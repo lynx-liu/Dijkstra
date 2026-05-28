@@ -2,7 +2,7 @@
 
 基于 [技术方案](多模态物流车辆会合预测系统技术方案.md) 的实现仓库。
 
-**覆盖范围**：中国全境公铁多模态路网；新疆等为重点验证区域，见 [docs/OSM_DATA.md](docs/OSM_DATA.md)、[docs/DESIGN.md](docs/DESIGN.md)。
+**覆盖范围**：全国公铁多模态路网，见 [docs/OSM_DATA.md](docs/OSM_DATA.md)、[docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 状态
 
@@ -12,34 +12,23 @@
 | 1 路网图（OSM 下载 + 建图） | 完成，见下方部署 |
 | 2–6 匹配 / 路由 / 会合算法 | 完成 |
 
-## 构建
+## 快速开始（两步）
+
+### 1) 初始化（依赖 + 编译 + 图 + 索引）
 
 ```bash
-bash tools/install_deps.sh    # pip install osmium
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build
+bash tools/bootstrap_service.sh
 ```
 
-## 部署全国 OSM 路网图（真实数据在 `data/`，不在 Git 里）
-
-仓库里**只有**测试用 `tests/fixtures/sample.osm`（3 个节点）。全国图需本机生成：
+### 2) 启动服务
 
 ```bash
-bash tools/install_deps.sh
-bash tools/deploy_graph_nationwide.sh   # 或 deploy_graph.sh（勿设置 BBOX）
-export MMLP_GRAPH_PATH=data/graph/china.mmlp.bin
-bash tools/graph_status.sh            # 查看下载/建图进度
+bash tools/start_http_server.sh
 ```
 
-| 生成文件 | 说明 |
-|----------|------|
-| `data/osm/china-latest.osm.pbf` | Geofabrik 中国原始数据 (~1.4 GB) |
-| `data/graph/china.mmlp.bin` | 全国公铁路网（程序读取此文件） |
+> `bootstrap_service.sh` 已包含初始化所需步骤，通常不需要再手动分步执行。
 
-下载约 10～30 分钟，建图可能 **1～3 小时**（视 CPU/内存）。日志：`data/deploy.log`。
-
-## 校验路网 + 网页预览
+## 校验路网 + 网页预览（可选）
 
 ```bash
 python3 tools/verify_graph.py data/graph/china.mmlp.bin
@@ -49,7 +38,7 @@ bash tools/serve_map_viewer.sh          # http://127.0.0.1:8765/web/index.html
 
 在网页里将 **蓝/红路网** 与 **OSM 底图** 对照，即可目视检查偏移与缺失。
 
-## 运行会合预测（全国图，按区域加载）
+## 运行会合预测
 
 不把 5.7GB 全图载入内存，只加载车辆附近区域：
 
@@ -83,7 +72,7 @@ export MMLP_GRAPH_PATH=data/graph/china.mmlp.bin
 
 ## 常驻服务（逐车接入）
 
-适合持续上报 GPS：每来一辆车就与**已接入的全车队**算最快碰头，立即返回。
+每来一辆车就与**已接入车队**计算最快会合并返回结果。
 
 ```bash
 cmake --build build --target mmlp_service
@@ -113,32 +102,57 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 
 全部两两组合加 `--all-pairs`。车辆 GPS 须能匹配到路网且在同一连通分量上。
 
-## 验证地图是否正确（网页预览）
+## HTTP 接口
 
-全国 `.mmlp.bin` 太大，浏览器无法整图加载。按城市导出一条 GeoJSON 后在网页上叠加 OSM 底图查看：
+### 1) 单车接入（与已接入车队比较）
+
+- `POST /api/vehicle`
+- 输入：单辆车 JSON
+- 输出：该车与车队最快会合结果（或 `found:false`）
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/vehicle \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000000}'
+```
+
+### 2) 多车批量（第一辆车 vs 其余车辆，返回列表并排序）
+
+- `POST /api/meetings/lead`
+- 输入：`vehicles` 数组，`vehicles[0]` 作为基准车
+- 输出：`meetings` 列表，按 `meetDurationSec` 升序（时间短的在前）
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/meetings/lead \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vehicles": [
+      {"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000000},
+      {"id":"t2","lat":43.9132,"lon":87.4920,"speed":70,"timestamp":1700000100},
+      {"id":"t3","lat":43.9200,"lon":87.5000,"speed":68,"timestamp":1700000100}
+    ]
+  }'
+```
+
+## 验证地图（网页预览）
+
+按区域导出 GeoJSON 后在网页叠加底图查看：
 
 ```bash
 bash tools/preview_map.sh
 # 浏览器打开 http://127.0.0.1:8765/
 ```
 
-蓝线=公路，红线=铁路，橙点=枢纽。可与底图道路是否重合、铁路走向是否一致作人工核对。
+蓝线=公路，红线=铁路，橙点=枢纽。
 
-自定义区域：
+自定义区域示例：
 
 ```bash
 python3 tools/graph_to_geojson.py -i data/graph/china.mmlp.bin \
-  --bbox 104.0,30.5,104.2,30.7 -o web/data/chengdu.json --max-edges 12000
+  --bbox 104.0,30.5,104.2,30.7 -o web/data/preview.json --max-edges 12000
 ```
 
-可选：仅导入某一区域（仍从全国 PBF 读取，Python 按 bbox 过滤）：
-
-```bash
-export BBOX=73.5,34.3,96.4,49.2   # minLon,minLat,maxLon,maxLat
-bash tools/deploy_graph.sh
-```
-
-更快裁剪（需 `osmium-tool`）：`export USE_OSMIUM_EXTRACT=1` 后再执行 `deploy_graph.sh`。
+需要按区域建图时，可设置 `BBOX=minLon,minLat,maxLon,maxLat` 后执行 `bash tools/deploy_graph.sh`。
 
 ## 加载路网并预测
 
