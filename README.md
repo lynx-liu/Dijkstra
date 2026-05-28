@@ -116,6 +116,40 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
   -d '{"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000000}'
 ```
 
+返回示例（已找到会合）：
+
+```json
+{
+  "found": true,
+  "focal": "t1",
+  "partner": "t2",
+  "meetTimeUnix": 1700000250,
+  "meetTimeUtc": "2023-11-14T22:17:29Z",
+  "meetDurationSec": 149.54,
+  "lat": 43.913413,
+  "lon": 87.491920,
+  "locationId": "edge:14456442370006"
+}
+```
+
+返回示例（未找到会合）：
+
+```json
+{
+  "found": false,
+  "focal": "t1"
+}
+```
+
+字段说明：
+- `found`：是否找到可达会合点
+- `focal`：本次请求车辆 ID
+- `partner`：与 `focal` 会合最快的车辆 ID
+- `meetTimeUnix` / `meetTimeUtc`：会合时间（Unix 秒 / UTC 字符串）
+- `meetDurationSec`：从两车对齐起算到会合的耗时（秒）
+- `lat` / `lon`：会合点坐标
+- `locationId`：会合位置对应的路网位置标识
+
 ### 2) 多车批量（第一辆车 vs 其余车辆，返回列表并排序）
 
 - `POST /api/meetings/lead`
@@ -133,6 +167,46 @@ curl -X POST http://127.0.0.1:8080/api/meetings/lead \
     ]
   }'
 ```
+
+返回示例：
+
+```json
+{
+  "focal": "t1",
+  "meetings": [
+    {
+      "found": true,
+      "partner": "t3",
+      "meetTimeUnix": 1700000232,
+      "meetTimeUtc": "2023-11-14T22:17:12Z",
+      "meetDurationSec": 132.15,
+      "lat": 43.921756,
+      "lon": 87.491721,
+      "locationId": "edge:13611128940001"
+    },
+    {
+      "found": true,
+      "partner": "t2",
+      "meetTimeUnix": 1700000250,
+      "meetTimeUtc": "2023-11-14T22:17:29Z",
+      "meetDurationSec": 149.54,
+      "lat": 43.913413,
+      "lon": 87.491920,
+      "locationId": "edge:14456442370006"
+    },
+    {
+      "found": false,
+      "partner": "t4"
+    }
+  ]
+}
+```
+
+字段与排序说明：
+- `focal`：基准车辆 ID（即输入 `vehicles[0].id`）
+- `meetings`：其余车辆与 `focal` 的会合结果列表
+- 列表按 `meetDurationSec` 升序排序（时间短的在前）
+- 无法会合的项为 `found:false`，排在已找到结果之后
 
 ## 验证地图（网页预览）
 
