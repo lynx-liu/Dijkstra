@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="mmlp-test">
+  <node id="1001" lat="43.8000" lon="87.5000"/>
+  <node id="1002" lat="43.8100" lon="87.5100"/>
+  <node id="1003" lat="43.8200" lon="87.5200"/>
+  <way id="2001">
+    <nd ref="1001"/>
+    <nd ref="1002"/>
+    <nd ref="1003"/>
+    <tag k="highway" v="primary"/>
+    <tag k="maxspeed" v="72"/>
+  </way>
+</osm>

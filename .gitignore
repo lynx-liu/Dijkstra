@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+data/graph/
+data/graph/*.mmlp*
+Testing/Temporary/
+data/*.log
+data/*.out
+tests/fixtures/*.mmlp.bin
+data/osm/
+web/data/*.geojson
