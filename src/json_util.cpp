@@ -1,5 +1,7 @@
 #include "mmlp/json_util.hpp"
 
+#include "mmlp/geo.hpp"
+
 #include <cctype>
 #include <cmath>
 #include <ctime>
@@ -158,6 +160,37 @@ bool parseVehicleJson(const std::string& json, VehicleInfo& vehicle, VehicleHist
   return true;
 }
 
+namespace {
+
+void appendRouteJson(std::ostringstream& os, const RoutePolyline& route) {
+  os << "[";
+  for (std::size_t i = 0; i < route.points.size(); ++i) {
+    if (i > 0) {
+      os << ',';
+    }
+    os << std::fixed << std::setprecision(6) << '[' << route.points[i].lat << ','
+       << route.points[i].lon << ']';
+  }
+  os << "]";
+}
+
+double polylineLengthMeters(const RoutePolyline& route) {
+  double sum = 0.0;
+  for (std::size_t i = 1; i < route.points.size(); ++i) {
+    sum += haversineMeters(route.points[i - 1], route.points[i]);
+  }
+  return sum;
+}
+
+void appendRouteMetricsJson(std::ostringstream& os, const RoutePolyline& routeSelf,
+                            const RoutePolyline& routePartner) {
+  os << std::fixed << std::setprecision(1);
+  os << ",\"routeDistanceSelfM\":" << polylineLengthMeters(routeSelf)
+     << ",\"routeDistancePartnerM\":" << polylineLengthMeters(routePartner);
+}
+
+}  // namespace
+
 std::string formatFocalBestMeetingJson(const FocalBestMeeting& b) {
   if (!b.found) {
     std::ostringstream os;
@@ -180,7 +213,12 @@ std::string formatFocalBestMeetingJson(const FocalBestMeeting& b) {
      << ",\"meetTimeUnix\":" << meetUnix << ",\"meetTimeUtc\":\"" << meetUtc << "\""
      << ",\"meetDurationSec\":" << std::setprecision(2) << b.meetDuration << ",\"lat\":"
      << std::setprecision(6) << b.lat << ",\"lon\":" << b.lon << ",\"locationId\":\""
-     << escapeJson(b.locationId) << "\"}";
+     << escapeJson(b.locationId) << "\",\"routeSelf\":";
+  appendRouteJson(os, b.routeSelf);
+  os << ",\"routePartner\":";
+  appendRouteJson(os, b.routePartner);
+  appendRouteMetricsJson(os, b.routeSelf, b.routePartner);
+  os << "}";
   return os.str();
 }
 
@@ -330,7 +368,12 @@ std::string formatMeetingsWithLeadJson(const std::vector<FocalBestMeeting>& meet
        << ",\"meetTimeUnix\":" << meetUnix << ",\"meetTimeUtc\":\"" << meetUtc << "\""
        << ",\"meetDurationSec\":" << std::setprecision(2) << m.meetDuration << ",\"lat\":"
        << std::setprecision(6) << m.lat << ",\"lon\":" << m.lon << ",\"locationId\":\""
-       << escapeJson(m.locationId) << "\"}";
+       << escapeJson(m.locationId) << "\",\"routeSelf\":";
+    appendRouteJson(os, m.routeSelf);
+    os << ",\"routePartner\":";
+    appendRouteJson(os, m.routePartner);
+    appendRouteMetricsJson(os, m.routeSelf, m.routePartner);
+    os << "}";
   }
   os << "]}";
   return os.str();

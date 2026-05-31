@@ -36,4 +36,9 @@ bool computePairwiseMeetingFast(const MultimodalGraph& graph, const PreparedVehi
                                 const PreparedVehicle& b, int64_t alignTime,
                                 const PredictParam& param, MeetingResult& out);
 
+void fillMeetingRoutes(const MultimodalGraph& graph, const PreparedVehicle& a,
+                       const PreparedVehicle& b, double meetDuration,
+                       const GraphPosition& where, const PredictParam& param,
+                       MeetingResult& out);
+
 }  // namespace mmlp

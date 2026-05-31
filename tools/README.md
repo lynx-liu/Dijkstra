@@ -31,6 +31,8 @@ bash tools/bootstrap_service.sh
 
 # 启动服务
 bash tools/start_http_server.sh
+# 浏览器: http://127.0.0.1:8080/map
+# 接口说明见仓库根目录 README.md「HTTP 接口」
 ```
 
 ## 二进制图格式

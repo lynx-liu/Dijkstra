@@ -3,9 +3,12 @@
 #include "mmlp/geo.hpp"
 #include "mmlp/motion.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <queue>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace mmlp {
 
@@ -241,6 +244,157 @@ LatLon positionLatLon(const MultimodalGraph& graph, const GraphPosition& pos) {
 
   const double t = std::max(0.0, std::min(1.0, pos.alongMeters / edge->length));
   return {from->lat + t * (to->lat - from->lat), from->lon + t * (to->lon - from->lon)};
+}
+
+RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosition& start,
+                                   const GraphPosition& goal, double speedMs, VehicleType type,
+                                   const PredictParam& param, double maxTime) {
+  RoutePolyline route;
+  if (!start.valid || !goal.valid || maxTime <= 0.0) {
+    return route;
+  }
+
+  const LatLon goalLoc = positionLatLon(graph, goal);
+  const double maxSpeedMs = std::max(speedMs, 5.0);
+
+  using QueueItem = std::tuple<double, double, int64_t>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+  std::unordered_map<int64_t, double> dist;
+  std::unordered_map<int64_t, int64_t> parent;
+
+  auto heuristic = [&](int64_t nodeId) -> double {
+    const Node* node = graph.findNode(nodeId);
+    if (node == nullptr) {
+      return 0.0;
+    }
+    return haversineMeters({node->lat, node->lon}, goalLoc) / maxSpeedMs;
+  };
+
+  auto relax = [&](int64_t nodeId, double t, int64_t fromNode) {
+    if (t > maxTime + 1e-9) {
+      return;
+    }
+    const auto it = dist.find(nodeId);
+    if (it != dist.end() && it->second <= t + 1e-9) {
+      return;
+    }
+    dist[nodeId] = t;
+    if (fromNode != 0) {
+      parent[nodeId] = fromNode;
+    }
+    pq.push({t + heuristic(nodeId), t, nodeId});
+  };
+
+  std::unordered_set<int64_t> seedNodes;
+  if (start.edgeId == 0) {
+    relax(start.nodeId, 0.0, 0);
+    seedNodes.insert(start.nodeId);
+  } else {
+    const Edge* edge = graph.findEdge(start.edgeId);
+    if (edge == nullptr) {
+      return route;
+    }
+    const double toFrom = travelTimeSeconds(start.alongMeters, speedMs, type, param);
+    const double toTo =
+        travelTimeSeconds(std::max(0.0, edge->length - start.alongMeters), speedMs, type, param);
+    relax(edge->from, toFrom, 0);
+    relax(edge->to, toTo, 0);
+    seedNodes.insert(edge->from);
+    seedNodes.insert(edge->to);
+  }
+
+  const std::size_t visitCap =
+      param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
+
+  while (!pq.empty()) {
+    if (dist.size() >= visitCap) {
+      break;
+    }
+    const auto [f, t, u] = pq.top();
+    pq.pop();
+    (void)f;
+    const auto it = dist.find(u);
+    if (it == dist.end() || t > it->second + 1e-6) {
+      continue;
+    }
+
+    for (const AdjacencyEdge& adj : graph.neighbors(u)) {
+      const Edge* edge = graph.findEdge(adj.edgeId);
+      if (edge == nullptr || !edgeAllowedForVehicle(edge->type, type)) {
+        continue;
+      }
+      const double eff = edgeEffectiveSpeedMs(adj, type, speedMs);
+      const double w = travelTimeSeconds(adj.length, eff, type, param);
+      relax(adj.to, t + w, u);
+    }
+  }
+
+  auto nodeTime = [&](int64_t nodeId) -> double {
+    const auto it = dist.find(nodeId);
+    if (it == dist.end()) {
+      return kInfTime;
+    }
+    return it->second;
+  };
+
+  double bestGoalTime = kInfTime;
+  int64_t bestGoalNode = 0;
+
+  if (goal.edgeId == 0) {
+    const double t = nodeTime(goal.nodeId);
+    if (t < bestGoalTime) {
+      bestGoalTime = t;
+      bestGoalNode = goal.nodeId;
+    }
+  } else {
+    const Edge* edge = graph.findEdge(goal.edgeId);
+    if (edge != nullptr) {
+      const double fromSide =
+          nodeTime(edge->from) + travelTimeSeconds(goal.alongMeters, speedMs, type, param);
+      const double toSide =
+          nodeTime(edge->to) +
+          travelTimeSeconds(std::max(0.0, edge->length - goal.alongMeters), speedMs, type, param);
+      if (fromSide <= toSide && fromSide < bestGoalTime) {
+        bestGoalTime = fromSide;
+        bestGoalNode = edge->from;
+      } else if (toSide < bestGoalTime) {
+        bestGoalTime = toSide;
+        bestGoalNode = edge->to;
+      }
+    }
+  }
+
+  if (bestGoalNode == 0 || bestGoalTime >= kInfTime / 2.0) {
+    return route;
+  }
+
+  std::vector<int64_t> nodes;
+  int64_t cur = bestGoalNode;
+  while (cur != 0) {
+    nodes.push_back(cur);
+    const auto pit = parent.find(cur);
+    if (pit == parent.end() || seedNodes.count(cur) != 0) {
+      break;
+    }
+    cur = pit->second;
+  }
+  std::reverse(nodes.begin(), nodes.end());
+
+  if (start.edgeId != 0) {
+    route.points.push_back(positionLatLon(graph, start));
+  }
+  for (int64_t nodeId : nodes) {
+    const Node* node = graph.findNode(nodeId);
+    if (node != nullptr) {
+      route.points.push_back({node->lat, node->lon});
+    }
+  }
+  const LatLon endLoc = positionLatLon(graph, goal);
+  if (route.points.empty() ||
+      haversineMeters(route.points.back(), endLoc) > 1.0) {
+    route.points.push_back(endLoc);
+  }
+  return route;
 }
 
 }  // namespace mmlp

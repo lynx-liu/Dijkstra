@@ -3,6 +3,7 @@
 #include "mmlp/geo.hpp"
 #include "mmlp/matching.hpp"
 #include "mmlp/motion.hpp"
+#include "mmlp/routing.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -436,6 +437,7 @@ bool meetingFromFields(const MultimodalGraph& graph, const PreparedVehicle& a,
     out.locationId = oss.str();
   }
 
+  fillMeetingRoutes(graph, a, b, bestDuration, bestWhere, param, out);
   return true;
 }
 
@@ -505,6 +507,7 @@ bool computePairwiseMeetingFast(const MultimodalGraph& graph, const PreparedVehi
   }
 
   fillMeetingResult(graph, a, b, alignTime, bestDuration, bestWhere, out);
+  fillMeetingRoutes(graph, a, b, bestDuration, bestWhere, param, out);
   return true;
 }
 
@@ -525,6 +528,47 @@ bool computePairwiseMeeting(const MultimodalGraph& graph, const PreparedVehicle&
     return false;
   }
   return meetingFromFields(graph, a, b, fieldA, fieldB, alignTime, param, out);
+}
+
+void fillMeetingRoutes(const MultimodalGraph& graph, const PreparedVehicle& a,
+                       const PreparedVehicle& b, double meetDuration,
+                       const GraphPosition& where, const PredictParam& param,
+                       MeetingResult& out) {
+  const double routeHorizon = std::min(param.maxTime, meetDuration + 120.0);
+  out.routeA = computeRoutePolyline(graph, a.position, where, a.speedMs, a.info.type, param,
+                                    routeHorizon);
+  out.routeB = computeRoutePolyline(graph, b.position, where, b.speedMs, b.info.type, param,
+                                    routeHorizon);
+
+  auto dedupeConsecutive = [](RoutePolyline& route) {
+    if (route.points.size() < 2) {
+      return;
+    }
+    std::vector<LatLon> cleaned;
+    cleaned.push_back(route.points.front());
+    for (std::size_t i = 1; i < route.points.size(); ++i) {
+      if (haversineMeters(cleaned.back(), route.points[i]) > 1.0) {
+        cleaned.push_back(route.points[i]);
+      }
+    }
+    route.points = std::move(cleaned);
+  };
+
+  auto prependGps = [](RoutePolyline& route, const VehicleInfo& vehicle) {
+    const LatLon gps{vehicle.lat, vehicle.lon};
+    if (route.points.empty()) {
+      route.points.push_back(gps);
+      return;
+    }
+    if (haversineMeters(gps, route.points.front()) > 25.0) {
+      route.points.insert(route.points.begin(), gps);
+    }
+  };
+
+  dedupeConsecutive(out.routeA);
+  dedupeConsecutive(out.routeB);
+  prependGps(out.routeA, a.info);
+  prependGps(out.routeB, b.info);
 }
 
 }  // namespace mmlp

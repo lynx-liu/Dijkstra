@@ -42,4 +42,9 @@ GraphPosition positionAtTime(const MultimodalGraph& graph, const GraphPosition& 
 
 LatLon positionLatLon(const MultimodalGraph& graph, const GraphPosition& pos);
 
+// Shortest-time route polyline from start to goal on the graph (for map display).
+RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosition& start,
+                                   const GraphPosition& goal, double speedMs, VehicleType type,
+                                   const PredictParam& param, double maxTime);
+
 }  // namespace mmlp

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mmlp/constants.hpp"
+#include "mmlp/geo.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -61,6 +62,11 @@ struct PredictParam {
   double truckRest = 30.0 * 60.0;
 };
 
+// Road/rail route polyline (lat/lon sequence).
+struct RoutePolyline {
+  std::vector<LatLon> points;
+};
+
 struct MeetingResult {
   std::string vehicleA;
   std::string vehicleB;
@@ -72,6 +78,9 @@ struct MeetingResult {
 
   std::string locationId;
   double distance = 0.0;  // meters between vehicles at meetTime (predicted)
+
+  RoutePolyline routeA;
+  RoutePolyline routeB;
 };
 
 // Fastest meeting for one focal vehicle among a fleet.
@@ -86,6 +95,9 @@ struct FocalBestMeeting {
   double lat = 0.0;
   double lon = 0.0;
   std::string locationId;
+
+  RoutePolyline routeSelf;
+  RoutePolyline routePartner;
 };
 
 }  // namespace mmlp

@@ -163,6 +163,13 @@ FocalBestMeeting predictBestMeetingFor(const std::string& focalVehicleId,
   best.lat = bestResult.lat;
   best.lon = bestResult.lon;
   best.locationId = bestResult.locationId;
+  if (bestResult.vehicleA == focalVehicleId) {
+    best.routeSelf = bestResult.routeA;
+    best.routePartner = bestResult.routeB;
+  } else {
+    best.routeSelf = bestResult.routeB;
+    best.routePartner = bestResult.routeA;
+  }
   return best;
 }
 
@@ -230,6 +237,13 @@ FocalBestMeeting predictBestMeetingFor(const std::string& focalVehicleId,
   best.lat = bestResult.lat;
   best.lon = bestResult.lon;
   best.locationId = bestResult.locationId;
+  if (bestResult.vehicleA == focalVehicleId) {
+    best.routeSelf = bestResult.routeA;
+    best.routePartner = bestResult.routeB;
+  } else {
+    best.routeSelf = bestResult.routeB;
+    best.routePartner = bestResult.routeA;
+  }
   return best;
 }
 
@@ -285,6 +299,8 @@ std::vector<FocalBestMeeting> predictMeetingsWithLead(const std::vector<VehicleI
     item.lat = meeting.lat;
     item.lon = meeting.lon;
     item.locationId = meeting.locationId;
+    item.routeSelf = meeting.routeA;
+    item.routePartner = meeting.routeB;
     results.push_back(item);
   }
 

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MMLP 实时会合地图</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    #map { height: calc(100vh - 56px); width: 100%; }
+    header {
+      padding: 8px 12px; display: flex; gap: 12px; align-items: center;
+      background: #1a1a2e; color: #eee; min-height: 56px;
+    }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    #status { font-size: 12px; color: #9ab; flex: 1; }
+    .panel {
+      position: absolute; top: 64px; left: 10px; z-index: 1000;
+      background: rgba(255,255,255,.96); border-radius: 8px; padding: 10px 12px;
+      font-size: 12px; max-width: 280px; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+      max-height: calc(100vh - 120px); overflow-y: auto;
+    }
+    .panel h2 { margin: 0 0 8px; font-size: 13px; }
+    .panel .hint { color: #666; margin: 0 0 8px; line-height: 1.4; }
+    .meet-item {
+      border-left: 4px solid #ccc; padding: 6px 0 6px 8px; margin-bottom: 8px;
+      cursor: pointer;
+    }
+    .meet-item:hover { background: #f5f5f5; }
+    .meet-item .title { font-weight: 600; }
+    .meet-item .meta { color: #555; margin-top: 2px; }
+    .veh-row { margin-bottom: 6px; padding-left: 8px; border-left: 3px solid #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>实时车辆与会合</h1>
+    <span id="status">连接中…</span>
+  </header>
+  <div id="map"></div>
+  <div class="panel" id="panel" style="display:none">
+    <h2 id="panelTitle">会合列表</h2>
+    <p class="hint" id="panelHint"></p>
+    <div id="vehicleList"></div>
+    <div id="meetingList"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    const MEETING_PALETTE = [
+      { focal: '#2563eb', partner: '#0891b2', meet: '#ea580c' },
+      { focal: '#7c3aed', partner: '#16a34a', meet: '#dc2626' },
+      { focal: '#c2410c', partner: '#0d9488', meet: '#9333ea' },
+      { focal: '#be123c', partner: '#ca8a04', meet: '#0369a1' },
+    ];
+
+    const map = L.map('map').setView([43.82, 87.60], 10);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+    L.control.scale({ metric: true }).addTo(map);
+
+    const layers = L.layerGroup().addTo(map);
+    const statusEl = document.getElementById('status');
+    const panel = document.getElementById('panel');
+    let lastSig = '';
+    let lastState = null;
+    let highlightIdx = -1;
+
+    function vehicleIcon(label, color) {
+      return L.divIcon({
+        className: '',
+        html: `<div style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);white-space:nowrap">${label}</div>`,
+        iconSize: [0, 0],
+        iconAnchor: [20, 12]
+      });
+    }
+
+    function meetIcon(label, color) {
+      return L.divIcon({
+        className: '',
+        html: `<div style="text-align:center"><div style="background:${color};color:#fff;font-size:10px;padding:1px 5px;border-radius:3px;border:1px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.3);white-space:nowrap">${label}</div><div style="width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid ${color};margin:0 auto"></div></div>`,
+        iconSize: [0, 0],
+        iconAnchor: [24, 28]
+      });
+    }
+
+    function latLngs(route) {
+      if (!Array.isArray(route)) return [];
+      return route.filter(p => Array.isArray(p) && p.length >= 2).map(p => [p[0], p[1]]);
+    }
+
+    function fmtKm(m) {
+      if (m == null || Number.isNaN(m)) return '-';
+      return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+    }
+
+    function renderPanel(state) {
+      const focal = state.focal || '';
+      const vehicles = state.vehicles || [];
+      const meetings = (state.meetings || []).filter(m => m.found);
+      document.getElementById('panelTitle').textContent = focal ? `基准车 ${focal}` : '会合列表';
+      document.getElementById('panelHint').textContent =
+        state.mode === 'batch'
+          ? '批量接口：每组是「基准车 ↔ 对方车」的会合，不是对方车之间会合。'
+          : '单车接入：与车队最快会合的一组。';
+      panel.style.display = 'block';
+
+      const vList = document.getElementById('vehicleList');
+      vList.innerHTML = vehicles.map(v =>
+        `<div class="veh-row" style="border-color:${v.id === focal ? '#2563eb' : '#16a34a'}">
+          <b>${v.id}</b>${v.id === focal ? ' (基准)' : ''}<br>
+          速度 ${v.speed ?? '-'} km/h
+        </div>`
+      ).join('');
+
+      const mList = document.getElementById('meetingList');
+      if (meetings.length === 0) {
+        mList.innerHTML = '<div class="meta">暂无会合结果</div>';
+        return;
+      }
+      mList.innerHTML = meetings.map((mt, idx) => {
+        const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
+        const ds = fmtKm(mt.routeDistanceSelfM);
+        const dp = fmtKm(mt.routeDistancePartnerM);
+        const dur = mt.meetDurationSec != null ? mt.meetDurationSec.toFixed(0) + ' 秒' : '-';
+        return `<div class="meet-item" data-idx="${idx}" style="border-color:${pal.meet}">
+          <div class="title">${focal} ↔ ${mt.partner}</div>
+          <div class="meta">耗时 ${dur} · 路程 ${ds} / ${dp}</div>
+          <div class="meta" style="color:#888">${focal} 与对方到会合点的路网距离</div>
+        </div>`;
+      }).join('');
+
+      mList.querySelectorAll('.meet-item').forEach(el => {
+        el.addEventListener('click', () => {
+          highlightIdx = Number(el.dataset.idx);
+          render(lastState);
+        });
+      });
+    }
+
+    function render(state) {
+      lastState = state;
+      layers.clearLayers();
+      const bounds = [];
+      const vehicles = state.vehicles || [];
+      const meetings = (state.meetings || []).filter(m => m.found);
+      const focal = state.focal || '';
+
+      renderPanel(state);
+
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return;
+        const isFocal = v.id === focal;
+        const color = isFocal ? '#1e3a8a' : '#14532d';
+        const m = L.marker([v.lat, v.lon], { icon: vehicleIcon(v.id, color) });
+        m.bindPopup(`<b>${v.id}</b>${isFocal ? ' (基准车)' : ''}<br>速度 ${v.speed ?? '-'} km/h`);
+        m.addTo(layers);
+        bounds.push([v.lat, v.lon]);
+      });
+
+      meetings.forEach((mt, idx) => {
+        const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
+        const dim = highlightIdx >= 0 && highlightIdx !== idx;
+        const opacity = dim ? 0.2 : 0.9;
+        const weight = dim ? 2 : 5;
+        const partner = mt.partner || '';
+        const label = `${focal || 'A'}↔${partner}`;
+
+        if (mt.lat != null && mt.lon != null) {
+          const dur = mt.meetDurationSec != null ? `${mt.meetDurationSec.toFixed(0)} 秒` : '-';
+          const meet = L.marker([mt.lat, mt.lon], {
+            icon: meetIcon(label, pal.meet),
+            zIndexOffset: 100 + idx,
+          });
+          meet.bindPopup(
+            `<b>${label} 会合点</b><br>` +
+            `预计 ${dur}<br>` +
+            `${focal} 路程 ${fmtKm(mt.routeDistanceSelfM)}<br>` +
+            `${partner} 路程 ${fmtKm(mt.routeDistancePartnerM)}<br>` +
+            `<small>优化目标：最早会合时间，非地理中点</small>`
+          );
+          meet.addTo(layers);
+          bounds.push([mt.lat, mt.lon]);
+        }
+
+        const rs = latLngs(mt.routeSelf);
+        const rp = latLngs(mt.routePartner);
+        if (rs.length >= 2) {
+          L.polyline(rs, { color: pal.focal, weight, opacity, dashArray: dim ? '4 6' : null }).addTo(layers);
+          rs.forEach(p => bounds.push(p));
+        }
+        if (rp.length >= 2) {
+          L.polyline(rp, { color: pal.partner, weight, opacity, dashArray: '8 5' }).addTo(layers);
+          rp.forEach(p => bounds.push(p));
+        }
+      });
+
+      if (bounds.length > 0) {
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
+      }
+
+      const nV = vehicles.length;
+      const nM = meetings.length;
+      statusEl.textContent =
+        `车辆 ${nV} 辆 · 会合 ${nM} 组（均为基准车 ${focal || '-'} 与对方） · ` +
+        `${state.mode === 'batch' ? '批量' : '单车'} · ` +
+        `更新 ${new Date((state.updatedAt || 0) * 1000).toLocaleTimeString()}`;
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/api/map/state');
+        if (!res.ok) throw new Error(res.statusText);
+        const state = await res.json();
+        const sig = JSON.stringify(state);
+        if (sig !== lastSig) {
+          lastSig = sig;
+          highlightIdx = -1;
+          render(state);
+        }
+      } catch (e) {
+        statusEl.textContent = '无法连接服务，请确认已运行 start_http_server.sh — ' + e.message;
+      }
+    }
+
+    poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>
