@@ -28,6 +28,8 @@ bash tools/start_http_server.sh
 
 启动后在浏览器打开 **http://127.0.0.1:8080/map**，可实时查看 POST 上报的车辆位置、会合点及两车路径（点击标记查看详情，页面每 2 秒自动刷新）。
 
+> **若地图只有标记、没有底图**：底图瓦片来自外网（国内常无法访问 `tile.openstreetmap.org`）。在新机器上执行一次 `bash tools/fetch_web_vendor.sh`（`bootstrap_service.sh` 已包含此步），页面会自动尝试 Carto / Esri 等备用底图；完全离线环境需自行配置可访问的瓦片源。
+
 > `bootstrap_service.sh` 已包含初始化所需步骤，通常不需要再手动分步执行。
 
 ## 校验路网 + 网页预览（可选）
@@ -286,6 +288,8 @@ curl -X POST http://127.0.0.1:8080/api/meetings/lead \
 
 - `GET /map` — 浏览器打开实时地图（车辆位置、会合点、路径；点击标记弹出详情）
 - `GET /api/map/state` — 最近一次 POST 后的车辆与会合快照（地图页每 2 秒轮询）
+
+**底图说明**：页面通过 `/web/map_boot.js` 依次尝试 OSM、Carto、Esri、OSM DE 瓦片；Leaflet 优先从 `/web/vendor/leaflet/` 本地加载，失败则回退 bootcdn / unpkg。初始化时运行 `bash tools/fetch_web_vendor.sh` 可下载本地 Leaflet。须通过 `http://host:8080/map` 访问，不要用 `file://` 打开。
 
 ```bash
 curl http://127.0.0.1:8080/api/map/state

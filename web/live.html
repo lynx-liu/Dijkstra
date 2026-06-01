@@ -4,11 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MMLP 实时会合地图</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; }
-    #map { height: calc(100vh - 56px); width: 100%; }
+    #map { height: calc(100vh - 56px); width: 100%; background: #e8eef4; }
     header {
       padding: 8px 12px; display: flex; gap: 12px; align-items: center;
       background: #1a1a2e; color: #eee; min-height: 56px;
@@ -36,7 +35,7 @@
 <body>
   <header>
     <h1>实时车辆与会合</h1>
-    <span id="status">连接中…</span>
+    <span id="status">加载地图组件…</span>
   </header>
   <div id="map"></div>
   <div class="panel" id="panel" style="display:none">
@@ -46,7 +45,7 @@
     <div id="meetingList"></div>
   </div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="/web/map_boot.js"></script>
   <script>
     const MEETING_PALETTE = [
       { focal: '#2563eb', partner: '#0891b2', meet: '#ea580c' },
@@ -55,19 +54,20 @@
       { focal: '#be123c', partner: '#ca8a04', meet: '#0369a1' },
     ];
 
-    const map = L.map('map').setView([43.82, 87.60], 10);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
-    L.control.scale({ metric: true }).addTo(map);
-
-    const layers = L.layerGroup().addTo(map);
+    let map;
+    let layers;
     const statusEl = document.getElementById('status');
     const panel = document.getElementById('panel');
     let lastSig = '';
     let lastState = null;
     let highlightIdx = -1;
+    let tileLabel = '';
+    let tileWarning = '';
+
+    function setStatusExtra() {
+      const tilePart = tileWarning || (tileLabel ? `底图 ${tileLabel}` : '');
+      return tilePart;
+    }
 
     function vehicleIcon(label, color) {
       return L.divIcon({
@@ -204,10 +204,11 @@
 
       const nV = vehicles.length;
       const nM = meetings.length;
+      const extra = setStatusExtra();
       statusEl.textContent =
-        `车辆 ${nV} 辆 · 会合 ${nM} 组（均为基准车 ${focal || '-'} 与对方） · ` +
-        `${state.mode === 'batch' ? '批量' : '单车'} · ` +
-        `更新 ${new Date((state.updatedAt || 0) * 1000).toLocaleTimeString()}`;
+        `车辆 ${nV} 辆 · 会合 ${nM} 组 · ${state.mode === 'batch' ? '批量' : '单车'} · ` +
+        `更新 ${new Date((state.updatedAt || 0) * 1000).toLocaleTimeString()}` +
+        (extra ? ` · ${extra}` : '');
     }
 
     async function poll() {
@@ -226,8 +227,26 @@
       }
     }
 
-    poll();
-    setInterval(poll, 2000);
+    MapBoot.ready().then(() => {
+      map = MapBoot.createMap('map', { preferCanvas: true }).setView([43.82, 87.60], 10);
+      MapBoot.addBaseTiles(map, (label, warn) => {
+        if (warn) {
+          tileWarning = warn;
+          tileLabel = '';
+        } else if (label) {
+          tileLabel = label;
+          tileWarning = '';
+        }
+        if (lastState) render(lastState);
+      });
+      MapBoot.addScale(map);
+      layers = L.layerGroup().addTo(map);
+      statusEl.textContent = '连接数据…';
+      poll();
+      setInterval(poll, 2000);
+    }).catch((e) => {
+      statusEl.textContent = '地图组件加载失败：' + e.message + '（可运行 bash tools/fetch_web_vendor.sh）';
+    });
   </script>
 </body>
 </html>

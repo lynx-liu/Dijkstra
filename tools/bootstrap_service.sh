@@ -18,16 +18,16 @@ echo ""
 
 cd "${ROOT}"
 
-echo "[1/4] Install Python dependencies..."
+echo "[1/5] Install Python dependencies..."
 bash tools/install_deps.sh
 
-echo "[2/4] Build binaries..."
+echo "[2/5] Build binaries..."
 cmake -S . -B build
 cmake --build build --target mmlp_service mmlp_build_aux
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
-    echo "[3/4] Graph file missing, deploying nationwide graph..."
+    echo "[3/5] Graph file missing, deploying nationwide graph..."
     bash tools/deploy_graph_nationwide.sh
   else
     echo "ERROR: graph not found: ${GRAPH}" >&2
@@ -35,11 +35,14 @@ if [[ ! -f "${GRAPH}" ]]; then
     exit 1
   fi
 else
-  echo "[3/4] Graph file exists, skip deploy."
+  echo "[3/5] Graph file exists, skip deploy."
 fi
 
-echo "[4/4] Ensure fast index files..."
+echo "[4/5] Ensure fast index files..."
 bash tools/ensure_graph_index.sh "${GRAPH}"
+
+echo "[5/5] Fetch map page vendor (Leaflet, for offline/restricted network)..."
+bash tools/fetch_web_vendor.sh
 
 echo ""
 echo "Bootstrap complete."
