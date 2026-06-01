@@ -15,7 +15,16 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+# map_roads lives in tools/
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from tools.map_roads import GraphMmap, bbox_from_points, export_roads_geojson
+from tools.map_tiles import MBTilesStore, resolve_mbtiles_path
+from tools.map_tile_render import GraphTileRenderer
 
 
 def _drain_stderr(proc: subprocess.Popen) -> None:
@@ -92,6 +101,81 @@ class MapState:
             }
 
 
+class RoadBasemap:
+    """Local road/rail GeoJSON from graph indexes (no external map tiles)."""
+
+    def __init__(self, graph_path: str) -> None:
+        self._graph_path = graph_path
+        self._lock = threading.Lock()
+        self._graph: GraphMmap | None = None
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache_max = 24
+
+    def _ensure(self) -> GraphMmap:
+        if self._graph is None:
+            self._graph = GraphMmap(self._graph_path)
+        return self._graph
+
+    def _cache_get(self, key: str) -> dict[str, Any] | None:
+        row = self._cache.get(key)
+        if row is None:
+            return None
+        return row[1]
+
+    def _cache_put(self, key: str, body: dict[str, Any]) -> None:
+        self._cache[key] = (time.time(), body)
+        if len(self._cache) > self._cache_max:
+            oldest = min(self._cache.items(), key=lambda x: x[1][0])[0]
+            del self._cache[oldest]
+
+    def export_bbox(
+        self,
+        min_lon: float,
+        min_lat: float,
+        max_lon: float,
+        max_lat: float,
+        max_features: int = 0,
+    ) -> dict[str, Any]:
+        key = f"{min_lon:.5f},{min_lat:.5f},{max_lon:.5f},{max_lat:.5f}:{max_features}"
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
+            graph = self._ensure()
+            body = export_roads_geojson(
+                graph, min_lon, min_lat, max_lon, max_lat, max_features=max_features
+            )
+            self._cache_put(key, body)
+            return body
+
+    def export_auto(self, map_state: MapState) -> dict[str, Any]:
+        snap = map_state.snapshot()
+        points: list[tuple[float, float]] = []
+        for v in snap.get("vehicles", []):
+            lat, lon = v.get("lat"), v.get("lon")
+            if lat is not None and lon is not None:
+                points.append((float(lat), float(lon)))
+        for m in snap.get("meetings", []):
+            if m.get("found") and m.get("lat") is not None and m.get("lon") is not None:
+                points.append((float(m["lat"]), float(m["lon"])))
+                for pt in m.get("routeSelf") or []:
+                    if isinstance(pt, list) and len(pt) >= 2:
+                        points.append((float(pt[0]), float(pt[1])))
+                for pt in m.get("routePartner") or []:
+                    if isinstance(pt, list) and len(pt) >= 2:
+                        points.append((float(pt[0]), float(pt[1])))
+        min_lon, min_lat, max_lon, max_lat = bbox_from_points(points)
+        return self.export_bbox(min_lon, min_lat, max_lon, max_lat)
+
+    def close(self) -> None:
+        if self._graph is not None:
+            self._graph.close()
+            self._graph = None
+
+
 class MmlpCore:
     def __init__(self, graph: str, padding_m: float, binary: str, load_mode: str):
         env = os.environ.copy()
@@ -102,6 +186,16 @@ class MmlpCore:
         self._lock = threading.Lock()
         self._ready_cond = threading.Condition()
         self.map_state = MapState()
+        self.road_basemap = RoadBasemap(graph)
+        self.tile_renderer = GraphTileRenderer(graph)
+        self.mbtiles: MBTilesStore | None = None
+        mbtiles_path = resolve_mbtiles_path()
+        if mbtiles_path:
+            try:
+                self.mbtiles = MBTilesStore(mbtiles_path)
+                sys.stderr.write(f"[http] offline map tiles: {mbtiles_path}\n")
+            except Exception as e:
+                sys.stderr.write(f"[http] mbtiles load failed: {e}\n")
 
         hint = "~5 min for full" if load_mode == "full" else "usually under 1 min for index"
         sys.stderr.write(
@@ -193,6 +287,10 @@ class MmlpCore:
         if self._proc.stdin:
             self._proc.stdin.close()
         self._proc.terminate()
+        self.road_basemap.close()
+        self.tile_renderer.close()
+        if self.mbtiles is not None:
+            self.mbtiles.close()
 
 
 def make_handler(core: MmlpCore, web_root: str):
@@ -235,6 +333,71 @@ def make_handler(core: MmlpCore, web_root: str):
                 return
             if path == "/api/map/state":
                 self._json(200, core.map_state.snapshot())
+                return
+            if path == "/api/map/tiles/meta":
+                if core.mbtiles is not None:
+                    meta = dict(core.mbtiles.meta)
+                    meta["source"] = "mbtiles"
+                    self._json(200, meta)
+                else:
+                    self._json(200, core.tile_renderer.meta())
+                return
+            tile_parts = path.split("/")
+            if (
+                len(tile_parts) == 7
+                and tile_parts[1:4] == ["api", "map", "tiles"]
+                and tile_parts[6].endswith(".png")
+            ):
+                try:
+                    z = int(tile_parts[4])
+                    x = int(tile_parts[5])
+                    y = int(tile_parts[6][:-4])
+                except ValueError:
+                    self._json(400, {"error": "bad tile path"})
+                    return
+                data = None
+                if core.mbtiles is not None:
+                    data = core.mbtiles.get_tile(z, x, y)
+                if data is None:
+                    data = core.tile_renderer.render_tile(z, x, y)
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                fmt = (core.mbtiles.meta.get("format") or "png").lower()
+                mime = "image/png" if fmt == "png" else "image/jpeg"
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if path == "/api/map/roads":
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    if qs.get("auto", ["0"])[0] in ("1", "true", "yes"):
+                        body = core.road_basemap.export_auto(core.map_state)
+                    else:
+                        min_lon = float(qs["minLon"][0])
+                        min_lat = float(qs["minLat"][0])
+                        max_lon = float(qs["maxLon"][0])
+                        max_lat = float(qs["maxLat"][0])
+                        max_features = int(qs.get("maxFeatures", ["0"])[0] or "0")
+                        body = core.road_basemap.export_bbox(
+                            min_lon, min_lat, max_lon, max_lat, max_features=max_features
+                        )
+                    self._json(200, body)
+                except (KeyError, IndexError, ValueError) as e:
+                    self._json(
+                        400,
+                        {
+                            "error": "use ?auto=1 or minLon,minLat,maxLon,maxLat",
+                            "detail": str(e),
+                        },
+                    )
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
                 return
             if path in ("/", "/map", "/map/"):
                 if self._serve_file("live.html"):

@@ -4,10 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MMLP 实时会合地图</title>
+  <link rel="stylesheet" href="/web/vendor/leaflet/leaflet.css" />
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; }
-    #map { height: calc(100vh - 56px); width: 100%; background: #e8eef4; }
+    #map { height: calc(100vh - 56px); width: 100%; background: #ddd; }
     header {
       padding: 8px 12px; display: flex; gap: 12px; align-items: center;
       background: #1a1a2e; color: #eee; min-height: 56px;
@@ -55,18 +56,50 @@
     ];
 
     let map;
+    let basemapLayer;
     let layers;
     const statusEl = document.getElementById('status');
     const panel = document.getElementById('panel');
     let lastSig = '';
     let lastState = null;
     let highlightIdx = -1;
+    let mapMode = 'loading';
     let tileLabel = '';
-    let tileWarning = '';
+    let tileHint = '';
+    let basemapTimer = null;
 
-    function setStatusExtra() {
-      const tilePart = tileWarning || (tileLabel ? `底图 ${tileLabel}` : '');
-      return tilePart;
+    function scheduleRoadReload(delayMs, bbox) {
+      if (mapMode !== 'roads') return;
+      if (basemapTimer) clearTimeout(basemapTimer);
+      basemapTimer = setTimeout(() => reloadRoads(bbox), delayMs == null ? 300 : delayMs);
+    }
+
+    async function reloadRoads(bboxOpt) {
+      if (!map || !basemapLayer || mapMode !== 'roads') return;
+      try {
+        const meta = await MapBoot.loadRoadFallback(map, basemapLayer, {
+          bbox: bboxOpt || MapBoot.boundsQuery(map.getBounds(), 0.18),
+        });
+        tileLabel = `${meta.label} · ${meta.features}条`;
+        tileHint = meta.truncated ? '区域较大，部分路网未显示' : '';
+        if (lastState) renderStatus(lastState);
+      } catch (e) {
+        tileLabel = '离线路网加载失败';
+        tileHint = e.message;
+        if (lastState) renderStatus(lastState);
+      }
+    }
+
+    function renderStatus(state) {
+      const nV = (state.vehicles || []).length;
+      const nM = (state.meetings || []).filter(m => m.found).length;
+      const focal = state.focal || '-';
+      const extra = [tileLabel, tileHint].filter(Boolean).join(' · ');
+      statusEl.textContent =
+        `车辆 ${nV} 辆 · 会合 ${nM} 组 · 基准 ${focal} · ` +
+        `${state.mode === 'batch' ? '批量' : '单车'} · ` +
+        `更新 ${new Date((state.updatedAt || 0) * 1000).toLocaleTimeString()}` +
+        (extra ? ` · ${extra}` : '');
     }
 
     function vehicleIcon(label, color) {
@@ -199,16 +232,12 @@
       });
 
       if (bounds.length > 0) {
-        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
+        const lb = L.latLngBounds(bounds);
+        map.fitBounds(lb, { padding: [50, 50], maxZoom: 14 });
+        scheduleRoadReload(250, MapBoot.boundsQuery(lb, 0.22));
       }
 
-      const nV = vehicles.length;
-      const nM = meetings.length;
-      const extra = setStatusExtra();
-      statusEl.textContent =
-        `车辆 ${nV} 辆 · 会合 ${nM} 组 · ${state.mode === 'batch' ? '批量' : '单车'} · ` +
-        `更新 ${new Date((state.updatedAt || 0) * 1000).toLocaleTimeString()}` +
-        (extra ? ` · ${extra}` : '');
+      renderStatus(state);
     }
 
     async function poll() {
@@ -227,20 +256,26 @@
       }
     }
 
-    MapBoot.ready().then(() => {
-      map = MapBoot.createMap('map', { preferCanvas: true }).setView([43.82, 87.60], 10);
-      MapBoot.addBaseTiles(map, (label, warn) => {
-        if (warn) {
-          tileWarning = warn;
-          tileLabel = '';
-        } else if (label) {
-          tileLabel = label;
-          tileWarning = '';
-        }
-        if (lastState) render(lastState);
-      });
-      MapBoot.addScale(map);
+    MapBoot.ready().then(async () => {
+      map = MapBoot.createMap('map').setView([43.82, 87.60], 11);
+      basemapLayer = L.layerGroup().addTo(map);
       layers = L.layerGroup().addTo(map);
+      MapBoot.addScale(map);
+      statusEl.textContent = '加载底图…';
+      try {
+        const base = await MapBoot.initBasemap(map, basemapLayer);
+        mapMode = base.mode;
+        tileLabel = base.label;
+        tileHint = base.hint || '';
+        if (mapMode === 'roads') {
+          MapBoot.addRoadLegend(map);
+          map.on('moveend', () => scheduleRoadReload(500));
+        }
+      } catch (e) {
+        mapMode = 'roads';
+        tileLabel = '底图初始化失败';
+        tileHint = e.message;
+      }
       statusEl.textContent = '连接数据…';
       poll();
       setInterval(poll, 2000);
