@@ -19,8 +19,8 @@ int main() {
   a.speed = 72.0;
   a.timestamp = 1'700'000'000;
 
-  std::string j1 = R"({"id":"A","lat":43.80,"lon":87.50,"speed":72,"timestamp":1700000000})";
-  std::string j2 = R"({"id":"B","lat":43.82,"lon":87.52,"speed":72,"timestamp":1700000000})";
+  std::string j1 = R"({"id":"A","lat":43.80,"lon":87.50,"speed":72,"time":"2026-06-01T10:00:00Z"})";
+  std::string j2 = R"({"id":"B","lat":43.82,"lon":87.52,"speed":72,"time":"2026-06-01T10:00:00Z"})";
 
   mmlp::VehicleInfo v1, v2;
   mmlp::VehicleHistory h1, h2;

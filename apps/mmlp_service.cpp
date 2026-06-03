@@ -110,6 +110,30 @@ int main(int argc, char** argv) {
       continue;
     }
 
+    if (mmlp::isDestinationArrivalCommand(line)) {
+      mmlp::DestinationQuery dest;
+      std::vector<mmlp::VehicleInfo> vehicles;
+      std::vector<mmlp::VehicleHistory> histories;
+      std::string parseErr;
+      if (!mmlp::parseDestinationArrivalJson(line, dest, &vehicles, &histories, &parseErr)) {
+        std::cout << mmlp::formatErrorJson(parseErr) << "\n" << std::flush;
+        continue;
+      }
+      const std::vector<mmlp::VehicleInfo>* vehPtr =
+          vehicles.empty() ? nullptr : &vehicles;
+      const std::vector<mmlp::VehicleHistory>* histPtr =
+          histories.empty() ? nullptr : &histories;
+      std::string runErr;
+      const auto summary = service.vehiclesReachDestinationBy(
+          dest.lat, dest.lon, dest.arriveByUnix, dest.type, dest.sortBy, vehPtr, histPtr, &runErr);
+      if (!runErr.empty() && summary.vehicles.empty()) {
+        std::cout << mmlp::formatErrorJson(runErr) << "\n" << std::flush;
+        continue;
+      }
+      std::cout << mmlp::formatDestinationArrivalJson(summary) << "\n" << std::flush;
+      continue;
+    }
+
     if (mmlp::isMeetWithLeadCommand(line)) {
       std::vector<mmlp::VehicleInfo> vehicles;
       std::vector<mmlp::VehicleHistory> histories;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mmlp/arrival.hpp"
 #include "mmlp/fleet_index.hpp"
 #include "mmlp/graph_store.hpp"
 #include "mmlp/predict.hpp"
@@ -40,6 +41,16 @@ class FleetMeetingService {
   std::vector<FocalBestMeeting> meetingsWithLead(
       const std::vector<VehicleInfo>& vehicles,
       const std::vector<VehicleHistory>& histories, std::string* error = nullptr);
+
+  // Vehicles that reach (destLat, destLon) before arriveByUnix; sorted fastest first.
+  // If overrideVehicles is null or empty, uses ingested fleet.
+  DestinationArrivalSummary vehiclesReachDestinationBy(
+      double destLat, double destLon, int64_t arriveByUnix,
+      VehicleType destType = VehicleType::TRUCK,
+      ArrivalSortBy sortBy = ArrivalSortBy::DURATION,
+      const std::vector<VehicleInfo>* overrideVehicles = nullptr,
+      const std::vector<VehicleHistory>* overrideHistories = nullptr,
+      std::string* error = nullptr);
 
   bool removeVehicle(const std::string& vehicleId);
   void clearFleet();

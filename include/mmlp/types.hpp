@@ -100,4 +100,25 @@ struct FocalBestMeeting {
   RoutePolyline routePartner;
 };
 
+// One vehicle's predicted trip to a fixed destination before a deadline.
+struct VehicleArrivalResult {
+  std::string vehicleId;
+  bool reachable = false;
+  double travelDurationSec = 0.0;
+  double etaUnix = 0.0;  // internal; JSON uses ISO eta
+  double routeDistanceM = 0.0;
+  RoutePolyline route;
+};
+
+enum class ArrivalSortBy { DURATION, ETA, DISTANCE };
+
+struct DestinationArrivalSummary {
+  double lat = 0.0;
+  double lon = 0.0;
+  int64_t arriveByUnix = 0;  // internal; JSON uses ISO arriveBy
+  std::string locationId;
+  ArrivalSortBy sortBy = ArrivalSortBy::DURATION;
+  std::vector<VehicleArrivalResult> vehicles;
+};
+
 }  // namespace mmlp

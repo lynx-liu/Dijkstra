@@ -66,14 +66,12 @@ std::string formatMeetTimeUtc(double meetTimeUnix) {
 
 void printMeetingJson(std::ostream& out, const mmlp::MeetingResult& m, bool prettyIndent) {
   const std::string prefix = prettyIndent ? "  " : "";
-  const int64_t meetUnix = static_cast<int64_t>(std::llround(m.meetTime));
-  const std::string meetUtc = formatMeetTimeUtc(m.meetTime);
+  const std::string meetTime = formatMeetTimeUtc(m.meetTime);
 
   out << prefix << "{"
       << "\"vehicleA\":\"" << jsonEscape(m.vehicleA) << "\","
       << "\"vehicleB\":\"" << jsonEscape(m.vehicleB) << "\","
-      << "\"meetTimeUnix\":" << meetUnix << ","
-      << "\"meetTimeUtc\":\"" << meetUtc << "\","
+      << "\"meetTime\":\"" << meetTime << "\","
       << "\"lat\":" << std::fixed << std::setprecision(6) << m.lat << ","
       << "\"lon\":" << m.lon << ","
       << "\"locationId\":\"" << jsonEscape(m.locationId) << "\""
@@ -87,16 +85,14 @@ void printBest(const mmlp::FocalBestMeeting& b) {
     return;
   }
 
-  const int64_t meetUnix = static_cast<int64_t>(std::llround(b.meetTime));
-  const std::string meetUtc = formatMeetTimeUtc(b.meetTime);
+  const std::string meetTime = formatMeetTimeUtc(b.meetTime);
 
   std::cout << std::fixed << std::setprecision(6);
   std::cout << "{"
             << "\"found\":true,"
             << "\"focal\":\"" << jsonEscape(b.focalVehicleId) << "\","
             << "\"partner\":\"" << jsonEscape(b.partnerVehicleId) << "\","
-            << "\"meetTimeUnix\":" << meetUnix << ","
-            << "\"meetTimeUtc\":\"" << meetUtc << "\","
+            << "\"meetTime\":\"" << meetTime << "\","
             << "\"meetDurationSec\":" << std::setprecision(2) << b.meetDuration << ","
             << "\"lat\":" << std::setprecision(6) << b.lat << ","
             << "\"lon\":" << b.lon << ","

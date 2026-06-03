@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mmlp/arrival.hpp"
 #include "mmlp/fleet_service.hpp"
 #include "mmlp/types.hpp"
 
@@ -17,11 +18,24 @@ bool isPreloadCommand(const std::string& json);
 
 bool isMeetWithLeadCommand(const std::string& json);
 
+bool isDestinationArrivalCommand(const std::string& json);
+
+bool parseDestinationArrivalJson(const std::string& json, DestinationQuery& dest,
+                                std::vector<VehicleInfo>* vehicles,
+                                std::vector<VehicleHistory>* histories,
+                                std::string* error = nullptr);
+
+bool parseIso8601Utc(const std::string& text, int64_t& outUnix, std::string* error = nullptr);
+
+ArrivalSortBy parseArrivalSortBy(const std::string& text);
+std::string arrivalSortByLabel(ArrivalSortBy sortBy);
+
 bool parseVehiclesJson(const std::string& json, std::vector<VehicleInfo>& vehicles,
                        std::vector<VehicleHistory>& histories, std::string* error = nullptr);
 
 std::string formatFocalBestMeetingJson(const FocalBestMeeting& result);
 std::string formatMeetingsWithLeadJson(const std::vector<FocalBestMeeting>& meetings);
+std::string formatDestinationArrivalJson(const DestinationArrivalSummary& summary);
 std::string formatOkJson(const std::string& message);
 std::string formatErrorJson(const std::string& message);
 

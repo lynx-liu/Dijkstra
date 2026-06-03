@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(mmlp
+  src/arrival.cpp
   src/geo.cpp
   src/fleet_service.cpp
   src/fleet_index.cpp

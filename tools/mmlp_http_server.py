@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -34,6 +35,11 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
         sys.stderr.write("[mmlp] " + line)
 
 
+def _iso_utc(ts: float | None = None) -> str:
+    dt = datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class MapState:
     """In-memory fleet + meeting snapshot for the live map."""
 
@@ -42,6 +48,9 @@ class MapState:
         self.vehicles: dict[str, dict[str, Any]] = {}
         self.focal = ""
         self.meetings: list[dict[str, Any]] = []
+        self.destination: dict[str, Any] | None = None
+        self.arrivals: list[dict[str, Any]] = []
+        self.sort_by = "duration"
         self.mode = "none"
         self.updated_at = 0.0
 
@@ -52,7 +61,7 @@ class MapState:
             "lat": v.get("lat"),
             "lon": v.get("lon"),
             "speed": v.get("speed", 0),
-            "timestamp": v.get("timestamp", 0),
+            "time": v.get("time") or v.get("observedAt") or "",
             "type": v.get("type", "truck"),
         }
 
@@ -79,6 +88,8 @@ class MapState:
                 self.meetings = [result]
             else:
                 self.meetings = []
+            self.destination = None
+            self.arrivals = []
             self.updated_at = time.time()
 
     def update_batch(self, vehicles: list[dict[str, Any]], result: dict[str, Any]) -> None:
@@ -88,6 +99,25 @@ class MapState:
             self.mode = "batch"
             self.focal = str(result.get("focal", vehicles[0].get("id", "") if vehicles else ""))
             self.meetings = list(result.get("meetings", []))
+            self.destination = None
+            self.arrivals = []
+            self.updated_at = time.time()
+
+    def update_arrival(
+        self,
+        vehicles: list[dict[str, Any]] | None,
+        result: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            if vehicles:
+                for v in vehicles:
+                    self._upsert_vehicle_unlocked(v)
+            self.mode = "arrival"
+            self.focal = ""
+            self.meetings = []
+            self.destination = dict(result.get("destination") or {})
+            self.arrivals = list(result.get("vehicles") or [])
+            self.sort_by = str(result.get("sortBy") or "duration")
             self.updated_at = time.time()
 
     def snapshot(self) -> dict[str, Any]:
@@ -96,8 +126,11 @@ class MapState:
                 "vehicles": list(self.vehicles.values()),
                 "focal": self.focal,
                 "meetings": self.meetings,
+                "destination": self.destination,
+                "arrivals": self.arrivals,
+                "sortBy": self.sort_by,
                 "mode": self.mode,
-                "updatedAt": self.updated_at,
+                "updatedAt": _iso_utc(self.updated_at),
             }
 
 
@@ -270,7 +303,7 @@ class MmlpCore:
         return {"status": "ok"}
 
     def _request(self, payload: dict) -> dict:
-        line = json.dumps(payload, separators=(",", ":"))
+        line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         with self._lock:
             assert self._proc.stdin and self._proc.stdout
             self._proc.stdin.write(line + "\n")
@@ -451,6 +484,43 @@ def make_handler(core: MmlpCore, web_root: str):
                     self._json(500, {"error": str(e)})
                 return
 
+            if self.path in ("/api/destinations/arrive", "/api/destination/arrive"):
+                try:
+                    payload = self._read_json_body()
+                except json.JSONDecodeError as e:
+                    self._json(400, {"error": "invalid json: " + str(e)})
+                    return
+                for key in ("lat", "lon", "arriveBy"):
+                    if key not in payload:
+                        self._json(
+                            400,
+                            {
+                                "error": "need lat, lon, arriveBy (ISO UTC, e.g. 2026-06-01T12:00:00Z)",
+                            },
+                        )
+                        return
+                req: dict[str, Any] = {
+                    "action": "destination_arrival",
+                    "lat": payload["lat"],
+                    "lon": payload["lon"],
+                    "arriveBy": payload["arriveBy"],
+                }
+                if "type" in payload:
+                    req["type"] = payload["type"]
+                if "sortBy" in payload:
+                    req["sortBy"] = payload["sortBy"]
+                vehicles = payload.get("vehicles")
+                if isinstance(vehicles, list) and len(vehicles) > 0:
+                    req["vehicles"] = vehicles
+                try:
+                    result = core.ingest(req)
+                    veh_list = vehicles if isinstance(vehicles, list) else None
+                    core.map_state.update_arrival(veh_list, result)
+                    self._json(200, result)
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
+                return
+
             self._json(404, {"error": "not found"})
 
     return Handler
@@ -487,6 +557,7 @@ def main():
     print(f"http://127.0.0.1:{args.port}/map  (live fleet map)")
     print(f"http://127.0.0.1:{args.port}/api/vehicle  (GET /health)")
     print(f"http://127.0.0.1:{args.port}/api/meetings/lead  (batch vs first vehicle)")
+    print(f"http://127.0.0.1:{args.port}/api/destinations/arrive  (vehicles reaching destination by time)")
     print("Service is ready — POST returns meeting results, not loading.")
     try:
         server.serve_forever()

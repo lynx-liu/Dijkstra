@@ -412,6 +412,101 @@ std::vector<FocalBestMeeting> FleetMeetingService::meetingsWithLead(
   return predictMeetingsWithLead(vehicles, histories, ctx_, ctx_.index, p);
 }
 
+DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
+    double destLat, double destLon, int64_t arriveByUnix, VehicleType destType,
+    ArrivalSortBy sortBy, const std::vector<VehicleInfo>* overrideVehicles,
+    const std::vector<VehicleHistory>* overrideHistories, std::string* error) {
+  DestinationArrivalSummary empty;
+  if (arriveByUnix <= 0) {
+    if (error) {
+      *error = "arriveByUnix must be positive";
+    }
+    return empty;
+  }
+
+  std::vector<VehicleInfo> vehicles;
+  std::vector<VehicleHistory> histories;
+  if (overrideVehicles != nullptr && !overrideVehicles->empty()) {
+    vehicles = *overrideVehicles;
+    if (overrideHistories != nullptr) {
+      histories = *overrideHistories;
+    }
+  } else {
+    vehicles = fleetSnapshot(fleet_);
+    histories = historySnapshot(histories_);
+  }
+
+  if (vehicles.empty()) {
+    if (error) {
+      *error = "no vehicles (ingest fleet or pass vehicles array)";
+    }
+    return empty;
+  }
+
+  int64_t latestVehicleTime = 0;
+  for (const auto& v : vehicles) {
+    latestVehicleTime = std::max(latestVehicleTime, v.timestamp);
+  }
+  if (arriveByUnix <= latestVehicleTime) {
+    if (error) {
+      *error =
+          "arriveBy must be later than every vehicle time "
+          "(set arriveBy = vehicle time + travel window, e.g. +2 hours)";
+    }
+    return empty;
+  }
+
+  VehicleInfo destProbe;
+  destProbe.id = "__destination__";
+  destProbe.lat = destLat;
+  destProbe.lon = destLon;
+  destProbe.type = destType;
+  destProbe.speed = 60.0;
+  destProbe.timestamp = arriveByUnix;
+
+  std::vector<VehicleInfo> forGraph = vehicles;
+  forGraph.push_back(destProbe);
+
+  if (!ensureGraphForVehicles(forGraph, error)) {
+    return empty;
+  }
+
+  const PredictParam p = servicePredictParam();
+
+  double padM = paddingMeters_;
+  for (const auto& v : vehicles) {
+    const double d = haversineMeters({destLat, destLon}, {v.lat, v.lon});
+    padM = std::min(padM, d + 20000.0);
+  }
+  padM = std::max(padM, 15000.0);
+
+  if (fullGraphLoaded_ || indexOnlyLoaded_) {
+    const GraphContext* sub = nullptr;
+    std::string subErr;
+    if (!getOrBuildSubgraph(destProbe, forGraph, padM, sub, &subErr)) {
+      if (error) {
+        *error = subErr;
+      }
+      return empty;
+    }
+    DestinationQuery q;
+    q.lat = destLat;
+    q.lon = destLon;
+    q.arriveByUnix = arriveByUnix;
+    q.type = destType;
+    q.sortBy = sortBy;
+    return predictVehiclesToDestination(vehicles, histories, *sub, ctx_.index, q, p);
+  }
+
+  DestinationQuery q;
+  q.lat = destLat;
+  q.lon = destLon;
+  q.arriveByUnix = arriveByUnix;
+  q.type = destType;
+  q.sortBy = sortBy;
+  return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);
+}
+
 bool FleetMeetingService::removeVehicle(const std::string& vehicleId) {
   fleetIndex_.remove(vehicleId);
   const bool had = fleet_.erase(vehicleId) > 0;

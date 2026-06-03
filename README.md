@@ -51,8 +51,8 @@ export MMLP_GRAPH_PATH=data/graph/china.mmlp.bin
 ./build/mmlp_predict \
   --graph data/graph/china.mmlp.bin \
   --focal truck_A \
-  --vehicle truck_A,43.9055,87.4561,72,1700000000 \
-  --vehicle truck_B,43.9132,87.4920,72,1700000000 \
+  --vehicle truck_A,43.9055,87.4561,72,1780308000 \
+  --vehicle truck_B,43.9132,87.4920,72,1780308000 \
   --padding-m 80000
 ```
 
@@ -63,8 +63,7 @@ export MMLP_GRAPH_PATH=data/graph/china.mmlp.bin
   "found": true,
   "focal": "A",
   "partner": "B",
-  "meetTimeUnix": 1700000075,
-  "meetTimeUtc": "2023-11-14T22:13:55Z",
+  "meetTime": "2026-06-01T10:01:15Z",
   "meetDurationSec": 74.93,
   "lat": 43.9094,
   "lon": 87.4741,
@@ -72,7 +71,7 @@ export MMLP_GRAPH_PATH=data/graph/china.mmlp.bin
 }
 ```
 
-`meetTimeUnix` 为整数 Unix 秒；`meetTimeUtc` 为 UTC 的 ISO 8601 时间。
+`meetTime` 为 UTC 的 ISO 8601 时间字符串（如 `2026-06-01T10:01:15Z`）。
 
 ## 常驻服务（逐车接入）
 
@@ -87,11 +86,11 @@ bash tools/start_http_server.sh
 
 curl -X POST http://127.0.0.1:8080/api/vehicle \
   -H 'Content-Type: application/json' \
-  -d '{"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000100}'
+  -d '{"id":"新A5D107","lat":43.9055,"lon":87.4561,"speed":72,"time":"2026-06-03T10:00:00Z"}'
 
 curl -X POST http://127.0.0.1:8080/api/vehicle \
   -H 'Content-Type: application/json' \
-  -d '{"id":"t2","lat":43.9132,"lon":87.4920,"speed":72,"timestamp":1700000100}'
+  -d '{"id":"新A3M892","lat":43.915,"lon":87.528,"speed":72,"time":"2026-06-03T10:00:00Z"}'
 ```
 
 第二辆车 POST 后，返回的 `partner` 为与之最快会合的已接入车辆；第一辆车时 `found:false`（车队不足 2 辆）。返回含路径 `routeSelf` / `routePartner` 及路程 `routeDistanceSelfM` / `routeDistancePartnerM`，详见下方 [HTTP 接口](#http-接口)。
@@ -102,7 +101,7 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 # 每行一辆车的 JSON，stdout 一行结果
 ```
 
-请求字段：`id`, `lat`, `lon`, `speed`(km/h), `timestamp`(Unix 秒)；可选 `type`:`train`、`history`:[72,70,...]。
+请求字段：`id`, `lat`, `lon`, `speed`(km/h), `time`（ISO UTC，如 `2026-06-01T10:00:00Z`）；可选 `type`:`train`、`history`:[72,70,...]。
 
 全部两两组合加 `--all-pairs`。车辆 GPS 须能匹配到路网且在同一连通分量上。
 
@@ -112,8 +111,8 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 
 - 默认端口 `8080`；服务未就绪时返回 `503`
 - 请求体 `Content-Type: application/json`
-- 车辆字段：`id`, `lat`, `lon`, `speed`（km/h）, `timestamp`（Unix 秒）；可选 `type`（`truck` / `train`）、`history`（速度样本数组，km/h）
-- 时间对齐：两车会合前，先将各车状态对齐到 `max(timestamp)`；`timestamp` 较早的车会沿路网先「追平」时间差，再计算会合
+- 车辆字段：`id`, `lat`, `lon`, `speed`（km/h）, `time`（ISO UTC 字符串）；可选 `type`（`truck` / `train`）、`history`（速度样本数组，km/h）
+- 时间对齐：两车会合前，先将各车状态对齐到 **较晚的 `time`**；较早观测的车会沿路网先「追平」时间差，再计算会合
 - 会合优化目标：**最早会合时间**（`meetDurationSec` 最小），不是地理中点
 - 路径字段：`routeSelf` 为基准车（或本次 POST 车辆）到会合点的路网折线；`routePartner` 为对方车辆到会合点的折线；坐标为 `[[lat, lon], ...]`，首点尽量与车辆上报 GPS 衔接
 
@@ -146,7 +145,7 @@ curl http://127.0.0.1:8080/health
 ```bash
 curl -X POST http://127.0.0.1:8080/api/vehicle \
   -H 'Content-Type: application/json' \
-  -d '{"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000100}'
+  -d '{"id":"新A5D107","lat":43.9055,"lon":87.4561,"speed":72,"time":"2026-06-03T10:00:00Z"}'
 ```
 
 返回示例（已找到会合）：
@@ -154,10 +153,9 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 ```json
 {
   "found": true,
-  "focal": "t1",
-  "partner": "t2",
-  "meetTimeUnix": 1700000176,
-  "meetTimeUtc": "2023-11-14T22:16:16Z",
+  "focal": "新A5D107",
+  "partner": "新A3M892",
+  "meetTime": "2026-06-01T10:01:16Z",
   "meetDurationSec": 76.09,
   "lat": 43.909409,
   "lon": 87.474346,
@@ -181,7 +179,7 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 ```json
 {
   "found": false,
-  "focal": "t1"
+  "focal": "新A5D107"
 }
 ```
 
@@ -192,8 +190,7 @@ curl -X POST http://127.0.0.1:8080/api/vehicle \
 | `found` | 是否找到可达会合点 |
 | `focal` | 本次请求车辆 ID |
 | `partner` | 与 `focal` 会合最快的已接入车辆 ID（仅 `found:true`） |
-| `meetTimeUnix` | 会合时刻，Unix 秒（整数） |
-| `meetTimeUtc` | 会合时刻，UTC ISO 8601 字符串 |
+| `meetTime` | 会合时刻，UTC ISO 8601 字符串 |
 | `meetDurationSec` | 从两车时间对齐后起算，到会合的耗时（秒） |
 | `lat` / `lon` | 会合点 WGS84 坐标 |
 | `locationId` | 会合点在路网上的位置标识（节点 ID 或 `edge:<id>`） |
@@ -213,24 +210,42 @@ curl -X POST http://127.0.0.1:8080/api/meetings/lead \
   -H 'Content-Type: application/json' \
   -d '{
     "vehicles": [
-      {"id":"t1","lat":43.9055,"lon":87.4561,"speed":72,"timestamp":1700000100},
-      {"id":"t2","lat":43.9132,"lon":87.4920,"speed":70,"timestamp":1700000100},
-      {"id":"t3","lat":43.9200,"lon":87.5000,"speed":68,"timestamp":1700000100}
+      {"id":"新A5D107","lat":43.9055,"lon":87.4561,"speed":72,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A8K231","lat":43.918,"lon":87.475,"speed":65,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A3M892","lat":43.915,"lon":87.528,"speed":68,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A2H668","lat":43.65,"lon":87.50,"speed":70,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A1L335","lat":43.92,"lon":86.25,"speed":75,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A6C778","lat":43.92,"lon":88.75,"speed":72,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A4N902","lat":42.95,"lon":89.18,"speed":78,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A7T281","lat":42.35,"lon":89.85,"speed":80,"time":"2026-06-03T10:00:00Z"},
+      {"id":"新A5X640","lat":41.76,"lon":86.17,"speed":82,"time":"2026-06-03T10:00:00Z"}
     ]
   }'
 ```
+
+乌鲁木齐示例车队（目的地 `43.92, 87.50`，`id` 为**模拟车牌**；直线距离约值，路网里程通常更长）：
+
+| 车牌 | 档位 | 约直线距离 | 位置说明 |
+|------|------|------------|----------|
+| `新A8K231` / `新A3M892` | 近 | 3–5 km | 目的地西/东 |
+| `新A5D107` / `新A2H668` / `新A9R004` | 城区/近郊 | 15–50 km | 市区及南郊 |
+| `新A1L335` / `新A6C778` / `新A0B519` | **百公里** | ~100 km | 西、东、南 |
+| `新A4N902` | **约180km** | 东南（吐鲁番方向） |
+| `新A7T281` | **约280km** | 东南 |
+| `新A5X640` / `新A3Q118` | **约380–480km** | 南（库尔勒及以南干线） |
+
+一键冒烟：`bash tools/smoke_meetings_lead.sh`（9 车，基准 `新A5D107`）。完整坐标见 `tools/demo_fleet.json`。
 
 返回示例：
 
 ```json
 {
-  "focal": "t1",
+  "focal": "新A5D107",
   "meetings": [
     {
       "found": true,
-      "partner": "t2",
-      "meetTimeUnix": 1700000176,
-      "meetTimeUtc": "2023-11-14T22:16:16Z",
+      "partner": "新A8K231",
+      "meetTime": "2026-06-01T10:01:16Z",
       "meetDurationSec": 76.09,
       "lat": 43.909409,
       "lon": 87.474346,
@@ -249,9 +264,8 @@ curl -X POST http://127.0.0.1:8080/api/meetings/lead \
     },
     {
       "found": true,
-      "partner": "t3",
-      "meetTimeUnix": 1700000257,
-      "meetTimeUtc": "2023-11-14T22:17:37Z",
+      "partner": "新A3M892",
+      "meetTime": "2026-06-01T10:02:37Z",
       "meetDurationSec": 157.02,
       "lat": 43.914401,
       "lon": 87.491518,
@@ -284,7 +298,54 @@ curl -X POST http://127.0.0.1:8080/api/meetings/lead \
 
 排序规则：`found:true` 的项按 `meetDurationSec` 升序；`found:false` 的项排在后面（按 `partner` 字典序）。
 
-### 3) 实时地图
+### 3) 目的地到达（给定目的地与截止时间）
+
+- `POST /api/destinations/arrive`
+- 输入：`lat`、`lon`、`arriveBy`（ISO UTC 时间，如 `2026-06-01T12:00:00Z`）
+- 可选：`type`（`truck` / `train`）、`sortBy`（排序方式）、`vehicles`（省略则使用已接入车队）
+- 输出：能按时到达的车辆列表；含 `route` 折线与 `routeDistanceM`
+
+**`sortBy` 取值**（默认 `duration`）：
+
+| 值 | 说明 |
+|----|------|
+| `duration` | 按行程时间 `travelDurationSec` 升序（最短在前） |
+| `eta` | 按预计到达时间 `eta` 升序（最早在前） |
+| `distance` | 按路网距离 `routeDistanceM` 升序（最近在前） |
+
+```bash
+# 推荐：一次请求带上多档距离车辆（见 tools/demo_fleet.json）
+VEHICLE_TIME="2026-06-03T10:00:00Z"
+ARRIVE_BY="2026-06-04T10:00:00Z"   # 远途建议 +24h（数百公里）
+
+curl -X POST http://127.0.0.1:8080/api/destinations/arrive \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"lat\":43.92,\"lon\":87.50,\"arriveBy\":\"${ARRIVE_BY}\",\"sortBy\":\"distance\",
+    \"vehicles\":[
+      {\"id\":\"新A8K231\",\"lat\":43.918,\"lon\":87.475,\"speed\":65,\"time\":\"${VEHICLE_TIME}\"},
+      {\"id\":\"新A5D107\",\"lat\":43.9055,\"lon\":87.4561,\"speed\":72,\"time\":\"${VEHICLE_TIME}\"},
+      {\"id\":\"新A1L335\",\"lat\":43.92,\"lon\":86.25,\"speed\":75,\"time\":\"${VEHICLE_TIME}\"},
+      {\"id\":\"新A4N902\",\"lat\":42.95,\"lon\":89.18,\"speed\":78,\"time\":\"${VEHICLE_TIME}\"},
+      {\"id\":\"新A7T281\",\"lat\":42.35,\"lon\":89.85,\"speed\":80,\"time\":\"${VEHICLE_TIME}\"},
+      {\"id\":\"新A5X640\",\"lat\":41.76,\"lon\":86.17,\"speed\":82,\"time\":\"${VEHICLE_TIME}\"}
+    ]
+  }"
+
+# 自动配对时间（12 车，近郊～约500km，sortBy=distance，+24h）：
+bash tools/smoke_dest_arrive.sh
+```
+
+**不要用两个独立的 `date -u now`**：若 `time` 用 `NOW=$(date …)`、`arriveBy` 又用另一次 `date …`，或目的地请求晚于上车请求，可能出现 `arriveBy ≤ vehicle time`，结果永远 `vehicles: []`。正确写法是让截止时刻**基于同一观测时刻**计算：
+
+```bash
+VEHICLE_TIME=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+ARRIVE_BY=$(date -u -d "${VEHICLE_TIME} + 24 hours" +%Y-%m-%dT%H:%M:%SZ)   # 百公里～数百公里须 +24h
+```
+
+也可先 POST `/api/vehicle` 再查目的地，但 `arriveBy` 仍须 **晚于** 已接入车辆各自的 `time`。
+
+### 4) 实时地图
 
 - `GET /map` — 浏览器打开实时地图（车辆位置、会合点、路径；点击标记弹出详情）
 - `GET /api/map/state` — 最近一次 POST 后的车辆与会合快照（地图页每 2 秒轮询）
@@ -300,17 +361,16 @@ curl http://127.0.0.1:8080/api/map/state
 ```json
 {
   "vehicles": [
-    {"id": "t1", "lat": 43.9055, "lon": 87.4561, "speed": 72, "timestamp": 1700000100, "type": "truck"},
-    {"id": "t2", "lat": 43.9132, "lon": 87.492, "speed": 70, "timestamp": 1700000100, "type": "truck"},
-    {"id": "t3", "lat": 43.92, "lon": 87.5, "speed": 68, "timestamp": 1700000100, "type": "truck"}
+    {"id": "新A8K231", "lat": 43.918, "lon": 87.475, "speed": 65, "time": "2026-06-03T10:00:00Z", "type": "truck"},
+    {"id": "新A5D107", "lat": 43.9055, "lon": 87.4561, "speed": 72, "time": "2026-06-03T10:00:00Z", "type": "truck"},
+    {"id": "新A1L335", "lat": 43.92, "lon": 86.25, "speed": 75, "time": "2026-06-03T10:00:00Z", "type": "truck"}
   ],
-  "focal": "t1",
+  "focal": "新A5D107",
   "meetings": [
     {
       "found": true,
-      "partner": "t2",
-      "meetTimeUnix": 1700000176,
-      "meetTimeUtc": "2023-11-14T22:16:16Z",
+      "partner": "新A8K231",
+      "meetTime": "2026-06-01T10:01:16Z",
       "meetDurationSec": 76.09,
       "lat": 43.909409,
       "lon": 87.474346,
@@ -322,7 +382,7 @@ curl http://127.0.0.1:8080/api/map/state
     }
   ],
   "mode": "batch",
-  "updatedAt": 1717123456.789
+  "updatedAt": "2026-06-01T10:05:00Z"
 }
 ```
 
@@ -333,8 +393,11 @@ curl http://127.0.0.1:8080/api/map/state
 | `vehicles` | 最近一次 POST 涉及的全部车辆（上报 GPS） |
 | `focal` | 基准车 ID（批量接口为 `vehicles[0]`；单车接口为本次 POST 车辆） |
 | `meetings` | 最近一次 POST 返回的会合结果（结构与上文相同） |
-| `mode` | `batch`（`/api/meetings/lead`）或 `single`（`/api/vehicle`） |
-| `updatedAt` | 快照更新时间，Unix 秒（浮点） |
+| `destination` | 目的地到达模式下的 `{lat, lon, arriveBy, locationId}` |
+| `arrivals` | 目的地到达模式下的可到达车辆列表（含 `route`、`eta`） |
+| `sortBy` | 目的地到达排序方式：`duration` / `eta` / `distance` |
+| `mode` | `batch`、`single` 或 `arrival`（`/api/destinations/arrive`） |
+| `updatedAt` | 快照更新时间，UTC ISO 8601 字符串 |
 
 ## 验证地图（网页预览）
 
@@ -403,6 +466,6 @@ mmlp::FocalBestMeeting predictBestMeetingFor(
 mmlp::FocalBestMeeting predictBestMeetingForCurrent(fleet, histories, graph);
 ```
 
-`FocalBestMeeting` 字段：`partnerVehicleId`、`meetTime`（Unix 秒）、`meetDuration`（对齐起点后的等待秒数）、`lat`/`lon`/`locationId`。
+`FocalBestMeeting` 字段：`partnerVehicleId`、`meetTime`（ISO UTC）、`meetDuration`（对齐起点后的等待秒数）、`lat`/`lon`/`locationId`。
 
 设计补充见 [docs/DESIGN.md](docs/DESIGN.md)。
