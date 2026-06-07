@@ -32,6 +32,21 @@ double extractMaxRadiusM() {
   return 55000.0;
 }
 
+uint64_t destinationSubgraphCacheKey(const std::vector<VehicleInfo>& vehicles, int widthKm) {
+  uint64_t h = 0xDE57A7110ULL;
+  h ^= static_cast<uint64_t>(widthKm) * 1315423911u;
+  for (const auto& v : vehicles) {
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(
+              static_cast<int>(std::floor(v.lat / 0.05)))) *
+         2654435761u;
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(
+              static_cast<int>(std::floor(v.lon / 0.05)))) *
+         1597334677u;
+    h ^= std::hash<std::string>{}(v.id);
+  }
+  return h;
+}
+
 uint64_t meetingSubgraphCacheKey(const VehicleInfo& focal,
                                  const std::vector<VehicleInfo>& partners, int widthKm) {
   uint64_t h = (static_cast<uint64_t>(static_cast<uint32_t>(
@@ -266,6 +281,46 @@ bool FleetMeetingService::getOrBuildSubgraph(const VehicleInfo& focal,
   return true;
 }
 
+bool FleetMeetingService::getOrBuildDestinationSubgraph(const std::vector<VehicleInfo>& vehicles,
+                                                        double paddingMeters,
+                                                        const GraphContext*& sub,
+                                                        std::string* error) {
+  paddingMeters = std::min(paddingMeters, extractMaxRadiusM());
+  const int widthKm = static_cast<int>(paddingMeters / 5000.0);
+  const uint64_t key = destinationSubgraphCacheKey(vehicles, widthKm);
+
+  const auto hit = subgraphCache_.find(key);
+  if (hit != subgraphCache_.end()) {
+    sub = &hit->second.ctx;
+    subgraphCacheLru_.remove(key);
+    subgraphCacheLru_.push_back(key);
+    return true;
+  }
+
+  if (subgraphCache_.size() >= kSubgraphCacheMax) {
+    const uint64_t evict = subgraphCacheLru_.front();
+    subgraphCacheLru_.pop_front();
+    subgraphCache_.erase(evict);
+  }
+
+  SubgraphCacheEntry entry;
+  entry.key = key;
+  bool ok = false;
+  if (indexOnlyLoaded_) {
+    ok = extractGraphContextForDestinationIndexed(graphStore_, ctx_.index, vehicles,
+                                                  paddingMeters, entry.ctx, error);
+  } else {
+    ok = extractGraphContextForDestination(ctx_, vehicles, paddingMeters, entry.ctx, error);
+  }
+  if (!ok) {
+    return false;
+  }
+  subgraphCache_[key] = std::move(entry);
+  subgraphCacheLru_.push_back(key);
+  sub = &subgraphCache_[key].ctx;
+  return true;
+}
+
 FocalBestMeeting FleetMeetingService::ingestVehicle(const VehicleInfo& vehicle,
                                                     const VehicleHistory* history,
                                                     std::string* error) {
@@ -473,14 +528,22 @@ DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
 
   const PredictParam p = servicePredictParam();
 
-  double padM = paddingMeters_;
-  for (const auto& v : vehicles) {
-    const double d = haversineMeters({destLat, destLon}, {v.lat, v.lon});
-    padM = std::min(padM, d + 20000.0);
-  }
-  padM = std::max(padM, 15000.0);
+  // Corridor width cap (55km default); do not use paddingMeters_ (150km) — bbox extract was 10× slower.
+  double padM = extractMaxRadiusM();
 
-  if (fullGraphLoaded_ || indexOnlyLoaded_) {
+  DestinationQuery q;
+  q.lat = destLat;
+  q.lon = destLon;
+  q.arriveByUnix = arriveByUnix;
+  q.type = destType;
+  q.sortBy = sortBy;
+
+  if (fullGraphLoaded_) {
+    return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);
+  }
+
+  if (indexOnlyLoaded_) {
+    const auto t0 = std::chrono::steady_clock::now();
     const GraphContext* sub = nullptr;
     std::string subErr;
     if (!getOrBuildSubgraph(destProbe, forGraph, padM, sub, &subErr)) {
@@ -489,21 +552,21 @@ DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
       }
       return empty;
     }
-    DestinationQuery q;
-    q.lat = destLat;
-    q.lon = destLon;
-    q.arriveByUnix = arriveByUnix;
-    q.type = destType;
-    q.sortBy = sortBy;
-    return predictVehiclesToDestination(vehicles, histories, *sub, ctx_.index, q, p);
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto summary =
+        predictVehiclesToDestination(vehicles, histories, *sub, ctx_.index, q, p);
+    const auto t2 = std::chrono::steady_clock::now();
+    std::cerr << "[mmlp] destination vehicles=" << vehicles.size()
+              << " sub_nodes=" << sub->graph.nodes().size()
+              << " extract_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " predict_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+              << " reachable=" << summary.vehicles.size() << "\n"
+              << std::flush;
+    return summary;
   }
 
-  DestinationQuery q;
-  q.lat = destLat;
-  q.lon = destLon;
-  q.arriveByUnix = arriveByUnix;
-  q.type = destType;
-  q.sortBy = sortBy;
   return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);
 }
 

@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(Threads REQUIRED)
+
 add_library(mmlp
   src/arrival.cpp
   src/geo.cpp
@@ -24,6 +26,7 @@ add_library(mmlp
   src/spatial_index.cpp
 )
 target_include_directories(mmlp PUBLIC include)
+target_link_libraries(mmlp PUBLIC Threads::Threads)
 
 add_executable(test_fixture tests/test_fixture.cpp)
 target_link_libraries(test_fixture PRIVATE mmlp)

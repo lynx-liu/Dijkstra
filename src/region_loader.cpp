@@ -4,9 +4,9 @@
 #include "mmlp/graph_io.hpp"
 
 #include <cmath>
-#include <iostream>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -517,6 +517,47 @@ bool extractGraphContextForMeetingIndexed(const GraphFileStore& store, const Spa
     collectCorridorEdgeIdsIndexed(store, index, focalLl, partnerLl, width, edgeIds);
   }
 
+  if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
+    return false;
+  }
+  return true;
+}
+
+bool extractGraphContextForDestination(const GraphContext& full,
+                                       const std::vector<VehicleInfo>& vehicles,
+                                       double paddingMeters, GraphContext& out,
+                                       std::string* error) {
+  if (vehicles.empty()) {
+    if (error) {
+      *error = "no vehicles for destination extract";
+    }
+    return false;
+  }
+  const GeoBBox box = bboxFromVehicles(vehicles, paddingMeters);
+  return extractGraphContextInBBox(full, box, out, error, false);
+}
+
+bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
+                                              const SpatialIndex& index,
+                                              const std::vector<VehicleInfo>& vehicles,
+                                              double paddingMeters, GraphContext& out,
+                                              std::string* error) {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (vehicles.empty()) {
+    return fail("no vehicles for destination extract");
+  }
+
+  const GeoBBox box = bboxFromVehicles(vehicles, paddingMeters);
+  std::unordered_set<int64_t> edgeIds;
+  index.collectEdgesInBBox(box, edgeIds);
+  if (edgeIds.empty()) {
+    return fail("no graph edges in destination bbox");
+  }
   if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
     return false;
   }

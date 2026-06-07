@@ -59,4 +59,16 @@ bool extractGraphContextForMeetingIndexed(const GraphFileStore& store, const Spa
                                          double maxCorridorWidthM, GraphContext& out,
                                          std::string* error = nullptr);
 
+// Destination batch: one bbox around all vehicles + destination (faster than N corridors).
+bool extractGraphContextForDestination(const GraphContext& full,
+                                       const std::vector<VehicleInfo>& vehicles,
+                                       double paddingMeters, GraphContext& out,
+                                       std::string* error = nullptr);
+
+bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
+                                              const SpatialIndex& index,
+                                              const std::vector<VehicleInfo>& vehicles,
+                                              double paddingMeters, GraphContext& out,
+                                              std::string* error = nullptr);
+
 }  // namespace mmlp

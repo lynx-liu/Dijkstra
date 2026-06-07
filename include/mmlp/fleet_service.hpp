@@ -69,6 +69,10 @@ class FleetMeetingService {
   bool getOrBuildSubgraph(const VehicleInfo& focal, const std::vector<VehicleInfo>& partners,
                           double corridorWidthM, const GraphContext*& sub, std::string* error);
 
+  bool getOrBuildDestinationSubgraph(const std::vector<VehicleInfo>& vehicles,
+                                     double paddingMeters, const GraphContext*& sub,
+                                     std::string* error);
+
   std::string graphPath_;
   double paddingMeters_;
   GraphFileStore graphStore_;

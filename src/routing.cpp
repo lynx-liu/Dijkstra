@@ -246,21 +246,41 @@ LatLon positionLatLon(const MultimodalGraph& graph, const GraphPosition& pos) {
   return {from->lat + t * (to->lat - from->lat), from->lon + t * (to->lon - from->lon)};
 }
 
-RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosition& start,
-                                   const GraphPosition& goal, double speedMs, VehicleType type,
-                                   const PredictParam& param, double maxTime) {
-  RoutePolyline route;
-  if (!start.valid || !goal.valid || maxTime <= 0.0) {
-    return route;
+void simplifyRoutePolyline(RoutePolyline& route, std::size_t maxPoints) {
+  if (maxPoints < 2 || route.points.size() <= maxPoints) {
+    return;
   }
+  const std::size_t n = route.points.size();
+  std::vector<LatLon> out;
+  out.reserve(maxPoints);
+  for (std::size_t i = 0; i < maxPoints; ++i) {
+    const std::size_t idx = i * (n - 1) / (maxPoints - 1);
+    out.push_back(route.points[idx]);
+  }
+  route.points = std::move(out);
+}
+
+RouteToGoal computeRouteToGoal(const MultimodalGraph& graph, const GraphPosition& start,
+                               const GraphPosition& goal, double speedMs, VehicleType type,
+                               const PredictParam& param, double maxTime) {
+  RouteToGoal result;
+  if (!start.valid || !goal.valid || maxTime <= 0.0) {
+    return result;
+  }
+  RoutePolyline& route = result.polyline;
 
   const LatLon goalLoc = positionLatLon(graph, goal);
   const double maxSpeedMs = std::max(speedMs, 5.0);
+
+  const Edge* goalEdge = goal.edgeId != 0 ? graph.findEdge(goal.edgeId) : nullptr;
+  const int64_t goalNodeOnly = goal.edgeId == 0 ? goal.nodeId : 0;
 
   using QueueItem = std::tuple<double, double, int64_t>;
   std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
   std::unordered_map<int64_t, double> dist;
   std::unordered_map<int64_t, int64_t> parent;
+  dist.reserve(8192);
+  parent.reserve(8192);
 
   auto heuristic = [&](int64_t nodeId) -> double {
     const Node* node = graph.findNode(nodeId);
@@ -292,7 +312,7 @@ RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosi
   } else {
     const Edge* edge = graph.findEdge(start.edgeId);
     if (edge == nullptr) {
-      return route;
+      return result;
     }
     const double toFrom = travelTimeSeconds(start.alongMeters, speedMs, type, param);
     const double toTo =
@@ -306,21 +326,58 @@ RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosi
   const std::size_t visitCap =
       param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
 
+  double bestGoalTime = kInfTime;
+  int64_t bestGoalNode = 0;
+
+  auto updateGoalFromNode = [&](int64_t nodeId, double nodeT) {
+    if (goalNodeOnly != 0 && nodeId == goalNodeOnly && nodeT < bestGoalTime) {
+      bestGoalTime = nodeT;
+      bestGoalNode = nodeId;
+      return;
+    }
+    if (goalEdge == nullptr) {
+      return;
+    }
+    if (nodeId == goalEdge->from) {
+      const double tGoal =
+          nodeT + travelTimeSeconds(goal.alongMeters, speedMs, type, param);
+      if (tGoal < bestGoalTime) {
+        bestGoalTime = tGoal;
+        bestGoalNode = goalEdge->from;
+      }
+    }
+    if (nodeId == goalEdge->to) {
+      const double tGoal =
+          nodeT + travelTimeSeconds(std::max(0.0, goalEdge->length - goal.alongMeters), speedMs,
+                                    type, param);
+      if (tGoal < bestGoalTime) {
+        bestGoalTime = tGoal;
+        bestGoalNode = goalEdge->to;
+      }
+    }
+  };
+
   while (!pq.empty()) {
     if (dist.size() >= visitCap) {
       break;
     }
     const auto [f, t, u] = pq.top();
+    if (bestGoalTime < kInfTime / 2.0 && f >= bestGoalTime - 1e-6) {
+      break;
+    }
     pq.pop();
-    (void)f;
     const auto it = dist.find(u);
     if (it == dist.end() || t > it->second + 1e-6) {
       continue;
     }
 
+    updateGoalFromNode(u, t);
+    if (goalNodeOnly != 0 && u == goalNodeOnly && t <= bestGoalTime + 1e-6) {
+      break;
+    }
+
     for (const AdjacencyEdge& adj : graph.neighbors(u)) {
-      const Edge* edge = graph.findEdge(adj.edgeId);
-      if (edge == nullptr || !edgeAllowedForVehicle(edge->type, type)) {
+      if (!edgeAllowedForVehicle(adj.type, type)) {
         continue;
       }
       const double eff = edgeEffectiveSpeedMs(adj, type, speedMs);
@@ -329,44 +386,10 @@ RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosi
     }
   }
 
-  auto nodeTime = [&](int64_t nodeId) -> double {
-    const auto it = dist.find(nodeId);
-    if (it == dist.end()) {
-      return kInfTime;
-    }
-    return it->second;
-  };
-
-  double bestGoalTime = kInfTime;
-  int64_t bestGoalNode = 0;
-
-  if (goal.edgeId == 0) {
-    const double t = nodeTime(goal.nodeId);
-    if (t < bestGoalTime) {
-      bestGoalTime = t;
-      bestGoalNode = goal.nodeId;
-    }
-  } else {
-    const Edge* edge = graph.findEdge(goal.edgeId);
-    if (edge != nullptr) {
-      const double fromSide =
-          nodeTime(edge->from) + travelTimeSeconds(goal.alongMeters, speedMs, type, param);
-      const double toSide =
-          nodeTime(edge->to) +
-          travelTimeSeconds(std::max(0.0, edge->length - goal.alongMeters), speedMs, type, param);
-      if (fromSide <= toSide && fromSide < bestGoalTime) {
-        bestGoalTime = fromSide;
-        bestGoalNode = edge->from;
-      } else if (toSide < bestGoalTime) {
-        bestGoalTime = toSide;
-        bestGoalNode = edge->to;
-      }
-    }
-  }
-
   if (bestGoalNode == 0 || bestGoalTime >= kInfTime / 2.0) {
-    return route;
+    return result;
   }
+  result.travelTimeSec = bestGoalTime;
 
   std::vector<int64_t> nodes;
   int64_t cur = bestGoalNode;
@@ -394,7 +417,13 @@ RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosi
       haversineMeters(route.points.back(), endLoc) > 1.0) {
     route.points.push_back(endLoc);
   }
-  return route;
+  return result;
+}
+
+RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosition& start,
+                                   const GraphPosition& goal, double speedMs, VehicleType type,
+                                   const PredictParam& param, double maxTime) {
+  return computeRouteToGoal(graph, start, goal, speedMs, type, param, maxTime).polyline;
 }
 
 }  // namespace mmlp

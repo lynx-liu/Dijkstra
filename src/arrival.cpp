@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <sstream>
+#include <thread>
+#include <vector>
 
 namespace mmlp {
 
@@ -24,7 +27,17 @@ const VehicleHistory* findHistory(const std::vector<VehicleHistory>& histories,
   return nullptr;
 }
 
-std::string locationIdForPosition(const GraphPosition& pos) {
+double polylineLengthMeters(const RoutePolyline& route) {
+  double sum = 0.0;
+  for (std::size_t i = 1; i < route.points.size(); ++i) {
+    sum += haversineMeters(route.points[i - 1], route.points[i]);
+  }
+  return sum;
+}
+
+}  // namespace
+
+std::string graphLocationId(const GraphPosition& pos) {
   if (!pos.valid) {
     return {};
   }
@@ -38,15 +51,7 @@ std::string locationIdForPosition(const GraphPosition& pos) {
   return oss.str();
 }
 
-double polylineLengthMeters(const RoutePolyline& route) {
-  double sum = 0.0;
-  for (std::size_t i = 1; i < route.points.size(); ++i) {
-    sum += haversineMeters(route.points[i - 1], route.points[i]);
-  }
-  return sum;
-}
-
-void sortArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy) {
+void sortDestinationArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy) {
   switch (sortBy) {
     case ArrivalSortBy::ETA:
       std::sort(rows.begin(), rows.end(),
@@ -69,7 +74,49 @@ void sortArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy)
   }
 }
 
-}  // namespace
+std::optional<VehicleArrivalResult> predictVehicleToDestination(
+    const VehicleInfo& vehicle, const VehicleHistory* history, const GraphContext& routeCtx,
+    const SpatialIndex& matchIndex, const DestinationQuery& dest, const GraphPosition& goalPos,
+    const PredictParam& param) {
+  if (vehicle.type != dest.type || !goalPos.valid) {
+    return std::nullopt;
+  }
+
+  const MultimodalGraph& graph = routeCtx.graph;
+  const PreparedVehicle prepared =
+      prepareVehicle(graph, vehicle, history, vehicle.timestamp, param, &matchIndex);
+  if (!prepared.valid) {
+    return std::nullopt;
+  }
+
+  const double maxHorizon =
+      std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+  if (maxHorizon < 1.0) {
+    return std::nullopt;
+  }
+
+  const RouteToGoal path = computeRouteToGoal(graph, prepared.position, goalPos, prepared.speedMs,
+                                              vehicle.type, param, maxHorizon);
+  const double travel = path.travelTimeSec;
+  if (travel >= kInfTime / 2.0 || travel > maxHorizon + 1e-6) {
+    return std::nullopt;
+  }
+
+  const double eta = static_cast<double>(vehicle.timestamp) + travel;
+  if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+    return std::nullopt;
+  }
+
+  VehicleArrivalResult row;
+  row.vehicleId = vehicle.id;
+  row.reachable = true;
+  row.travelDurationSec = travel;
+  row.etaUnix = eta;
+  row.routeDistanceM = polylineLengthMeters(path.polyline);
+  row.route = path.polyline;
+  simplifyRoutePolyline(row.route, 120);
+  return row;
+}
 
 DestinationArrivalSummary predictVehiclesToDestination(
     const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
@@ -91,58 +138,43 @@ DestinationArrivalSummary predictVehiclesToDestination(
   destProbe.timestamp = dest.arriveByUnix;
 
   const GraphPosition goalPos = matchVehicleToGraph(graph, destProbe, &matchIndex);
-  summary.locationId = locationIdForPosition(goalPos);
+  summary.locationId = graphLocationId(goalPos);
   if (!goalPos.valid) {
     return summary;
   }
 
-  const LatLon goalLoc{dest.lat, dest.lon};
   summary.vehicles.reserve(vehicles.size());
-
-  for (const auto& vehicle : vehicles) {
-    if (vehicle.type != dest.type) {
-      continue;
+  const std::size_t maxWorkers =
+      std::max<std::size_t>(1, static_cast<std::size_t>(std::thread::hardware_concurrency()));
+  const bool parallel = vehicles.size() > 2 && maxWorkers > 1;
+  if (parallel) {
+    std::vector<std::future<std::optional<VehicleArrivalResult>>> futures;
+    futures.reserve(vehicles.size());
+    for (const auto& vehicle : vehicles) {
+      const VehicleHistory* hist = findHistory(histories, vehicle.id);
+      futures.push_back(std::async(
+          std::launch::async,
+          [vehicle, hist, &routeCtx, &matchIndex, dest, goalPos, param]() {
+            return predictVehicleToDestination(vehicle, hist, routeCtx, matchIndex, dest, goalPos,
+                                             param);
+          }));
     }
-
-    VehicleArrivalResult row;
-    row.vehicleId = vehicle.id;
-
-    const VehicleHistory* hist = findHistory(histories, vehicle.id);
-    const PreparedVehicle prepared =
-        prepareVehicle(graph, vehicle, hist, vehicle.timestamp, param, &matchIndex);
-    if (!prepared.valid) {
-      continue;
+    for (auto& fut : futures) {
+      if (auto row = fut.get()) {
+        summary.vehicles.push_back(std::move(*row));
+      }
     }
-
-    const double maxHorizon =
-        std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
-    if (maxHorizon < 1.0) {
-      continue;
+  } else {
+    for (const auto& vehicle : vehicles) {
+      const VehicleHistory* hist = findHistory(histories, vehicle.id);
+      if (auto row = predictVehicleToDestination(vehicle, hist, routeCtx, matchIndex, dest,
+                                                 goalPos, param)) {
+        summary.vehicles.push_back(std::move(*row));
+      }
     }
-
-    const TimeField field = computeTimeField(graph, prepared.position, prepared.speedMs,
-                                             vehicle.type, param, maxHorizon, &goalLoc);
-    const double travel =
-        timeAtPosition(graph, field, goalPos, prepared.speedMs, vehicle.type, param);
-    if (travel >= kInfTime / 2.0 || travel > maxHorizon + 1e-6) {
-      continue;
-    }
-
-    const double eta = static_cast<double>(vehicle.timestamp) + travel;
-    if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
-      continue;
-    }
-
-    row.reachable = true;
-    row.travelDurationSec = travel;
-    row.etaUnix = eta;
-    row.route = computeRoutePolyline(graph, prepared.position, goalPos, prepared.speedMs,
-                                     vehicle.type, param, maxHorizon);
-    row.routeDistanceM = polylineLengthMeters(row.route);
-    summary.vehicles.push_back(std::move(row));
   }
 
-  sortArrivals(summary.vehicles, dest.sortBy);
+  sortDestinationArrivals(summary.vehicles, dest.sortBy);
   return summary;
 }
 

@@ -9,13 +9,14 @@ import argparse
 import json
 import mimetypes
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 # map_roads lives in tools/
@@ -219,16 +220,9 @@ class MmlpCore:
         self._lock = threading.Lock()
         self._ready_cond = threading.Condition()
         self.map_state = MapState()
-        self.road_basemap = RoadBasemap(graph)
-        self.tile_renderer = GraphTileRenderer(graph)
+        self.road_basemap: RoadBasemap | None = None
+        self.tile_renderer: GraphTileRenderer | None = None
         self.mbtiles: MBTilesStore | None = None
-        mbtiles_path = resolve_mbtiles_path()
-        if mbtiles_path:
-            try:
-                self.mbtiles = MBTilesStore(mbtiles_path)
-                sys.stderr.write(f"[http] offline map tiles: {mbtiles_path}\n")
-            except Exception as e:
-                sys.stderr.write(f"[http] mbtiles load failed: {e}\n")
 
         hint = "~5 min for full" if load_mode == "full" else "usually under 1 min for index"
         sys.stderr.write(
@@ -250,6 +244,17 @@ class MmlpCore:
         self._wait_service_ready()
         if self._load_error:
             raise RuntimeError(self._load_error)
+
+        # Defer mmap basemap until after mmlp_service ready (full graph needs all RAM).
+        self.road_basemap = RoadBasemap(graph)
+        self.tile_renderer = GraphTileRenderer(graph)
+        mbtiles_path = resolve_mbtiles_path()
+        if mbtiles_path:
+            try:
+                self.mbtiles = MBTilesStore(mbtiles_path)
+                sys.stderr.write(f"[http] offline map tiles: {mbtiles_path}\n")
+            except Exception as e:
+                sys.stderr.write(f"[http] mbtiles load failed: {e}\n")
 
     def _wait_service_ready(self) -> None:
         assert self._proc.stdout is not None
@@ -320,10 +325,35 @@ class MmlpCore:
         if self._proc.stdin:
             self._proc.stdin.close()
         self._proc.terminate()
-        self.road_basemap.close()
-        self.tile_renderer.close()
+        if self.road_basemap is not None:
+            self.road_basemap.close()
+        if self.tile_renderer is not None:
+            self.tile_renderer.close()
         if self.mbtiles is not None:
             self.mbtiles.close()
+
+
+class ReuseThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+def reserve_listen_socket(host: str, port: int) -> socket.socket:
+    """Bind port before slow graph load so two starts cannot race on 8080."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as e:
+        sock.close()
+        raise OSError(
+            f"cannot bind {host}:{port} ({e}). "
+            f"Another mmlp HTTP may be running — try: curl http://127.0.0.1:{port}/health "
+            f"or: pkill -f mmlp_http_server; sleep 1; bash tools/start_http_server.sh"
+        ) from e
+    sock.listen(128)
+    sys.stderr.write(f"[http] listening on {host}:{port} (graph loading in background)...\n")
+    sys.stderr.flush()
+    return sock
 
 
 def make_handler(core: MmlpCore, web_root: str):
@@ -547,13 +577,23 @@ def main():
         print("ERROR: build mmlp_service first", file=sys.stderr)
         sys.exit(1)
 
+    listen_sock: Optional[socket.socket] = None
     try:
+        listen_sock = reserve_listen_socket(args.host, args.port)
         core = MmlpCore(args.graph, args.padding_m, args.binary, args.load_mode)
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
     except RuntimeError as e:
         print(f"ERROR: failed to start: {e}", file=sys.stderr)
         sys.exit(1)
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(core, web_root))
+    server = ReuseThreadingHTTPServer(
+        (args.host, args.port), make_handler(core, web_root), bind_and_activate=False
+    )
+    server.socket = listen_sock
+    server.server_bind = lambda: None  # type: ignore[method-assign]
+    server.server_activate()
     print(f"http://127.0.0.1:{args.port}/map  (live fleet map)")
     print(f"http://127.0.0.1:{args.port}/api/vehicle  (GET /health)")
     print(f"http://127.0.0.1:{args.port}/api/meetings/lead  (batch vs first vehicle)")
@@ -565,6 +605,8 @@ def main():
         pass
     finally:
         core.close()
+        if listen_sock is not None:
+            listen_sock.close()
 
 
 if __name__ == "__main__":

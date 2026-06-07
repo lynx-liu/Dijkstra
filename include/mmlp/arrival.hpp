@@ -1,9 +1,11 @@
 #pragma once
 
 #include "mmlp/region_loader.hpp"
+#include "mmlp/routing.hpp"
 #include "mmlp/spatial_index.hpp"
 #include "mmlp/types.hpp"
 
+#include <optional>
 #include <vector>
 
 namespace mmlp {
@@ -20,6 +22,16 @@ struct DestinationQuery {
 DestinationArrivalSummary predictVehiclesToDestination(
     const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
     const GraphContext& routeCtx, const SpatialIndex& matchIndex, const DestinationQuery& dest,
+    const PredictParam& param = PredictParam{});
+
+void sortDestinationArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy);
+
+std::string graphLocationId(const GraphPosition& pos);
+
+// One vehicle on an already-extracted corridor subgraph (goal must be matchable on routeCtx).
+std::optional<VehicleArrivalResult> predictVehicleToDestination(
+    const VehicleInfo& vehicle, const VehicleHistory* history, const GraphContext& routeCtx,
+    const SpatialIndex& matchIndex, const DestinationQuery& dest, const GraphPosition& goalPos,
     const PredictParam& param = PredictParam{});
 
 }  // namespace mmlp

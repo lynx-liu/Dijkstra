@@ -42,6 +42,19 @@ GraphPosition positionAtTime(const MultimodalGraph& graph, const GraphPosition& 
 
 LatLon positionLatLon(const MultimodalGraph& graph, const GraphPosition& pos);
 
+struct RouteToGoal {
+  double travelTimeSec = kInfTime;
+  RoutePolyline polyline;
+};
+
+// Single A* search: travel time + map polyline (used by destination arrival).
+RouteToGoal computeRouteToGoal(const MultimodalGraph& graph, const GraphPosition& start,
+                               const GraphPosition& goal, double speedMs, VehicleType type,
+                               const PredictParam& param, double maxTime);
+
+// Downsample for API/map (full junction trace can be 10k+ points on long haul).
+void simplifyRoutePolyline(RoutePolyline& route, std::size_t maxPoints = 120);
+
 // Shortest-time route polyline from start to goal on the graph (for map display).
 RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosition& start,
                                    const GraphPosition& goal, double speedMs, VehicleType type,
