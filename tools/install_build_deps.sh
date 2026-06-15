@@ -18,30 +18,23 @@ try_enable_devtoolset() {
   source "${ROOT}/env_build.sh" 2>/dev/null || true
 }
 
-install_centos7_devtoolset() {
+yum_safe() {
   local pkg=yum
   command -v dnf >/dev/null 2>&1 && pkg=dnf
+  ${pkg} --disablerepo=centos-sclo-rh --disablerepo=centos-sclo-sclo "$@"
+}
 
-  echo "[install_build_deps] CentOS 7 detected; installing devtoolset-8 (C++17)..."
-  ${pkg} install -y epel-release make 2>/dev/null || ${pkg} install -y make
-
-  if ! command -v cmake3 >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
-    ${pkg} install -y cmake3 || ${pkg} install -y cmake
-  fi
-  if command -v cmake3 >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
-    alternatives --set cmake /usr/bin/cmake3 2>/dev/null || ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
-  fi
-
+setup_vault_sclo_repo() {
   local arch
   arch=$(uname -m)
-  local repo=/etc/yum.repos.d/mmlp-centos-sclo-vault.repo
-  cat >"${repo}" <<EOF
+  cat >/etc/yum.repos.d/mmlp-centos-sclo-vault.repo <<EOF
 [mmlp-sclo-rh]
 name=CentOS-7 SCLo rh (vault)
 baseurl=https://mirrors.aliyun.com/centos-vault/7.9.2009/sclo/${arch}/rh/
         https://vault.centos.org/7.9.2009/sclo/${arch}/rh/
 enabled=1
 gpgcheck=0
+skip_if_unavailable=1
 
 [mmlp-sclo-sclo]
 name=CentOS-7 SCLo sclo (vault)
@@ -49,10 +42,30 @@ baseurl=https://mirrors.aliyun.com/centos-vault/7.9.2009/sclo/${arch}/sclo/
         https://vault.centos.org/7.9.2009/sclo/${arch}/sclo/
 enabled=1
 gpgcheck=0
+skip_if_unavailable=1
 EOF
+}
 
-  ${pkg} clean all || true
-  ${pkg} install -y --disablerepo='*' --enablerepo='mmlp-sclo-rh,mmlp-sclo-sclo' \
+install_centos7_devtoolset() {
+  echo "[install_build_deps] fixing yum repos..."
+  bash "${ROOT}/fix_centos7_yum.sh"
+
+  echo "[install_build_deps] installing cmake / make / epel..."
+  yum_safe install -y make || true
+  if ! rpm -q epel-release >/dev/null 2>&1; then
+    yum_safe install -y epel-release || true
+  fi
+  if ! command -v cmake3 >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
+    yum_safe install -y cmake3 || yum_safe install -y cmake || true
+  fi
+  if command -v cmake3 >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
+    alternatives --set cmake /usr/bin/cmake3 2>/dev/null || ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+  fi
+
+  echo "[install_build_deps] installing devtoolset-8 from vault..."
+  setup_vault_sclo_repo
+  yum_safe install -y \
+    --enablerepo=mmlp-sclo-rh,mmlp-sclo-sclo \
     devtoolset-8-gcc devtoolset-8-gcc-c++ devtoolset-8-binutils devtoolset-8-runtime
 }
 
@@ -71,16 +84,14 @@ fi
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "ERROR: g++ ${maj} too old; need ${need_gcc_major}+ (C++17)." >&2
-  echo "Run as root: sudo bash tools/install_build_deps.sh" >&2
+  echo "Run as root: bash tools/install_build_deps.sh" >&2
   exit 1
 fi
 
-if grep -qiE 'centos.*7|aliyun|alinux' /etc/redhat-release 2>/dev/null; then
+if grep -qiE 'centos.*7|aliyun|alinux|red hat.*7' /etc/redhat-release 2>/dev/null; then
   install_centos7_devtoolset
 else
-  local_pkg=yum
-  command -v dnf >/dev/null 2>&1 && local_pkg=dnf
-  ${local_pkg} install -y gcc-c++ cmake make || true
+  yum_safe install -y gcc-c++ cmake make || true
 fi
 
 try_enable_devtoolset || true

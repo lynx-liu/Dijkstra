@@ -18,6 +18,10 @@ echo ""
 
 cd "${ROOT}"
 
+if [[ $(id -u) -eq 0 ]] && [[ -f /etc/redhat-release ]]; then
+  bash tools/fix_centos7_yum.sh
+fi
+
 bash tools/check_python.sh
 echo ""
 
@@ -28,6 +32,7 @@ echo "[2/5] Build binaries..."
 bash tools/install_build_deps.sh
 # shellcheck source=/dev/null
 source tools/env_build.sh
+rm -rf build
 "${CMAKE}" -S . -B build
 "${CMAKE}" --build build --target mmlp_service mmlp_build_aux
 
