@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null
-source "${ROOT}/tools/env_build.sh" 2>/dev/null || true
+source "${ROOT}/tools/env_runtime.sh"
 GRAPH="${1:-${MMLP_GRAPH_PATH:-${ROOT}/data/graph/china.mmlp.bin}}"
 
 if [[ ! -f "${GRAPH}" ]]; then

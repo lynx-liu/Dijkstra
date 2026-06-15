@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null
-source "${ROOT}/tools/env_build.sh" 2>/dev/null || true
+source "${ROOT}/tools/env_runtime.sh"
 PORT="${PORT:-8080}"
 HOST="${HOST:-0.0.0.0}"
 GRAPH="${MMLP_GRAPH_PATH:-${ROOT}/data/graph/china.mmlp.bin}"
@@ -58,12 +58,12 @@ echo ""
 
 port_in_use() {
   if command -v ss >/dev/null 2>&1; then
-    ss -tln | grep -q ":${PORT} "
-    return
+    ss -tln 2>/dev/null | grep -q ":${PORT} " && return 0
+    return 1
   fi
   if command -v lsof >/dev/null 2>&1; then
-    lsof -i ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1
-    return
+    lsof -i ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    return 1
   fi
   return 1
 }

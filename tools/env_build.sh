@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Source before cmake / running mmlp binaries on RHEL7 (GCC 4.8 needs devtoolset for C++17).
+# Source before cmake on RHEL7 (GCC 4.8 needs devtoolset for C++17 build).
 # Usage: source tools/env_build.sh
 
 _need_gcc_major=7
@@ -12,26 +12,8 @@ _gcc_ver() {
   fi
 }
 
-_enable_devtoolset() {
-  local v
-  for v in 11 10 9 8 7; do
-    if [[ -f "/opt/rh/devtoolset-${v}/enable" ]]; then
-      # shellcheck disable=SC1090
-      source "/opt/rh/devtoolset-${v}/enable"
-      return 0
-    fi
-  done
-  for v in 13 12 11 10 9; do
-    if [[ -f "/opt/rh/gcc-toolset-${v}/enable" ]]; then
-      # shellcheck disable=SC1090
-      source "/opt/rh/gcc-toolset-${v}/enable"
-      return 0
-    fi
-  done
-  return 1
-}
-
-_enable_devtoolset || true
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_runtime.sh"
 
 if [[ "$(_gcc_ver)" -lt "${_need_gcc_major}" ]]; then
   echo "ERROR: g++ $(_gcc_ver) is too old; C++17 needs g++ 7+." >&2
