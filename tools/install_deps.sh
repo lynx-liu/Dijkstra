@@ -14,14 +14,13 @@ fi
 pip3 install --upgrade 'pip>=20' 'setuptools>=40' 'wheel' 'packaging'
 
 install_rhel_build_deps() {
+  # pyosmium ships manylinux wheels; skip yum gcc/cmake here (see install_build_deps.sh).
   local pkg=yum
   command -v dnf >/dev/null 2>&1 && pkg=dnf
   if [[ $(id -u) -ne 0 ]]; then
     return 0
   fi
-  echo "[install_deps] installing C++ build deps for pyosmium..."
-  ${pkg} install -y gcc-c++ cmake boost-devel expat-devel zlib-devel bzip2-devel \
-    python3-devel 2>/dev/null || true
+  ${pkg} install -y python3-devel 2>/dev/null || true
 }
 
 install_debian_build_deps() {

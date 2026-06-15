@@ -2,6 +2,8 @@
 # Start MMLP HTTP meeting service. Blocks until graph/index is ready.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+source "${ROOT}/tools/env_build.sh" 2>/dev/null || true
 PORT="${PORT:-8080}"
 HOST="${HOST:-0.0.0.0}"
 GRAPH="${MMLP_GRAPH_PATH:-${ROOT}/data/graph/china.mmlp.bin}"

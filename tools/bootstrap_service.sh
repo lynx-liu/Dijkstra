@@ -25,8 +25,11 @@ echo "[1/5] Install Python dependencies..."
 bash tools/install_deps.sh
 
 echo "[2/5] Build binaries..."
-cmake -S . -B build
-cmake --build build --target mmlp_service mmlp_build_aux
+bash tools/install_build_deps.sh
+# shellcheck source=/dev/null
+source tools/env_build.sh
+"${CMAKE}" -S . -B build
+"${CMAKE}" --build build --target mmlp_service mmlp_build_aux
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
