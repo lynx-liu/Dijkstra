@@ -6,7 +6,6 @@ Memory-safe nationwide build via SQLite staging.
 Requires: pip install osmium
 """
 
-from __future__ import annotations
 
 import argparse
 import math

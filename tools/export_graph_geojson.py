@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Export mmlp.bin road/rail segments in a bbox to GeoJSON (for map preview)."""
 
-from __future__ import annotations
 
 import argparse
 import json

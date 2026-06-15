@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Render PNG map tiles from .mmlp.bin graph (offline street-style, no external CDN)."""
 
-from __future__ import annotations
 
 import io
 import math
 import threading
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from tools.map_roads import GraphMmap, collect_edge_ids_in_bbox, segment_in_bbox
 
@@ -21,7 +20,7 @@ MIN_ZOOM = 8
 MAX_ZOOM = 16
 
 
-def tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+def tile_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:
     n = 2.0**z
     lon_min = x / n * 360.0 - 180.0
     lon_max = (x + 1) / n * 360.0 - 180.0
@@ -58,9 +57,9 @@ class GraphTileRenderer:
 
     def __init__(self, graph_path: str, cache_size: int = 512):
         self._graph_path = graph_path
-        self._graph: GraphMmap | None = None
+        self._graph: Optional[GraphMmap] = None
         self._lock = threading.Lock()
-        self._cache: OrderedDict[tuple[int, int, int], bytes] = OrderedDict()
+        self._cache: OrderedDict[Tuple[int, int, int], bytes] = OrderedDict()
         self._cache_max = cache_size
 
     def _ensure(self) -> GraphMmap:
@@ -68,7 +67,7 @@ class GraphTileRenderer:
             self._graph = GraphMmap(self._graph_path)
         return self._graph
 
-    def meta(self) -> dict[str, Any]:
+    def meta(self) -> Dict[str, Any]:
         return {
             "available": True,
             "format": "png",
@@ -85,19 +84,19 @@ class GraphTileRenderer:
             self._graph.close()
             self._graph = None
 
-    def _cache_get(self, key: tuple[int, int, int]) -> bytes | None:
+    def _cache_get(self, key: Tuple[int, int, int]) -> Optional[bytes]:
         if key not in self._cache:
             return None
         self._cache.move_to_end(key)
         return self._cache[key]
 
-    def _cache_put(self, key: tuple[int, int, int], data: bytes) -> None:
+    def _cache_put(self, key: Tuple[int, int, int], data: bytes) -> None:
         self._cache[key] = data
         self._cache.move_to_end(key)
         while len(self._cache) > self._cache_max:
             self._cache.popitem(last=False)
 
-    def render_tile(self, z: int, x: int, y: int) -> bytes | None:
+    def render_tile(self, z: int, x: int, y: int) -> Optional[bytes]:
         if z < MIN_ZOOM or z > MAX_ZOOM:
             return None
         key = (z, x, y)
@@ -127,14 +126,14 @@ class GraphTileRenderer:
         lon_span = max(lon_max - lon_min, 1e-12)
         lat_span = max(lat_max - lat_min, 1e-12)
 
-        def to_px(lat: float, lon: float) -> tuple[float, float]:
+        def to_px(lat: float, lon: float) -> Tuple[float, float]:
             px = (lon - lon_min) / lon_span * TILE_SIZE
             py = (lat_max - lat) / lat_span * TILE_SIZE
             return px, py
 
         max_edges = _max_edges_for_zoom(z)
-        rails: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        roads: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        rails: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        roads: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
 
         for eid in edge_ids:
             if len(roads) + len(rails) >= max_edges:

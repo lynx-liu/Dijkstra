@@ -2,12 +2,13 @@
 """
 Build auxiliary files for fast service startup (low RAM, streaming):
   china.mmlp.bin -> china.mmlp.sidx, .nidx, .eidx
+from typing import Dict, List, Tuple
+
 
 One-time after deploy:
   python3 tools/build_graph_auxiliary.py data/graph/china.mmlp.bin
 """
 
-from __future__ import annotations
 
 import os
 import struct
@@ -23,11 +24,11 @@ EDGE_RECORD = 44
 CELL_SIZE = 0.02
 
 
-def cell_of(lat: float, lon: float) -> tuple[int, int]:
+def cell_of(lat: float, lon: float) -> Tuple[int, int]:
     return (int(lat // CELL_SIZE), int(lon // CELL_SIZE))
 
 
-def write_sorted_index(path: str, rows: list[tuple[int, int]]) -> None:
+def write_sorted_index(path: str, rows: List[Tuple[int, int]]) -> None:
     rows.sort(key=lambda x: x[0])
     with open(path, "wb") as out:
         out.write(NDX_MAGIC)
@@ -36,7 +37,7 @@ def write_sorted_index(path: str, rows: list[tuple[int, int]]) -> None:
             out.write(struct.pack("<qQ", *row))
 
 
-def lookup_node_latlon(sorted_nodes: list[tuple[int, int, float, float]], nid: int):
+def lookup_node_latlon(sorted_nodes: List[Tuple[int, int, float, float]], nid: int):
     lo, hi = 0, len(sorted_nodes) - 1
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -62,7 +63,7 @@ def build_auxiliary(bin_path: str) -> None:
 
         print(f"[aux] nodes={node_count:,} edges={edge_count:,}", flush=True)
 
-        node_rows: list[tuple[int, int, float, float]] = []
+        node_rows: List[Tuple[int, int, float, float]] = []
         for i in range(node_count):
             off = f.tell()
             rec = f.read(NODE_RECORD)
@@ -79,8 +80,8 @@ def build_auxiliary(bin_path: str) -> None:
 
         edge_base = f.tell()
         print("[aux] scanning edges (eidx + sidx) ...", flush=True)
-        cells: dict[tuple[int, int], list[int]] = {}
-        eidx_rows: list[tuple[int, int]] = []
+        cells: Dict[Tuple[int, int], List[int]] = {}
+        eidx_rows: List[Tuple[int, int]] = []
 
         for i in range(edge_count):
             off = f.tell()

@@ -3,7 +3,6 @@
 Export a bbox subset of .mmlp.bin to GeoJSON for map preview (numpy-accelerated scan).
 """
 
-from __future__ import annotations
 
 import argparse
 import json

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Serve raster tiles from a local MBTiles file (offline street map)."""
 
-from __future__ import annotations
 
 import os
 import sqlite3
 import threading
-from typing import Any
+from typing import Any, Dict, Optional
 
 
 class MBTilesStore:
@@ -18,8 +17,8 @@ class MBTilesStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self.meta = self._read_meta()
 
-    def _read_meta(self) -> dict[str, Any]:
-        meta: dict[str, Any] = {"available": True, "path": self.path}
+    def _read_meta(self) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {"available": True, "path": self.path}
         try:
             rows = self._conn.execute("SELECT name, value FROM metadata").fetchall()
             for name, value in rows:
@@ -29,7 +28,7 @@ class MBTilesStore:
             pass
         return meta
 
-    def get_tile(self, z: int, x: int, y: int) -> bytes | None:
+    def get_tile(self, z: int, x: int, y: int) -> Optional[bytes]:
         # Leaflet XYZ -> TMS row
         y_tms = (1 << z) - 1 - y
         with self._lock:
@@ -47,7 +46,7 @@ class MBTilesStore:
             self._conn.close()
 
 
-def resolve_mbtiles_path() -> str | None:
+def resolve_mbtiles_path() -> Optional[str]:
     for key in ("MMLP_MBTILES",):
         val = os.environ.get(key, "").strip()
         if val and os.path.isfile(val):

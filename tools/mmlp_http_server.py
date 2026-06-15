@@ -3,7 +3,6 @@
 HTTP wrapper for mmlp_service (streaming fleet meeting prediction).
 """
 
-from __future__ import annotations
 
 import argparse
 import json
@@ -15,9 +14,16 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 # map_roads lives in tools/
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +42,7 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
         sys.stderr.write("[mmlp] " + line)
 
 
-def _iso_utc(ts: float | None = None) -> str:
+def _iso_utc(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -46,17 +52,17 @@ class MapState:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.vehicles: dict[str, dict[str, Any]] = {}
+        self.vehicles: Dict[str, Dict[str, Any]] = {}
         self.focal = ""
-        self.meetings: list[dict[str, Any]] = []
-        self.destination: dict[str, Any] | None = None
-        self.arrivals: list[dict[str, Any]] = []
+        self.meetings: List[Dict[str, Any]] = []
+        self.destination: Optional[Dict[str, Any]] = None
+        self.arrivals: List[Dict[str, Any]] = []
         self.sort_by = "duration"
         self.mode = "none"
         self.updated_at = 0.0
 
     @staticmethod
-    def _vehicle_row(v: dict[str, Any]) -> dict[str, Any]:
+    def _vehicle_row(v: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": v.get("id", ""),
             "lat": v.get("lat"),
@@ -66,21 +72,21 @@ class MapState:
             "type": v.get("type", "truck"),
         }
 
-    def upsert_vehicle(self, v: dict[str, Any]) -> None:
+    def upsert_vehicle(self, v: Dict[str, Any]) -> None:
         vid = v.get("id")
         if not vid:
             return
         with self._lock:
             self._upsert_vehicle_unlocked(v)
 
-    def _upsert_vehicle_unlocked(self, v: dict[str, Any]) -> None:
+    def _upsert_vehicle_unlocked(self, v: Dict[str, Any]) -> None:
         vid = v.get("id")
         if not vid:
             return
         self.vehicles[str(vid)] = self._vehicle_row(v)
         self.updated_at = time.time()
 
-    def update_single(self, vehicle: dict[str, Any], result: dict[str, Any]) -> None:
+    def update_single(self, vehicle: Dict[str, Any], result: Dict[str, Any]) -> None:
         with self._lock:
             self._upsert_vehicle_unlocked(vehicle)
             self.mode = "single"
@@ -93,7 +99,7 @@ class MapState:
             self.arrivals = []
             self.updated_at = time.time()
 
-    def update_batch(self, vehicles: list[dict[str, Any]], result: dict[str, Any]) -> None:
+    def update_batch(self, vehicles: List[Dict[str, Any]], result: Dict[str, Any]) -> None:
         with self._lock:
             for v in vehicles:
                 self._upsert_vehicle_unlocked(v)
@@ -106,8 +112,8 @@ class MapState:
 
     def update_arrival(
         self,
-        vehicles: list[dict[str, Any]] | None,
-        result: dict[str, Any],
+        vehicles: Optional[List[Dict[str, Any]]],
+        result: Dict[str, Any],
     ) -> None:
         with self._lock:
             if vehicles:
@@ -121,7 +127,7 @@ class MapState:
             self.sort_by = str(result.get("sortBy") or "duration")
             self.updated_at = time.time()
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "vehicles": list(self.vehicles.values()),
@@ -141,8 +147,8 @@ class RoadBasemap:
     def __init__(self, graph_path: str) -> None:
         self._graph_path = graph_path
         self._lock = threading.Lock()
-        self._graph: GraphMmap | None = None
-        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._graph: Optional[GraphMmap] = None
+        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._cache_max = 24
 
     def _ensure(self) -> GraphMmap:
@@ -150,13 +156,13 @@ class RoadBasemap:
             self._graph = GraphMmap(self._graph_path)
         return self._graph
 
-    def _cache_get(self, key: str) -> dict[str, Any] | None:
+    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
         row = self._cache.get(key)
         if row is None:
             return None
         return row[1]
 
-    def _cache_put(self, key: str, body: dict[str, Any]) -> None:
+    def _cache_put(self, key: str, body: Dict[str, Any]) -> None:
         self._cache[key] = (time.time(), body)
         if len(self._cache) > self._cache_max:
             oldest = min(self._cache.items(), key=lambda x: x[1][0])[0]
@@ -169,7 +175,7 @@ class RoadBasemap:
         max_lon: float,
         max_lat: float,
         max_features: int = 0,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         key = f"{min_lon:.5f},{min_lat:.5f},{max_lon:.5f},{max_lat:.5f}:{max_features}"
         cached = self._cache_get(key)
         if cached is not None:
@@ -185,9 +191,9 @@ class RoadBasemap:
             self._cache_put(key, body)
             return body
 
-    def export_auto(self, map_state: MapState) -> dict[str, Any]:
+    def export_auto(self, map_state: MapState) -> Dict[str, Any]:
         snap = map_state.snapshot()
-        points: list[tuple[float, float]] = []
+        points: List[Tuple[float, float]] = []
         for v in snap.get("vehicles", []):
             lat, lon = v.get("lat"), v.get("lon")
             if lat is not None and lon is not None:
@@ -216,13 +222,13 @@ class MmlpCore:
         env["MMLP_LOAD_MODE"] = load_mode
         cmd = [binary, "--graph", graph, "--padding-m", str(padding_m), "--load-mode", load_mode]
         self._ready = False
-        self._load_error: str | None = None
+        self._load_error: Optional[str] = None
         self._lock = threading.Lock()
         self._ready_cond = threading.Condition()
         self.map_state = MapState()
-        self.road_basemap: RoadBasemap | None = None
-        self.tile_renderer: GraphTileRenderer | None = None
-        self.mbtiles: MBTilesStore | None = None
+        self.road_basemap: Optional[RoadBasemap] = None
+        self.tile_renderer: Optional[GraphTileRenderer] = None
+        self.mbtiles: Optional[MBTilesStore] = None
 
         hint = "~5 min for full" if load_mode == "full" else "usually under 1 min for index"
         sys.stderr.write(
@@ -235,7 +241,7 @@ class MmlpCore:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
             bufsize=1,
             env=env,
         )
@@ -529,7 +535,7 @@ def make_handler(core: MmlpCore, web_root: str):
                             },
                         )
                         return
-                req: dict[str, Any] = {
+                req: Dict[str, Any] = {
                     "action": "destination_arrival",
                     "lat": payload["lat"],
                     "lon": payload["lon"],

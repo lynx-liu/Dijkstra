@@ -18,6 +18,9 @@ echo ""
 
 cd "${ROOT}"
 
+bash tools/check_python.sh
+echo ""
+
 echo "[1/5] Install Python dependencies..."
 bash tools/install_deps.sh
 

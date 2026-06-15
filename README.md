@@ -32,6 +32,16 @@ bash tools/start_http_server.sh
 
 > `bootstrap_service.sh` 已包含初始化所需步骤，通常不需要再手动分步执行。
 
+**CentOS 7 / 阿里云 Linux 2**：使用系统自带的 **Python 3.6+** 即可，无需单独安装 3.8：
+
+```bash
+python3 --version   # 应为 3.6.x
+bash tools/bootstrap_service.sh
+MMLP_LOAD_MODE=index bash tools/start_http_server.sh
+```
+
+> 内存约 31GB 的机器请用 `MMLP_LOAD_MODE=index`，不要用 `full`（全国图约 30GB+ RAM）。
+
 ## 校验路网 + 网页预览（可选）
 
 ```bash

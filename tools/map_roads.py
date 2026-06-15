@@ -3,12 +3,11 @@
 Export road/rail GeoJSON for map basemap from .mmlp.bin + auxiliary indexes (no full graph RAM).
 """
 
-from __future__ import annotations
 
 import math
 import mmap
 import struct
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 BIN_MAGIC = b"MMLPGRPH"
 NDX_MAGIC = b"MMLPNDX\x00"
@@ -18,7 +17,7 @@ EDGE_RECORD = 44
 INDEX_HEADER = 20  # magic(8) + version(4) + count(8)
 
 
-def _cell_of(lat: float, lon: float, cell_size: float) -> tuple[int, int]:
+def _cell_of(lat: float, lon: float, cell_size: float) -> Tuple[int, int]:
     return int(math.floor(lat / cell_size)), int(math.floor(lon / cell_size))
 
 
@@ -58,7 +57,7 @@ class GraphMmap:
             if f is not None:
                 f.close()
 
-    def _find_offset(self, mm: mmap.mmap, table_off: int, row_count: int, target: int) -> int | None:
+    def _find_offset(self, mm: mmap.mmap, table_off: int, row_count: int, target: int) -> Optional[int]:
         lo, hi = 0, row_count - 1
         while lo <= hi:
             mid = (lo + hi) // 2
@@ -72,7 +71,7 @@ class GraphMmap:
                 hi = mid - 1
         return None
 
-    def node_latlon(self, node_id: int) -> tuple[float, float] | None:
+    def node_latlon(self, node_id: int) -> Optional[Tuple[float, float]]:
         off = self._find_offset(self.nidx_mm, self.nidx_table, self.nidx_rows, node_id)
         if off is None or off + NODE_RECORD > len(self.bin_mm):
             return None
@@ -81,7 +80,7 @@ class GraphMmap:
             return None
         return float(lat), float(lon)
 
-    def edge_endpoints(self, edge_id: int) -> tuple[int, int, int] | None:
+    def edge_endpoints(self, edge_id: int) -> Optional[Tuple[int, int, int]]:
         off = self._find_offset(self.eidx_mm, self.eidx_table, self.eidx_rows, edge_id)
         if off is None or off + EDGE_RECORD > len(self.bin_mm):
             return None
@@ -93,7 +92,7 @@ class GraphMmap:
 
 def collect_edge_ids_in_bbox(
     sidx_path: str, min_lon: float, min_lat: float, max_lon: float, max_lat: float
-) -> set[int]:
+) -> Set[int]:
     with open(sidx_path, "rb") as f:
         if f.read(8) != SIDX_MAGIC:
             raise ValueError("invalid sidx magic")
@@ -104,7 +103,7 @@ def collect_edge_ids_in_bbox(
         min_gx, min_gy = _cell_of(min_lat, min_lon, cell_size)
         max_gx, max_gy = _cell_of(max_lat, max_lon, cell_size)
 
-        edge_ids: set[int] = set()
+        edge_ids: Set[int] = set()
         for _ in range(cell_count):
             gx, gy, n = struct.unpack("<iiQ", f.read(16))
             payload = f.read(8 * n)
@@ -156,7 +155,7 @@ def export_roads_geojson(
     max_lon: float,
     max_lat: float,
     max_features: int = 0,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     if max_features <= 0:
         max_features = _default_max_features(min_lon, min_lat, max_lon, max_lat)
 
@@ -167,7 +166,7 @@ def export_roads_geojson(
     grid_n = 12
     lon_span = max(max_lon - min_lon, 1e-9)
     lat_span = max(max_lat - min_lat, 1e-9)
-    buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
     road_n = rail_n = 0
 
     for eid in edge_ids:
@@ -206,7 +205,7 @@ def export_roads_geojson(
         }
         buckets.setdefault((gx, gy), []).append(feat)
 
-    features: list[dict[str, Any]] = []
+    features: List[Dict[str, Any]] = []
     while len(features) < max_features:
         added = False
         for key in sorted(buckets.keys()):
@@ -235,8 +234,8 @@ def export_roads_geojson(
 
 
 def bbox_from_points(
-    points: list[tuple[float, float]], padding_frac: float = 0.35, min_pad_deg: float = 0.06
-) -> tuple[float, float, float, float]:
+    points: List[Tuple[float, float]], padding_frac: float = 0.35, min_pad_deg: float = 0.06
+) -> Tuple[float, float, float, float]:
     if not points:
         return 87.45, 43.75, 87.75, 43.95
     lats = [p[0] for p in points]
