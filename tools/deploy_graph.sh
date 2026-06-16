@@ -8,6 +8,7 @@ source "${ROOT}/config/osm.defaults.env"
 
 LOG_FILE="${DATA_DIR}/deploy.log"
 mkdir -p "${OSM_DIR}" "${GRAPH_DIR}"
+cd "${ROOT}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=== deploy_graph started $(date -Is) ==="
 
@@ -49,11 +50,17 @@ if [[ -f "${GRAPH_PATH}" ]]; then
 fi
 
 echo "[deploy_graph] building graph (SQLite streaming, low RAM) ..."
-python3 "${ROOT}/tools/osm_to_graph.py" --input "${INPUT_PBF}" --output "${GRAPH_PATH}" "${BBOX_ARGS[@]}"
+if ((${#BBOX_ARGS[@]})); then
+  python3 "${ROOT}/tools/osm_to_graph.py" --input "${INPUT_PBF}" --output "${GRAPH_PATH}" "${BBOX_ARGS[@]}"
+else
+  python3 "${ROOT}/tools/osm_to_graph.py" --input "${INPUT_PBF}" --output "${GRAPH_PATH}"
+fi
 
 echo "[deploy_graph] graph ready: ${GRAPH_PATH}"
 ls -lh "${GRAPH_PATH}"
 echo "[deploy_graph] building auxiliary index for fast service startup ..."
+# shellcheck source=/dev/null
+source "${ROOT}/tools/env_runtime.sh" 2>/dev/null || true
 cmake --build "${ROOT}/build" --target mmlp_build_aux 2>/dev/null || true
 if [[ -x "${ROOT}/build/mmlp_build_aux" ]]; then
   "${ROOT}/build/mmlp_build_aux" "${GRAPH_PATH}"

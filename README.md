@@ -32,17 +32,9 @@ bash tools/start_http_server.sh
 
 > `bootstrap_service.sh` 已包含初始化所需步骤，通常不需要再手动分步执行。
 
-**CentOS 7 / 阿里云 Linux 2**：系统 **Python 3.6** 即可；C++ 部分需要 **g++ 7+（C++17）**，CentOS 7 自带 4.8 不够，`bootstrap_service.sh` 会自动装 devtoolset-8：
+**CentOS 7 / 阿里云 Linux 2**：同样只需上面两条命令；`bootstrap` 会自动处理 Python 3.6、devtoolset-8、全国图下载与建图（首次建图约 1–3 小时，PBF 已下载时会跳过下载）。
 
-```bash
-python3 --version   # 应为 3.6.x
-bash tools/bootstrap_service.sh          # 含 install_build_deps（devtoolset-8）
-MMLP_LOAD_MODE=index bash tools/start_http_server.sh
-```
-
-若只重编二进制：`bash tools/install_build_deps.sh && source tools/env_build.sh && cmake -S . -B build && cmake --build build`
-
-> 内存约 31GB 的机器请用 `MMLP_LOAD_MODE=index`，不要用 `full`（全国图约 30GB+ RAM）。
+> 内存约 31GB 的机器默认 `index` 模式即可，不要用 `MMLP_LOAD_MODE=full`。
 
 ## 校验路网 + 网页预览（可选）
 

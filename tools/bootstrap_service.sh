@@ -29,12 +29,16 @@ echo "[1/5] Install Python dependencies..."
 bash tools/install_deps.sh
 
 echo "[2/5] Build binaries..."
-bash tools/install_build_deps.sh
-# shellcheck source=/dev/null
-source tools/env_build.sh
-rm -rf build
-"${CMAKE}" -S . -B build
-"${CMAKE}" --build build --target mmlp_service mmlp_build_aux
+if [[ -x build/mmlp_service ]] && [[ -x build/mmlp_build_aux ]] && [[ "${FORCE_REBUILD:-0}" != "1" ]]; then
+  echo "[2/5] Binaries exist, skip rebuild."
+else
+  bash tools/install_build_deps.sh
+  # shellcheck source=/dev/null
+  source tools/env_build.sh
+  rm -rf build
+  "${CMAKE}" -S . -B build
+  "${CMAKE}" --build build --target mmlp_service mmlp_build_aux
+fi
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
@@ -55,10 +59,14 @@ bash tools/ensure_graph_index.sh "${GRAPH}"
 echo "[5/5] Fetch map page vendor (Leaflet, for offline/restricted network)..."
 bash tools/fetch_web_vendor.sh
 
+if [[ ! -f "${GRAPH}" ]]; then
+  echo "ERROR: graph not found. Run: bash tools/bootstrap_service.sh" >&2
+  exit 1
+fi
+
 echo ""
 echo "Bootstrap complete."
-echo "Start service with:"
-echo "  bash tools/start_http_server.sh"
+echo "Start: bash tools/start_http_server.sh"
 echo ""
 
 if [[ "${START_AFTER_BOOTSTRAP}" == "1" ]]; then

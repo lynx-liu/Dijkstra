@@ -13,12 +13,11 @@ LOAD_MODE="${MMLP_LOAD_MODE:-index}"
 AUTO_BUILD_INDEX="${AUTO_BUILD_INDEX:-1}"
 
 if [[ ! -x "${BINARY}" ]]; then
-  echo "Build first: cmake -S ${ROOT} -B ${ROOT}/build && cmake --build ${ROOT}/build --target mmlp_service mmlp_build_aux"
+  echo "ERROR: binaries not built. Run: bash tools/bootstrap_service.sh" >&2
   exit 1
 fi
 if [[ ! -f "${GRAPH}" ]]; then
-  echo "Missing graph: ${GRAPH}"
-  echo "Run: bash ${ROOT}/tools/deploy_graph_nationwide.sh"
+  echo "ERROR: graph not found. Run: bash tools/bootstrap_service.sh" >&2
   exit 1
 fi
 
@@ -31,11 +30,7 @@ if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
   if [[ "${AUTO_BUILD_INDEX}" == "1" ]]; then
     bash "${ROOT}/tools/ensure_graph_index.sh" "${GRAPH}"
   else
-    echo "Index files missing for: ${GRAPH}"
-    echo "Run once:"
-    echo "  bash ${ROOT}/tools/ensure_graph_index.sh"
-    echo "Or:"
-    echo "  MMLP_LOAD_MODE=full bash $0"
+    echo "Index files missing. Run: bash tools/bootstrap_service.sh" >&2
     exit 1
   fi
 fi
