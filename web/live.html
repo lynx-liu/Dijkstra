@@ -81,6 +81,43 @@
       border-right: 8px solid transparent;
       border-top: 10px solid var(--badge-bg, #2563eb);
     }
+    .map--pick-dest { cursor: crosshair; }
+    .dest-dialog-backdrop {
+      position: fixed; inset: 0; z-index: 2000;
+      background: rgba(0, 0, 0, 0.45);
+      display: none; align-items: center; justify-content: center;
+      padding: 16px;
+    }
+    .dest-dialog-backdrop.open { display: flex; }
+    .dest-dialog {
+      background: #fff; border-radius: 10px; padding: 16px 18px;
+      width: min(360px, 100%); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.2);
+    }
+    .dest-dialog h3 { margin: 0 0 10px; font-size: 15px; }
+    .dest-dialog label {
+      display: block; font-size: 12px; color: #444; margin: 10px 0 4px;
+    }
+    .dest-dialog input, .dest-dialog select {
+      width: 100%; padding: 8px 10px; font-size: 13px;
+      border: 1px solid #ccc; border-radius: 6px;
+    }
+    .dest-dialog .coords {
+      font-size: 12px; color: #555; background: #f5f5f5;
+      padding: 8px 10px; border-radius: 6px; margin-bottom: 4px;
+    }
+    .dest-dialog .err {
+      color: #b91c1c; font-size: 12px; margin-top: 8px; min-height: 1.2em;
+    }
+    .dest-dialog .actions {
+      display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px;
+    }
+    .dest-dialog button {
+      border: none; border-radius: 6px; padding: 8px 14px;
+      font-size: 13px; cursor: pointer;
+    }
+    .dest-dialog .btn-cancel { background: #e5e7eb; color: #111; }
+    .dest-dialog .btn-ok { background: #2563eb; color: #fff; }
+    .dest-dialog .btn-ok:disabled { opacity: 0.6; cursor: wait; }
   </style>
 </head>
 <body>
@@ -94,6 +131,25 @@
     <p class="hint" id="panelHint"></p>
     <div id="vehicleList"></div>
     <div id="meetingList"></div>
+  </div>
+
+  <div class="dest-dialog-backdrop" id="destDialog" aria-hidden="true">
+    <div class="dest-dialog" role="dialog" aria-labelledby="destDialogTitle">
+      <h3 id="destDialogTitle">设置目的地</h3>
+      <div class="coords" id="destCoords">-</div>
+      <label for="destArriveBy">到达时间</label>
+      <input type="datetime-local" id="destArriveBy" />
+      <label for="destSortBy">排序方式</label>
+      <select id="destSortBy">
+        <option value="duration">行程时间（最快优先）</option>
+        <option value="distance">路网距离（最近优先）</option>
+      </select>
+      <div class="err" id="destError"></div>
+      <div class="actions">
+        <button type="button" class="btn-cancel" id="destCancel">取消</button>
+        <button type="button" class="btn-ok" id="destConfirm">计算并更新</button>
+      </div>
+    </div>
   </div>
 
   <script src="/web/map_boot.js"></script>
@@ -117,6 +173,172 @@
     let tileLabel = '';
     let tileHint = '';
     let basemapTimer = null;
+    let pickMarker = null;
+    let pendingDest = null;
+    let destSubmitting = false;
+
+    const destDialog = document.getElementById('destDialog');
+    const destCoords = document.getElementById('destCoords');
+    const destArriveBy = document.getElementById('destArriveBy');
+    const destSortBy = document.getElementById('destSortBy');
+    const destError = document.getElementById('destError');
+    const destCancel = document.getElementById('destCancel');
+    const destConfirm = document.getElementById('destConfirm');
+
+    function parseVehicleTimeMs(v) {
+      const t = v.time || v.observedAt || '';
+      if (!t) return NaN;
+      const s = t.includes('T') ? t : t.replace(' ', 'T');
+      return Date.parse(s.endsWith('Z') ? s : s + 'Z');
+    }
+
+    function defaultArriveLocalInput(vehicles) {
+      let maxMs = Date.now();
+      for (const v of vehicles) {
+        const ms = parseVehicleTimeMs(v);
+        if (!Number.isNaN(ms)) maxMs = Math.max(maxMs, ms);
+      }
+      const d = new Date(maxMs + 24 * 3600 * 1000);
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function localInputToIsoUtc(localVal) {
+      const d = new Date(localVal);
+      if (Number.isNaN(d.getTime())) return '';
+      return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
+
+    function vehiclesPayload(vehicles) {
+      const fallback = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      return vehicles.map(v => ({
+        id: v.id,
+        lat: v.lat,
+        lon: v.lon,
+        speed: v.speed ?? 60,
+        time: v.time || fallback,
+        type: v.type || 'truck',
+      }));
+    }
+
+    function updatePickCursor() {
+      const mapEl = document.getElementById('map');
+      const hasVehicles = lastState && (lastState.vehicles || []).length > 0;
+      if (mapEl) mapEl.classList.toggle('map--pick-dest', !!hasVehicles && !destDialog.classList.contains('open'));
+    }
+
+    function clearPickMarker() {
+      if (pickMarker && layers) {
+        layers.removeLayer(pickMarker);
+        pickMarker = null;
+      }
+    }
+
+    function showPickMarker(lat, lon) {
+      clearPickMarker();
+      pickMarker = L.circleMarker([lat, lon], {
+        radius: 8,
+        color: '#b91c1c',
+        weight: 3,
+        fillColor: '#fecaca',
+        fillOpacity: 0.85,
+      });
+      pickMarker.addTo(layers);
+    }
+
+    function closeDestDialog() {
+      destDialog.classList.remove('open');
+      destDialog.setAttribute('aria-hidden', 'true');
+      destError.textContent = '';
+      destConfirm.disabled = false;
+      pendingDest = null;
+      updatePickCursor();
+    }
+
+    function openDestDialog(lat, lon) {
+      const vehicles = (lastState && lastState.vehicles) || [];
+      if (vehicles.length === 0) {
+        statusEl.textContent = '请先有车辆数据，再点击地图设置目的地';
+        return;
+      }
+      pendingDest = { lat, lon };
+      destCoords.textContent = `纬度 ${lat.toFixed(5)} · 经度 ${lon.toFixed(5)}`;
+      destArriveBy.value = defaultArriveLocalInput(vehicles);
+      destSortBy.value = (lastState && lastState.sortBy) || 'duration';
+      destError.textContent = '';
+      destConfirm.disabled = false;
+      destDialog.classList.add('open');
+      destDialog.setAttribute('aria-hidden', 'false');
+      showPickMarker(lat, lon);
+      updatePickCursor();
+    }
+
+    async function submitDestination() {
+      if (!pendingDest || destSubmitting) return;
+      const vehicles = (lastState && lastState.vehicles) || [];
+      if (vehicles.length === 0) {
+        destError.textContent = '无车辆数据';
+        return;
+      }
+      const arriveBy = localInputToIsoUtc(destArriveBy.value);
+      if (!arriveBy) {
+        destError.textContent = '请选择到达时间';
+        return;
+      }
+      destSubmitting = true;
+      destConfirm.disabled = true;
+      destError.textContent = '计算中…';
+      try {
+        const payload = {
+          lat: pendingDest.lat,
+          lon: pendingDest.lon,
+          arriveBy,
+          sortBy: destSortBy.value,
+          vehicles: vehiclesPayload(vehicles),
+        };
+        const res = await fetch('/api/destinations/arrive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await res.json();
+        if (!res.ok || result.error) {
+          throw new Error(result.error || res.statusText);
+        }
+        const state = {
+          mode: 'arrival',
+          focal: '',
+          vehicles,
+          meetings: [],
+          destination: result.destination || {},
+          arrivals: result.vehicles || [],
+          sortBy: result.sortBy || destSortBy.value,
+          updatedAt: new Date().toISOString(),
+        };
+        lastSig = JSON.stringify(state);
+        highlightIdx = -1;
+        closeDestDialog();
+        clearPickMarker();
+        render(state);
+      } catch (e) {
+        destError.textContent = String(e.message || e);
+        destConfirm.disabled = false;
+      } finally {
+        destSubmitting = false;
+      }
+    }
+
+    destCancel.addEventListener('click', () => {
+      closeDestDialog();
+      clearPickMarker();
+    });
+    destDialog.addEventListener('click', (e) => {
+      if (e.target === destDialog) {
+        closeDestDialog();
+        clearPickMarker();
+      }
+    });
+    destConfirm.addEventListener('click', submitDestination);
 
     function scheduleRoadReload(delayMs, bbox) {
       if (mapMode !== 'roads') return;
@@ -256,7 +478,7 @@
         document.getElementById('panelTitle').textContent = '目的地到达排序';
         document.getElementById('panelHint').textContent =
           `目的地 (${dest.lat != null ? dest.lat.toFixed(4) : '-'}, ${dest.lon != null ? dest.lon.toFixed(4) : '-'}) · ` +
-          `须在 ${dest.arriveBy || '-'} 前到达 · 排序：${state.sortBy || 'duration'}`;
+          `须在 ${dest.arriveBy || '-'} 前到达 · 排序：${state.sortBy || 'duration'} · 点击地图可重新设置目的地`;
         panel.style.display = 'block';
         const vList = document.getElementById('vehicleList');
         vList.innerHTML = vehicles.map(v => {
@@ -294,8 +516,8 @@
       document.getElementById('panelTitle').textContent = focal ? `基准车 ${focal}` : '会合列表';
       document.getElementById('panelHint').textContent =
         state.mode === 'batch'
-          ? '批量接口：每组是「基准车 ↔ 对方车」的会合，不是对方车之间会合。'
-          : '单车接入：与车队最快会合的一组。';
+          ? '批量接口：每组是「基准车 ↔ 对方车」的会合，不是对方车之间会合。点击地图可设置目的地。'
+          : '单车接入：与车队最快会合的一组。点击地图可设置目的地。';
       panel.style.display = 'block';
 
       const vList = document.getElementById('vehicleList');
@@ -441,6 +663,7 @@
       }
 
       renderStatus(state);
+      updatePickCursor();
     }
 
     async function poll() {
@@ -464,6 +687,11 @@
       basemapLayer = L.layerGroup().addTo(map);
       layers = L.layerGroup().addTo(map);
       MapBoot.addScale(map);
+      map.on('click', (e) => {
+        if (!lastState || (lastState.vehicles || []).length === 0) return;
+        if (destDialog.classList.contains('open')) return;
+        openDestDialog(e.latlng.lat, e.latlng.lng);
+      });
       statusEl.textContent = '加载底图…';
       try {
         const base = await MapBoot.initBasemap(map, basemapLayer);
