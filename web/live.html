@@ -13,8 +13,39 @@
       padding: 8px 12px; display: flex; gap: 12px; align-items: center;
       background: #1a1a2e; color: #eee; min-height: 56px;
     }
-    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
-    #status { font-size: 12px; color: #9ab; flex: 1; }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; flex-shrink: 0; }
+    #status { font-size: 12px; color: #9ab; flex: 1; min-width: 120px; }
+    .place-search-wrap {
+      position: relative; flex-shrink: 0;
+    }
+    .place-search {
+      display: flex; align-items: center; gap: 6px;
+    }
+    .place-search input {
+      width: 168px; padding: 6px 10px; font-size: 13px;
+      border: 1px solid #3d4a6a; border-radius: 6px;
+      background: #0f172a; color: #eee;
+    }
+    .place-search input::placeholder { color: #7a8aa8; }
+    .place-search button {
+      padding: 6px 10px; font-size: 12px; border: none; border-radius: 6px;
+      background: #2563eb; color: #fff; cursor: pointer;
+    }
+    .place-search button:disabled { opacity: 0.6; cursor: wait; }
+    .place-search-results {
+      position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+      margin: 0; padding: 4px 0; list-style: none;
+      background: #fff; color: #111; border-radius: 8px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+      max-height: 220px; overflow-y: auto; z-index: 3000;
+      display: none;
+    }
+    .place-search-results.open { display: block; }
+    .place-search-results li {
+      padding: 8px 10px; font-size: 12px; cursor: pointer; line-height: 1.35;
+    }
+    .place-search-results li:hover { background: #f1f5f9; }
+    .place-search-results .sub { color: #64748b; font-size: 11px; margin-top: 2px; }
     .panel {
       position: absolute; top: 64px; left: 10px; z-index: 1000;
       background: rgba(255,255,255,.96); border-radius: 8px; padding: 10px 12px;
@@ -123,6 +154,13 @@
 <body>
   <header>
     <h1>实时车辆与会合</h1>
+    <div class="place-search-wrap">
+      <form class="place-search" id="placeSearchForm">
+        <input type="search" id="placeSearchInput" placeholder="搜索地名…" autocomplete="off" />
+        <button type="submit" id="placeSearchBtn">定位</button>
+      </form>
+      <ul class="place-search-results" id="placeSearchResults"></ul>
+    </div>
     <span id="status">加载地图组件…</span>
   </header>
   <div id="map"></div>
@@ -164,8 +202,13 @@
     let map;
     let basemapLayer;
     let layers;
+    let searchLayer;
     const statusEl = document.getElementById('status');
     const panel = document.getElementById('panel');
+    const placeSearchForm = document.getElementById('placeSearchForm');
+    const placeSearchInput = document.getElementById('placeSearchInput');
+    const placeSearchBtn = document.getElementById('placeSearchBtn');
+    const placeSearchResults = document.getElementById('placeSearchResults');
     let lastSig = '';
     let lastState = null;
     let highlightIdx = -1;
@@ -176,6 +219,7 @@
     let pickMarker = null;
     let pendingDest = null;
     let destSubmitting = false;
+    let searchedPlace = null;
 
     const destDialog = document.getElementById('destDialog');
     const destCoords = document.getElementById('destCoords');
@@ -340,6 +384,96 @@
     });
     destConfirm.addEventListener('click', submitDestination);
 
+    function shortPlaceName(name) {
+      if (!name) return '地点';
+      const parts = String(name).split(/[,，]/);
+      return parts[0].trim() || name;
+    }
+
+    function flyToPlace(place) {
+      if (!map) return;
+      placeSearchResults.classList.remove('open');
+      searchedPlace = place;
+      map.flyTo([place.lat, place.lon], 14, { duration: 0.75 });
+      if (mapMode === 'roads') {
+        const pad = 0.06;
+        const b = L.latLngBounds(
+          [place.lat - pad, place.lon - pad],
+          [place.lat + pad, place.lon + pad]
+        );
+        scheduleRoadReload(400, MapBoot.boundsQuery(b, 0.25));
+      }
+      if (searchLayer) searchLayer.clearLayers();
+      const label = shortPlaceName(place.name);
+      const vehicles = (lastState && lastState.vehicles) || [];
+      const mk = L.marker([place.lat, place.lon], {
+        icon: mapBadgeIcon(label, '#7c3aed', { kind: 'dest', pin: true }),
+        zIndexOffset: 150,
+      });
+      if (vehicles.length > 0) {
+        mk.bindTooltip('点击此处设为目的地', { direction: 'top', offset: [0, -36] });
+        mk.on('click', (ev) => {
+          if (ev.originalEvent) {
+            L.DomEvent.stopPropagation(ev.originalEvent);
+          }
+          openDestDialog(place.lat, place.lon);
+        });
+      } else {
+        mk.bindPopup(`<b>${escapeHtml(place.name)}</b><br>${place.lat.toFixed(5)}, ${place.lon.toFixed(5)}`);
+      }
+      mk.addTo(searchLayer);
+    }
+
+    function renderPlaceResults(results) {
+      placeSearchResults.innerHTML = '';
+      if (!results.length) {
+        placeSearchResults.innerHTML = '<li style="cursor:default;color:#64748b">未找到匹配地名</li>';
+        placeSearchResults.classList.add('open');
+        return;
+      }
+      results.forEach(place => {
+        const li = document.createElement('li');
+        const title = shortPlaceName(place.name);
+        li.innerHTML = `<div>${escapeHtml(title)}</div>` +
+          `<div class="sub">${escapeHtml(place.name)}</div>`;
+        li.addEventListener('click', () => flyToPlace(place));
+        placeSearchResults.appendChild(li);
+      });
+      placeSearchResults.classList.add('open');
+      if (results.length === 1) {
+        flyToPlace(results[0]);
+      }
+    }
+
+    async function searchPlace(query) {
+      const q = query.trim();
+      if (!q) return;
+      placeSearchBtn.disabled = true;
+      placeSearchResults.classList.remove('open');
+      try {
+        const res = await fetch('/api/map/geocode?q=' + encodeURIComponent(q) + '&limit=6');
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || res.statusText);
+        renderPlaceResults(body.results || []);
+      } catch (e) {
+        placeSearchResults.innerHTML =
+          `<li style="cursor:default;color:#b91c1c">${escapeHtml(e.message || String(e))}</li>`;
+        placeSearchResults.classList.add('open');
+      } finally {
+        placeSearchBtn.disabled = false;
+      }
+    }
+
+    placeSearchForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      searchPlace(placeSearchInput.value);
+    });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.place-search-wrap')) {
+        placeSearchResults.classList.remove('open');
+      }
+    });
+
     function scheduleRoadReload(delayMs, bbox) {
       if (mapMode !== 'roads') return;
       if (basemapTimer) clearTimeout(basemapTimer);
@@ -467,6 +601,16 @@
       return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
     }
 
+    /** Reachable first by shortest travel time; unreachable at the end. */
+    function orderArrivalPanel(vehicles, arrivals) {
+      const byId = new Map(arrivals.map(a => [a.vehicleId, a]));
+      const reachable = arrivals
+        .slice()
+        .sort((a, b) => (a.travelDurationSec ?? Infinity) - (b.travelDurationSec ?? Infinity));
+      const unreachable = vehicles.filter(v => !byId.has(v.id));
+      return { reachable, unreachable, byId };
+    }
+
     function renderPanel(state) {
       const focal = state.focal || '';
       const vehicles = state.vehicles || [];
@@ -480,21 +624,29 @@
           `目的地 (${dest.lat != null ? dest.lat.toFixed(4) : '-'}, ${dest.lon != null ? dest.lon.toFixed(4) : '-'}) · ` +
           `须在 ${dest.arriveBy || '-'} 前到达 · 排序：${state.sortBy || 'duration'} · 点击地图可重新设置目的地`;
         panel.style.display = 'block';
+        const { reachable, unreachable } = orderArrivalPanel(vehicles, arrivals);
         const vList = document.getElementById('vehicleList');
-        vList.innerHTML = vehicles.map(v => {
-          const rank = arrivals.findIndex(a => a.vehicleId === v.id);
-          const tag = rank >= 0 ? ` #${rank + 1} 可到达` : ' 无法按时到达';
-          const color = rank >= 0 ? '#ea580c' : '#94a3b8';
-          return `<div class="veh-row" style="border-color:${color}">
-            <b>${v.id}</b>${tag}<br>速度 ${v.speed ?? '-'} km/h
-          </div>`;
-        }).join('');
+        const rows = [];
+        reachable.forEach((row, idx) => {
+          const v = vehicles.find(x => x.id === row.vehicleId) || { id: row.vehicleId };
+          rows.push(`<div class="veh-row" style="border-color:#ea580c">
+            <b>${escapeHtml(v.id)}</b> #${idx + 1} 可到达<br>
+            行程 ${row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-'}
+            · 速度 ${v.speed ?? '-'} km/h
+          </div>`);
+        });
+        unreachable.forEach(v => {
+          rows.push(`<div class="veh-row" style="border-color:#94a3b8">
+            <b>${escapeHtml(v.id)}</b> 无法按时到达<br>速度 ${v.speed ?? '-'} km/h
+          </div>`);
+        });
+        vList.innerHTML = rows.join('');
         const mList = document.getElementById('meetingList');
-        if (arrivals.length === 0) {
+        if (reachable.length === 0) {
           mList.innerHTML = '<div class="meta">无车辆能在截止时间前到达</div>';
           return;
         }
-        mList.innerHTML = arrivals.map((row, idx) => {
+        mList.innerHTML = reachable.map((row, idx) => {
           const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
           const dur = row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-';
           const eta = row.eta || '-';
@@ -565,6 +717,14 @@
 
       renderPanel(state);
 
+      const arrivalPanel = state.mode === 'arrival'
+        ? orderArrivalPanel(vehicles, arrivals)
+        : null;
+      const sortedArrivals = arrivalPanel ? arrivalPanel.reachable : arrivals;
+      const arrivalRank = new Map(
+        sortedArrivals.map((row, idx) => [row.vehicleId, idx])
+      );
+
       if (state.mode === 'arrival' && dest.lat != null && dest.lon != null) {
         const destMk = L.marker([dest.lat, dest.lon], {
           icon: destinationIcon(),
@@ -582,7 +742,7 @@
         if (v.lat == null || v.lon == null) return;
         const isFocal = v.id === focal;
         const rank = state.mode === 'arrival'
-          ? arrivals.findIndex(a => a.vehicleId === v.id)
+          ? (arrivalRank.has(v.id) ? arrivalRank.get(v.id) : -1)
           : -1;
         let color = isFocal ? '#1e3a8a' : '#14532d';
         if (state.mode === 'arrival') {
@@ -638,7 +798,7 @@
       });
 
       if (state.mode === 'arrival') {
-        arrivals.forEach((row, idx) => {
+        sortedArrivals.forEach((row, idx) => {
           const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
           const dim = highlightIdx >= 0 && highlightIdx !== idx;
           const opacity = dim ? 0.25 : 0.88;
@@ -686,6 +846,7 @@
       map = MapBoot.createMap('map').setView([43.82, 87.60], 11);
       basemapLayer = L.layerGroup().addTo(map);
       layers = L.layerGroup().addTo(map);
+      searchLayer = L.layerGroup().addTo(map);
       MapBoot.addScale(map);
       map.on('click', (e) => {
         if (!lastState || (lastState.vehicles || []).length === 0) return;

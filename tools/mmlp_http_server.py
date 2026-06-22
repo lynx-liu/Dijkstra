@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+import urllib.error
+import urllib.request
 
 try:
     from http.server import ThreadingHTTPServer
@@ -33,6 +35,84 @@ if _ROOT not in sys.path:
 from tools.map_roads import GraphMmap, bbox_from_points, export_roads_geojson
 from tools.map_tiles import MBTilesStore, resolve_mbtiles_path
 from tools.map_tile_render import GraphTileRenderer
+
+
+# Offline fallback when Nominatim is unreachable (China / 新疆常用地名).
+_LOCAL_PLACES = (
+    {"name": "乌鲁木齐", "lat": 43.8256, "lon": 87.6168},
+    {"name": "乌鲁木齐市", "lat": 43.8256, "lon": 87.6168},
+    {"name": "北京", "lat": 39.9042, "lon": 116.4074},
+    {"name": "上海", "lat": 31.2304, "lon": 121.4737},
+    {"name": "广州", "lat": 23.1291, "lon": 113.2644},
+    {"name": "深圳", "lat": 22.5431, "lon": 114.0579},
+    {"name": "成都", "lat": 30.5728, "lon": 104.0668},
+    {"name": "西安", "lat": 34.3416, "lon": 108.9398},
+    {"name": "兰州", "lat": 36.0611, "lon": 103.8343},
+    {"name": "喀什", "lat": 39.4704, "lon": 75.9896},
+    {"name": "伊犁", "lat": 43.9219, "lon": 81.3240},
+    {"name": "克拉玛依", "lat": 45.5795, "lon": 84.8892},
+    {"name": "吐鲁番", "lat": 42.9513, "lon": 89.1898},
+    {"name": "哈密", "lat": 42.8185, "lon": 93.5142},
+    {"name": "阿克苏", "lat": 41.1717, "lon": 80.2651},
+    {"name": "库尔勒", "lat": 41.7269, "lon": 86.1746},
+    {"name": "石河子", "lat": 44.3054, "lon": 86.0806},
+    {"name": "昌吉", "lat": 44.0146, "lon": 87.3040},
+    {"name": "阿勒泰", "lat": 47.8484, "lon": 88.1387},
+    {"name": "塔城", "lat": 46.7454, "lon": 82.9789},
+)
+
+
+def _local_geocode(query: str, limit: int) -> List[Dict[str, Any]]:
+    q = query.strip()
+    if not q:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in _LOCAL_PLACES:
+        name = row["name"]
+        if q in name or name in q:
+            out.append({"name": name, "lat": row["lat"], "lon": row["lon"], "source": "local"})
+    return out[:limit]
+
+
+def geocode_places(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    q = query.strip()
+    if not q:
+        return []
+    limit = max(1, min(limit, 10))
+    url = "https://nominatim.openstreetmap.org/search?" + urlencode(
+        {
+            "q": q,
+            "format": "json",
+            "limit": str(limit),
+            "countrycodes": "cn",
+            "accept-language": "zh",
+        }
+    )
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "MMLP/1.0 (fleet map; contact: local deploy)"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        results: List[Dict[str, Any]] = []
+        for row in data:
+            try:
+                results.append(
+                    {
+                        "name": row.get("display_name") or q,
+                        "lat": float(row["lat"]),
+                        "lon": float(row["lon"]),
+                        "source": "nominatim",
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        if results:
+            return results
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+        sys.stderr.write("[geocode] nominatim failed: %s\n" % e)
+    return _local_geocode(q, limit)
 
 
 def _drain_stderr(proc: subprocess.Popen) -> None:
@@ -441,6 +521,22 @@ def make_handler(core: MmlpCore, web_root: str):
                 self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            if path == "/api/map/geocode":
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or qs.get("query") or [""])[0].strip()
+                if not q:
+                    self._json(400, {"error": "need q= place name"})
+                    return
+                try:
+                    limit = int((qs.get("limit") or ["5"])[0] or "5")
+                except ValueError:
+                    limit = 5
+                try:
+                    results = geocode_places(q, limit=limit)
+                    self._json(200, {"query": q, "results": results})
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
                 return
             if path == "/api/map/roads":
                 qs = parse_qs(urlparse(self.path).query)
