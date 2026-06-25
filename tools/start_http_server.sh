@@ -42,6 +42,12 @@ fi
 
 echo "=== MMLP HTTP service ==="
 echo "Graph: ${GRAPH}"
+MBTILES="${MMLP_MBTILES:-${ROOT}/data/map/china.mbtiles}"
+if [[ -f "${MBTILES}" ]]; then
+  echo "Map: ${MBTILES} (offline mbtiles)"
+else
+  echo "Map: graph render — install: bash tools/download_mbtiles.sh"
+fi
 echo "Load mode: ${LOAD_MODE}"
 if [[ "${LOAD_MODE}" == "full" ]]; then
   echo "Startup: full graph in RAM (~5 minutes)"

@@ -22,10 +22,19 @@ class MBTilesStore:
         try:
             rows = self._conn.execute("SELECT name, value FROM metadata").fetchall()
             for name, value in rows:
-                if name in ("minzoom", "maxzoom", "bounds", "center", "name", "format"):
+                if name in ("minzoom", "maxzoom", "bounds", "center", "name", "format", "type"):
                     meta[name] = value
         except sqlite3.Error:
             pass
+        fmt = str(meta.get("format") or "png").lower()
+        meta["format"] = fmt
+        meta["vector"] = fmt in ("pbf", "mvt", "vector")
+        for k in ("minzoom", "maxzoom"):
+            if k in meta:
+                try:
+                    meta[k] = int(meta[k])
+                except Exception:
+                    pass
         return meta
 
     def get_tile(self, z: int, x: int, y: int) -> Optional[bytes]:

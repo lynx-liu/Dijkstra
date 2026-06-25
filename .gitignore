@@ -9,6 +9,7 @@ data/*.out
 tests/fixtures/*.mmlp.bin
 data/osm/
 web/data/*.geojson
-data/map/*.mbtiles
+data/map/
+data/cache/
 tools/__pycache__/
 *.pyc

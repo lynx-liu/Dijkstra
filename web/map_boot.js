@@ -3,40 +3,16 @@
 
   const LEAFLET_CSS = ['/web/vendor/leaflet/leaflet.css'];
   const LEAFLET_JS = ['/web/vendor/leaflet/leaflet.js'];
+  const MAPLIBRE_CSS = ['/web/vendor/map/maplibre-gl.css'];
+  const MAPLIBRE_JS = ['/web/vendor/map/maplibre-gl.js'];
+  const MAPLIBRE_LEAFLET_JS = ['/web/vendor/map/leaflet-maplibre-gl.js'];
 
-  // 1) local mbtiles  2) online street tiles  3) local road graph fallback
-  const RASTER_SOURCES = [
-    {
-      name: '本地街道图（离线生成）',
-      url: '/api/map/tiles/{z}/{x}/{y}.png',
-      options: { maxZoom: 16, minZoom: 8, attribution: '本地路网渲染' },
-      local: true,
-    },
-    {
-      name: 'Carto 街道图',
-      url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-      options: {
-        subdomains: 'abcd',
-        maxZoom: 20,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; CARTO',
-      },
-    },
-    {
-      name: 'OpenStreetMap',
-      url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-      options: { maxZoom: 19, attribution: '&copy; OpenStreetMap' },
-    },
-    {
-      name: 'Esri 街道图',
-      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
-      options: { maxZoom: 19, attribution: '&copy; Esri' },
-    },
-  ];
+  const LOCAL_RASTER_URL = '/api/map/tiles/{z}/{x}/{y}.png';
 
   function loadStylesheet(urls, index) {
     return new Promise((resolve, reject) => {
       if (index >= urls.length) {
-        reject(new Error('leaflet.css missing — run: bash tools/fetch_web_vendor.sh'));
+        reject(new Error(urls[0] + ' missing'));
         return;
       }
       const link = document.createElement('link');
@@ -51,7 +27,7 @@
   function loadScript(urls, index) {
     return new Promise((resolve, reject) => {
       if (index >= urls.length) {
-        reject(new Error('leaflet.js missing — run: bash tools/fetch_web_vendor.sh'));
+        reject(new Error(urls[0] + ' missing'));
         return;
       }
       const script = document.createElement('script');
@@ -63,6 +39,7 @@
   }
 
   let bootPromise = null;
+  let mapLibreBoot = null;
 
   function ready() {
     if (!bootPromise) {
@@ -73,6 +50,20 @@
         });
     }
     return bootPromise;
+  }
+
+  function ensureMapLibre() {
+    if (!mapLibreBoot) {
+      mapLibreBoot = loadStylesheet(MAPLIBRE_CSS, 0)
+        .then(() => loadScript(MAPLIBRE_JS, 0))
+        .then(() => loadScript(MAPLIBRE_LEAFLET_JS, 0))
+        .then(() => {
+          if (!global.maplibregl || !global.L.maplibreGL) {
+            throw new Error('MapLibre missing');
+          }
+        });
+    }
+    return mapLibreBoot;
   }
 
   function roadStyle(feature) {
@@ -97,20 +88,19 @@
     };
   }
 
-  async function localTilesAvailable() {
+  async function fetchTileMeta() {
     try {
       const res = await fetch('/api/map/tiles/meta');
-      if (!res.ok) return false;
-      const meta = await res.json();
-      return !!meta.available;
+      if (!res.ok) return null;
+      return await res.json();
     } catch (e) {
-      return false;
+      return null;
     }
   }
 
-  function tryRasterLayer(map, src) {
+  function tryRasterLayer(map, url, options) {
     return new Promise((resolve, reject) => {
-      const layer = global.L.tileLayer(src.url, src.options);
+      const layer = global.L.tileLayer(url, options || {});
       let errors = 0;
       let ok = false;
       const fail = () => {
@@ -122,7 +112,7 @@
         }
         reject(new Error('tile load failed'));
       };
-      const timer = setTimeout(fail, src.local ? 4000 : 6000);
+      const timer = setTimeout(fail, 12000);
       layer.on('tileload', () => {
         if (!ok) {
           ok = true;
@@ -141,21 +131,93 @@
     });
   }
 
-  async function initRasterBasemap(map) {
-    const online = RASTER_SOURCES.filter((s) => !s.local);
-    const offline = RASTER_SOURCES.filter((s) => s.local);
-    const order = [...online, ...offline];
+  async function initRasterBasemap(map, meta) {
+    const minZoom = meta && meta.minzoom != null ? meta.minzoom : 8;
+    const maxZoom = meta && meta.maxzoom != null ? meta.maxzoom : 16;
+    const layer = await tryRasterLayer(map, LOCAL_RASTER_URL, {
+      minZoom,
+      maxZoom,
+      attribution: '本机离线瓦片',
+    });
+    map.setMinZoom(minZoom);
+    map.setMaxZoom(maxZoom);
+    return {
+      mode: 'raster',
+      layer,
+      label: (meta && meta.name) || '本地街道图（离线生成）',
+      hint: '本机离线瓦片',
+    };
+  }
 
-    let lastErr = null;
-    for (const src of order) {
-      try {
-        const layer = await tryRasterLayer(map, src);
-        return { mode: 'raster', layer, label: src.name, source: src };
-      } catch (e) {
-        lastErr = e;
-      }
+  function patchStyle(style, meta) {
+    const origin = global.location.origin || '';
+    const minZoom = meta && meta.minzoom != null ? meta.minzoom : 0;
+    const maxZoom = meta && meta.maxzoom != null ? meta.maxzoom : 14;
+    if (style.glyphs && style.glyphs.indexOf('http') !== 0) {
+      style.glyphs = origin + style.glyphs;
     }
-    throw lastErr || new Error('no raster basemap');
+    if (style.sources && style.sources.shortbread) {
+      const tiles = style.sources.shortbread.tiles || [];
+      style.sources.shortbread.tiles = tiles.map((u) => {
+        if (u.indexOf('http') === 0) return u;
+        return origin + u;
+      });
+      style.sources.shortbread.minzoom = minZoom;
+      style.sources.shortbread.maxzoom = maxZoom;
+    }
+    return style;
+  }
+
+  function waitMapLibreLayer(map, layer) {
+    return new Promise((resolve, reject) => {
+      const glMap = layer.getMaplibreMap();
+      if (!glMap) {
+        reject(new Error('MapLibre map not created'));
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error('MapLibre load timeout')), 45000);
+      glMap.once('load', () => {
+        clearTimeout(timer);
+        map.invalidateSize();
+        resolve(layer);
+      });
+      glMap.on('error', (ev) => {
+        clearTimeout(timer);
+        const msg = (ev && ev.error && ev.error.message) ? ev.error.message : 'MapLibre error';
+        reject(new Error(msg));
+      });
+    });
+  }
+
+  async function initVectorBasemap(map, meta) {
+    await ensureMapLibre();
+    const styleRes = await fetch('/web/map_style_shortbread.json');
+    if (!styleRes.ok) throw new Error('map_style_shortbread missing');
+    let style;
+    try {
+      style = patchStyle(await styleRes.json(), meta);
+    } catch (e) {
+      throw new Error('map style JSON invalid: ' + e.message);
+    }
+    const layer = global.L.maplibreGL({
+      style,
+      interactive: false,
+      padding: 0.05,
+      localIdeographFontFamily: 'sans-serif',
+      attribution: '离线矢量 mbtiles',
+    });
+    layer.addTo(map);
+    const minZoom = meta && meta.minzoom != null ? meta.minzoom : 0;
+    const maxZoom = meta && meta.maxzoom != null ? meta.maxzoom : 14;
+    map.setMinZoom(minZoom);
+    map.setMaxZoom(Math.max(maxZoom, 16));
+    await waitMapLibreLayer(map, layer);
+    return {
+      mode: 'mbtiles',
+      layer,
+      label: (meta && meta.name) || '离线矢量 mbtiles',
+      hint: '矢量底图（Shortbread，含地名）',
+    };
   }
 
   async function loadRoadFallback(map, roadLayer, options) {
@@ -189,14 +251,15 @@
   }
 
   async function initBasemap(map, roadLayer) {
+    const meta = await fetchTileMeta();
+    const src = meta && meta.source;
+    const fmt = ((meta && meta.format) || '').toLowerCase();
     try {
-      const raster = await initRasterBasemap(map);
-      return {
-        mode: 'raster',
-        layer: raster.layer,
-        label: raster.label,
-        hint: '标准街道底图；车辆/会合标记叠在上方',
-      };
+      if (src === 'mbtiles' && (fmt === 'pbf' || meta.vector)) {
+        roadLayer.clearLayers();
+        return await initVectorBasemap(map, meta);
+      }
+      return await initRasterBasemap(map, meta);
     } catch (e) {
       const roads = await loadRoadFallback(map, roadLayer, {
         bbox: { minLon: 87.42, minLat: 43.78, maxLon: 87.68, maxLat: 43.92 },
@@ -206,7 +269,7 @@
         label: roads.label,
         features: roads.features,
         truncated: roads.truncated,
-        hint: '当前无街道底图，仅显示离线路网线条。可配置 data/map/region.mbtiles 或开放外网',
+        hint: '底图失败，仅路网线条 — ' + e.message,
       };
     }
   }
@@ -229,7 +292,7 @@
   global.MapBoot = {
     ready,
     createMap(containerId, mapOptions) {
-      return global.L.map(containerId, mapOptions || {});
+      return global.L.map(containerId, Object.assign({ preferCanvas: false }, mapOptions || {}));
     },
     addScale(map) {
       global.L.control.scale({ metric: true }).addTo(map);

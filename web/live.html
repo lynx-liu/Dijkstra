@@ -5,10 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MMLP 实时会合地图</title>
   <link rel="stylesheet" href="/web/vendor/leaflet/leaflet.css" />
+  <link rel="stylesheet" href="/web/vendor/map/maplibre-gl.css" />
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: system-ui, sans-serif; }
-    #map { height: calc(100vh - 56px); width: 100%; background: #ddd; }
+    #map { height: calc(100vh - 56px); width: 100%; background: #f2efe9; }
+    .leaflet-container .leaflet-gl-layer,
+    .leaflet-container .maplibregl-map,
+    .leaflet-container .maplibregl-canvas {
+      width: 100%;
+      height: 100%;
+    }
     header {
       padding: 8px 12px; display: flex; gap: 12px; align-items: center;
       background: #1a1a2e; color: #eee; min-height: 56px;
@@ -843,7 +850,7 @@
     }
 
     MapBoot.ready().then(async () => {
-      map = MapBoot.createMap('map').setView([43.82, 87.60], 11);
+      map = MapBoot.createMap('map').setView([43.82, 87.60], 12);
       basemapLayer = L.layerGroup().addTo(map);
       layers = L.layerGroup().addTo(map);
       searchLayer = L.layerGroup().addTo(map);
@@ -864,9 +871,18 @@
           map.on('moveend', () => scheduleRoadReload(500));
         }
       } catch (e) {
-        mapMode = 'roads';
-        tileLabel = '底图初始化失败';
-        tileHint = e.message;
+        try {
+          const roads = await MapBoot.loadRoadFallback(map, basemapLayer, { auto: true });
+          mapMode = 'roads';
+          tileLabel = roads.label;
+          tileHint = '底图失败，已切到路网线条 — ' + e.message;
+          MapBoot.addRoadLegend(map);
+          map.on('moveend', () => scheduleRoadReload(500));
+        } catch (e2) {
+          mapMode = 'none';
+          tileLabel = '底图初始化失败';
+          tileHint = e.message + '; ' + e2.message;
+        }
       }
       statusEl.textContent = '连接数据…';
       poll();

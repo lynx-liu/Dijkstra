@@ -492,36 +492,55 @@ def make_handler(core: MmlpCore, web_root: str):
                     self._json(200, core.tile_renderer.meta())
                 return
             tile_parts = path.split("/")
-            if (
-                len(tile_parts) == 7
-                and tile_parts[1:4] == ["api", "map", "tiles"]
-                and tile_parts[6].endswith(".png")
-            ):
-                try:
-                    z = int(tile_parts[4])
-                    x = int(tile_parts[5])
-                    y = int(tile_parts[6][:-4])
-                except ValueError:
-                    self._json(400, {"error": "bad tile path"})
-                    return
-                data = None
-                if core.mbtiles is not None:
-                    data = core.mbtiles.get_tile(z, x, y)
-                if data is None:
-                    data = core.tile_renderer.render_tile(z, x, y)
-                if data is None:
-                    self.send_response(404)
+            if len(tile_parts) == 7 and tile_parts[1:4] == ["api", "map", "tiles"]:
+                fn = tile_parts[6]
+                ext = None
+                if fn.endswith(".png"):
+                    ext = "png"
+                elif fn.endswith(".pbf"):
+                    ext = "pbf"
+                if ext is not None:
+                    try:
+                        z = int(tile_parts[4])
+                        x = int(tile_parts[5])
+                        y = int(fn[: -len("." + ext)])
+                    except ValueError:
+                        self._json(400, {"error": "bad tile path"})
+                        return
+
+                    data = None
+                    mbtiles_vector = (
+                        core.mbtiles is not None
+                        and bool(core.mbtiles.meta.get("vector"))
+                    )
+                    if core.mbtiles is not None and (ext == "pbf" or not mbtiles_vector):
+                        data = core.mbtiles.get_tile(z, x, y)
+
+                    if data is None and ext == "png":
+                        data = core.tile_renderer.render_tile(z, x, y)
+
+                    if data is None:
+                        self.send_response(204)
+                        self.end_headers()
+                        return
+
+                    if ext == "pbf":
+                        mime = "application/vnd.mapbox-vector-tile"
+                    else:
+                        fmt = "png"
+                        if core.mbtiles is not None:
+                            fmt = (core.mbtiles.meta.get("format") or "png").lower()
+                        mime = "image/png" if fmt == "png" else "image/jpeg"
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    if ext == "pbf" and len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
+                        self.send_header("Content-Encoding", "gzip")
                     self.end_headers()
+                    self.wfile.write(data)
                     return
-                fmt = (core.mbtiles.meta.get("format") or "png").lower()
-                mime = "image/png" if fmt == "png" else "image/jpeg"
-                self.send_response(200)
-                self.send_header("Content-Type", mime)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "public, max-age=86400")
-                self.end_headers()
-                self.wfile.write(data)
-                return
             if path == "/api/map/geocode":
                 qs = parse_qs(urlparse(self.path).query)
                 q = (qs.get("q") or qs.get("query") or [""])[0].strip()

@@ -56,8 +56,21 @@ fi
 echo "[4/5] Ensure fast index files..."
 bash tools/ensure_graph_index.sh "${GRAPH}"
 
-echo "[5/5] Fetch map page vendor (Leaflet, for offline/restricted network)..."
+echo "[5/6] Fetch map page vendor (Leaflet + MapLibre + glyphs, offline)..."
 bash tools/fetch_web_vendor.sh
+bash tools/fetch_map_vendor.sh
+bash tools/fetch_map_glyphs.sh
+
+echo "[6/6] Offline map tiles (optional, ~2 GB)..."
+if [[ "${AUTO_DOWNLOAD_MBTILES:-0}" == "1" ]]; then
+  bash tools/download_mbtiles.sh
+else
+  if [[ -f "${ROOT}/data/map/china.mbtiles" ]]; then
+    echo "[6/6] china.mbtiles present."
+  else
+    echo "[6/6] Skip mbtiles (set AUTO_DOWNLOAD_MBTILES=1 or run: bash tools/download_mbtiles.sh)"
+  fi
+fi
 
 if [[ ! -f "${GRAPH}" ]]; then
   echo "ERROR: graph not found. Run: bash tools/bootstrap_service.sh" >&2
