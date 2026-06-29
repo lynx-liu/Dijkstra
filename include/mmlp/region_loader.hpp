@@ -7,6 +7,7 @@
 #include "mmlp/types.hpp"
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace mmlp {
@@ -82,5 +83,16 @@ bool extractGraphContextForDestinationCorridorsIndexed(
     const GraphFileStore& store, const SpatialIndex& index,
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
     double maxCorridorWidthM, GraphContext& out, std::string* error = nullptr);
+
+bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                          const std::vector<VehicleInfo>& vehicles,
+                                          double paddingMeters,
+                                          std::unordered_set<int64_t>& edgeIds,
+                                          std::string* error = nullptr);
+
+bool collectDestinationCorridorEdgeIdsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, std::unordered_set<int64_t>& edgeIds, std::string* error = nullptr);
 
 }  // namespace mmlp

@@ -73,4 +73,13 @@ double edgeEffectiveSpeedMs(const AdjacencyEdge& edge, VehicleType type, double 
   return vehicleSpeedMs;
 }
 
+double csrArcEffectiveSpeedMs(double speedLimitKmh, VehicleType type, double vehicleSpeedMs) {
+  if (speedLimitKmh > 0.0) {
+    const double cap = speedLimitKmh * kMetersPerSecondFromKmh;
+    return std::min(vehicleSpeedMs, cap);
+  }
+  (void)type;
+  return vehicleSpeedMs;
+}
+
 }  // namespace mmlp

@@ -18,4 +18,6 @@ double travelTimeSeconds(double distanceMeters, double speedMs, VehicleType type
 
 double edgeEffectiveSpeedMs(const AdjacencyEdge& edge, VehicleType type, double vehicleSpeedMs);
 
+double csrArcEffectiveSpeedMs(double speedLimitKmh, VehicleType type, double vehicleSpeedMs);
+
 }  // namespace mmlp

@@ -1,6 +1,7 @@
 #include "mmlp/spatial_index.hpp"
 
 #include "mmlp/geo.hpp"
+#include "mmlp/graph_store.hpp"
 #include "mmlp/matching.hpp"
 #include "mmlp/motion.hpp"
 
@@ -172,6 +173,93 @@ bool SpatialIndex::nearestEdge(const MultimodalGraph& graph, double lat, double 
       best.alongMeters = 0.0;
     } else if (best.alongMeters >= edge->length - 1.0) {
       best.nodeId = edge->to;
+      best.edgeId = 0;
+      best.alongMeters = 0.0;
+    }
+  }
+
+  out = best;
+  if (distanceMeters) {
+    *distanceMeters = bestDist;
+  }
+  return true;
+}
+
+bool SpatialIndex::nearestEdgeMmap(const GraphFileStore& store, double lat, double lon,
+                                   VehicleType type, GraphPosition& out,
+                                   double* distanceMeters) const {
+  int gx = 0;
+  int gy = 0;
+  cellOf(lat, lon, gx, gy);
+
+  GraphPosition best;
+  best.valid = false;
+  double bestDist = std::numeric_limits<double>::infinity();
+  const LatLon query{lat, lon};
+  const Vec2 p = latLonToLocalMeters(query, query);
+
+  for (int dx = -2; dx <= 2; ++dx) {
+    for (int dy = -2; dy <= 2; ++dy) {
+      const auto it = cells_.find(cellKey(gx + dx, gy + dy));
+      if (it == cells_.end()) {
+        continue;
+      }
+      for (int64_t edgeId : it->second) {
+        EdgeType edgeType = EdgeType::ROAD;
+        double length = 0.0;
+        double speedLimit = 0.0;
+        if (!store.readEdge(edgeId, edgeType, length, speedLimit)) {
+          continue;
+        }
+        if (type == VehicleType::TRUCK && edgeType != EdgeType::ROAD) {
+          continue;
+        }
+        if (type == VehicleType::TRAIN && edgeType != EdgeType::RAIL) {
+          continue;
+        }
+        double flat = 0.0;
+        double flon = 0.0;
+        double tlat = 0.0;
+        double tlon = 0.0;
+        if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+          continue;
+        }
+        const Vec2 a = latLonToLocalMeters({flat, flon}, query);
+        const Vec2 b = latLonToLocalMeters({tlat, tlon}, query);
+        double t = 0.0;
+        const double dist = pointToSegmentDistanceMeters(p, a, b, &t);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best.valid = true;
+          best.edgeId = edgeId;
+          int64_t from = 0;
+          int64_t to = 0;
+          if (store.edgeEndpoints(edgeId, from, to)) {
+            best.nodeId = from;
+          }
+          best.alongMeters = t * length;
+        }
+      }
+    }
+  }
+
+  if (!best.valid || bestDist > kMaxSnapDistanceMeters) {
+    return false;
+  }
+
+  int64_t from = 0;
+  int64_t to = 0;
+  double length = 0.0;
+  EdgeType edgeType = EdgeType::ROAD;
+  double speedLimit = 0.0;
+  if (store.edgeEndpoints(best.edgeId, from, to) &&
+      store.readEdge(best.edgeId, edgeType, length, speedLimit)) {
+    if (best.alongMeters <= 1.0) {
+      best.nodeId = from;
+      best.edgeId = 0;
+      best.alongMeters = 0.0;
+    } else if (best.alongMeters >= length - 1.0) {
+      best.nodeId = to;
       best.edgeId = 0;
       best.alongMeters = 0.0;
     }

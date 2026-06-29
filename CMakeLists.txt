@@ -23,6 +23,7 @@ add_library(mmlp
   src/predict.cpp
   src/region_loader.cpp
   src/routing.cpp
+  src/csr_graph.cpp
   src/spatial_index.cpp
 )
 target_include_directories(mmlp PUBLIC include)

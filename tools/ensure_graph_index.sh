@@ -14,8 +14,16 @@ fi
 
 BASE="${GRAPH%.bin}"
 if [[ -f "${BASE}.sidx" && -f "${BASE}.nidx" && -f "${BASE}.eidx" ]]; then
+  if [[ ! -f "${BASE}.egeo" ]]; then
+    echo "=== Building .egeo (speeds corridor filter, ~1 minute) ==="
+    if [[ ! -x "${ROOT}/build/mmlp_build_aux" ]]; then
+      cmake -S "${ROOT}" -B "${ROOT}/build"
+      cmake --build "${ROOT}/build" --target mmlp_build_aux
+    fi
+    "${ROOT}/build/mmlp_build_aux" "${GRAPH}" --egeo-only
+  fi
   echo "Index files OK:"
-  ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx"
+  ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx" "${BASE}.egeo" 2>/dev/null || ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx"
   exit 0
 fi
 

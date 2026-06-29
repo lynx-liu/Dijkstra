@@ -1,6 +1,7 @@
 #include "mmlp/matching.hpp"
 
 #include "mmlp/geo.hpp"
+#include "mmlp/graph_store.hpp"
 #include "mmlp/motion.hpp"
 #include "mmlp/spatial_index.hpp"
 
@@ -84,6 +85,17 @@ GraphPosition matchVehicleToGraph(const MultimodalGraph& graph, const VehicleInf
   }
 
   return best;
+}
+
+GraphPosition matchVehicleToGraphIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                         const VehicleInfo& vehicle) {
+  GraphPosition snapped;
+  if (index.nearestEdgeMmap(store, vehicle.lat, vehicle.lon, vehicle.type, snapped)) {
+    return snapped;
+  }
+  GraphPosition invalid;
+  invalid.valid = false;
+  return invalid;
 }
 
 }  // namespace mmlp

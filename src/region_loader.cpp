@@ -477,16 +477,11 @@ void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialInd
   index.collectEdgesInBBox(box, candidates);
 
   for (int64_t edgeId : candidates) {
-    int64_t from = 0;
-    int64_t to = 0;
-    if (!store.edgeEndpoints(edgeId, from, to)) {
-      continue;
-    }
     double flat = 0.0;
     double flon = 0.0;
     double tlat = 0.0;
     double tlon = 0.0;
-    if (!store.nodeLatLon(from, flat, flon) || !store.nodeLatLon(to, tlat, tlon)) {
+    if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
       continue;
     }
     const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
@@ -573,6 +568,22 @@ bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
                                               const std::vector<VehicleInfo>& vehicles,
                                               double paddingMeters, GraphContext& out,
                                               std::string* error) {
+  std::unordered_set<int64_t> edgeIds;
+  if (!collectDestinationBBoxEdgeIdsIndexed(store, index, vehicles, paddingMeters, edgeIds,
+                                          error)) {
+    return false;
+  }
+  if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
+    return false;
+  }
+  return true;
+}
+
+bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                          const std::vector<VehicleInfo>& vehicles,
+                                          double paddingMeters,
+                                          std::unordered_set<int64_t>& edgeIds,
+                                          std::string* error) {
   auto fail = [&](const std::string& msg) {
     if (error) {
       *error = msg;
@@ -584,21 +595,17 @@ bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
   }
 
   const GeoBBox box = bboxFromVehicles(vehicles, paddingMeters);
-  std::unordered_set<int64_t> edgeIds;
   index.collectEdgesInBBox(box, edgeIds);
   if (edgeIds.empty()) {
     return fail("no graph edges in destination bbox");
   }
-  if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
-    return false;
-  }
   return true;
 }
 
-bool extractGraphContextForDestinationCorridorsIndexed(
+bool collectDestinationCorridorEdgeIdsIndexed(
     const GraphFileStore& store, const SpatialIndex& index,
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
-    double maxCorridorWidthM, GraphContext& out, std::string* error) {
+    double maxCorridorWidthM, std::unordered_set<int64_t>& edgeIds, std::string* error) {
   auto fail = [&](const std::string& msg) {
     if (error) {
       *error = msg;
@@ -610,7 +617,6 @@ bool extractGraphContextForDestinationCorridorsIndexed(
   }
 
   const LatLon destLl{destLat, destLon};
-  std::unordered_set<int64_t> edgeIds;
   edgeIds.reserve(80000);
 
   for (const auto& vehicle : vehicles) {
@@ -632,6 +638,18 @@ bool extractGraphContextForDestinationCorridorsIndexed(
 
   if (edgeIds.empty()) {
     return fail("no edges in destination corridors");
+  }
+  return true;
+}
+
+bool extractGraphContextForDestinationCorridorsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, GraphContext& out, std::string* error) {
+  std::unordered_set<int64_t> edgeIds;
+  if (!collectDestinationCorridorEdgeIdsIndexed(store, index, vehicles, destLat, destLon,
+                                                maxCorridorWidthM, edgeIds, error)) {
+    return false;
   }
   if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
     return false;

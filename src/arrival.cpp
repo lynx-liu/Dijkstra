@@ -11,8 +11,10 @@
 #include <cmath>
 #include <future>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace mmlp {
@@ -51,6 +53,23 @@ bool vehicleMayReachDestination(const VehicleInfo& vehicle, const DestinationQue
   // Straight line at ~65% of road speed is a conservative travel-time lower bound.
   const double minTravelSec = dist / (std::max(speedMs, 5.0) * 0.65);
   return minTravelSec <= horizon + 120.0;
+}
+
+void addRoutingTargetNodes(const MultimodalGraph& graph, const GraphPosition& pos,
+                           std::unordered_set<int64_t>& targets) {
+  if (!pos.valid) {
+    return;
+  }
+  if (pos.edgeId == 0) {
+    targets.insert(pos.nodeId);
+    return;
+  }
+  const Edge* edge = graph.findEdge(pos.edgeId);
+  if (edge == nullptr) {
+    return;
+  }
+  targets.insert(edge->from);
+  targets.insert(edge->to);
 }
 
 }  // namespace
@@ -169,34 +188,91 @@ DestinationArrivalSummary predictVehiclesToDestination(
     return summary;
   }
 
-  summary.vehicles.reserve(vehicles.size());
-  const std::size_t maxWorkers =
-      std::max<std::size_t>(1, static_cast<std::size_t>(std::thread::hardware_concurrency()));
-  const bool parallel = vehicles.size() > 1 && maxWorkers > 1;
-  if (parallel) {
-    std::vector<std::future<std::optional<VehicleArrivalResult>>> futures;
-    futures.reserve(vehicles.size());
-    for (const auto& vehicle : vehicles) {
-      const VehicleHistory* hist = findHistory(histories, vehicle.id);
-      futures.push_back(std::async(
-          std::launch::async,
-          [vehicle, hist, &routeCtx, &matchIndex, dest, goalPos, param]() {
-            return predictVehicleToDestination(vehicle, hist, routeCtx, matchIndex, dest, goalPos,
-                                             param);
-          }));
+  struct VehicleJob {
+    const VehicleInfo* vehicle = nullptr;
+    const VehicleHistory* history = nullptr;
+    double speedMs = 0.0;
+    double maxHorizon = 0.0;
+  };
+  std::vector<VehicleJob> jobs;
+  jobs.reserve(vehicles.size());
+
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.type != dest.type) {
+      continue;
     }
-    for (auto& fut : futures) {
-      if (auto row = fut.get()) {
-        summary.vehicles.push_back(std::move(*row));
-      }
+    const VehicleHistory* hist = findHistory(histories, vehicle.id);
+    const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
+    if (!vehicleMayReachDestination(vehicle, dest, speedMs)) {
+      continue;
     }
-  } else {
-    for (const auto& vehicle : vehicles) {
-      const VehicleHistory* hist = findHistory(histories, vehicle.id);
-      if (auto row = predictVehicleToDestination(vehicle, hist, routeCtx, matchIndex, dest,
-                                                 goalPos, param)) {
-        summary.vehicles.push_back(std::move(*row));
+    const double maxHorizon =
+        std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+    if (maxHorizon < 1.0) {
+      continue;
+    }
+    jobs.push_back({&vehicle, hist, speedMs, maxHorizon});
+  }
+
+  PredictParam routeParam = param;
+  routeParam.maxVisitedNodes = 0;
+
+  std::map<int, std::vector<VehicleJob>> bySpeedKey;
+  for (const auto& job : jobs) {
+    const int key = static_cast<int>(std::lround(job.speedMs * 100.0));
+    bySpeedKey[key].push_back(job);
+  }
+
+  summary.vehicles.reserve(jobs.size());
+  for (auto& kv : bySpeedKey) {
+    const double speedMs = kv.first / 100.0;
+    double groupMaxHorizon = 0.0;
+    std::vector<std::pair<const VehicleJob*, PreparedVehicle>> preparedJobs;
+    preparedJobs.reserve(kv.second.size());
+    std::unordered_set<int64_t> targetNodes;
+    targetNodes.reserve(kv.second.size() * 2);
+
+    for (const auto& job : kv.second) {
+      groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
+      const PreparedVehicle prepared =
+          prepareVehicle(graph, *job.vehicle, job.history, job.vehicle->timestamp, param,
+                         &matchIndex);
+      if (!prepared.valid) {
+        continue;
       }
+      addRoutingTargetNodes(graph, prepared.position, targetNodes);
+      preparedJobs.push_back({&job, prepared});
+    }
+    if (preparedJobs.empty()) {
+      continue;
+    }
+
+    const RoutedTimeField field = computeRoutedTimeFieldFromGoal(
+        graph, goalPos, speedMs, dest.type, routeParam, groupMaxHorizon, &targetNodes);
+
+    for (const auto& [job, prepared] : preparedJobs) {
+      const RouteToGoal path =
+          routeFromRoutedField(graph, field, prepared.position, goalPos, prepared.speedMs,
+                               job->vehicle->type, routeParam);
+      const double travel = path.travelTimeSec;
+      if (travel >= kInfTime / 2.0 || travel > job->maxHorizon + 1e-6) {
+        continue;
+      }
+
+      const double eta = static_cast<double>(job->vehicle->timestamp) + travel;
+      if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+        continue;
+      }
+
+      VehicleArrivalResult row;
+      row.vehicleId = job->vehicle->id;
+      row.reachable = true;
+      row.travelDurationSec = travel;
+      row.etaUnix = eta;
+      row.routeDistanceM = polylineLengthMeters(path.polyline);
+      row.route = path.polyline;
+      simplifyRoutePolyline(row.route, 120);
+      summary.vehicles.push_back(std::move(row));
     }
   }
 
@@ -246,38 +322,155 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
   }
 
   const auto t0 = std::chrono::steady_clock::now();
+  std::int64_t collectMs = 0;
 
   constexpr double kPerVehicleThresholdM = 600000.0;
   constexpr double kBBoxExtractMaxSpanM = 50000.0;
+  // Pearl River Delta etc.: bbox pulls ~1M edges; use corridors instead.
+  const bool denseSouthChina =
+      dest.lat >= 18.0 && dest.lat <= 35.0 && dest.lon >= 105.0 && dest.lon <= 122.0;
+  const bool useBboxExtract =
+      maxSpanM <= kBBoxExtractMaxSpanM ||
+      (routable.size() >= 4 && maxSpanM <= kPerVehicleThresholdM && !denseSouthChina);
+
   if (maxSpanM <= kPerVehicleThresholdM) {
-    GraphContext regionCtx;
-    std::string extractErr;
-    bool extracted = false;
-    if (maxSpanM <= kBBoxExtractMaxSpanM) {
+    const auto tc0 = std::chrono::steady_clock::now();
+    std::unordered_set<int64_t> allowedEdges;
+    std::string collectErr;
+    bool collected = false;
+    if (useBboxExtract) {
       std::vector<VehicleInfo> forExtract = routable;
       forExtract.push_back(destProbe);
       const double padM =
           std::min(maxCorridorWidthM, std::max(20000.0, maxSpanM * 0.15 + 12000.0));
-      extracted = extractGraphContextForDestinationIndexed(store, matchIndex, forExtract, padM,
-                                                         regionCtx, &extractErr);
+      collected = collectDestinationBBoxEdgeIdsIndexed(store, matchIndex, forExtract, padM,
+                                                     allowedEdges, &collectErr);
     } else {
-      extracted = extractGraphContextForDestinationCorridorsIndexed(
-          store, matchIndex, routable, dest.lat, dest.lon, maxCorridorWidthM, regionCtx,
-          &extractErr);
+      collected = collectDestinationCorridorEdgeIdsIndexed(
+          store, matchIndex, routable, dest.lat, dest.lon, maxCorridorWidthM, allowedEdges,
+          &collectErr);
     }
-    if (!extracted) {
-      std::cerr << "[mmlp] destination region extract failed: " << extractErr << "\n"
+    const auto tc1 = std::chrono::steady_clock::now();
+    collectMs = std::chrono::duration_cast<std::chrono::milliseconds>(tc1 - tc0).count();
+    if (!collected) {
+      std::cerr << "[mmlp] destination edge collect failed: " << collectErr << "\n" << std::flush;
+      return summary;
+    }
+
+    const GraphPosition goalPos =
+        matchVehicleToGraphIndexed(store, matchIndex, destProbe);
+    summary.locationId = graphLocationId(goalPos);
+    if (!goalPos.valid) {
+      return summary;
+    }
+
+    if (false && store.hasCsr()) {
+      // National mmap CSR + per-edge hash filter scans all node arcs nationwide
+      // (much slower than compact subgraph). Reserved for future CH routing.
+      const auto t1 = std::chrono::steady_clock::now();
+
+      struct VehicleJob {
+        const VehicleInfo* vehicle = nullptr;
+        const VehicleHistory* history = nullptr;
+        double speedMs = 0.0;
+        double maxHorizon = 0.0;
+      };
+      std::vector<VehicleJob> jobs;
+      jobs.reserve(routable.size());
+      for (const auto& vehicle : routable) {
+        const VehicleHistory* hist = findHistory(histories, vehicle.id);
+        const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
+        const double maxHorizon =
+            std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+        if (maxHorizon < 1.0) {
+          continue;
+        }
+        jobs.push_back({&vehicle, hist, speedMs, maxHorizon});
+      }
+
+      PredictParam routeParam = param;
+      routeParam.maxVisitedNodes = 0;
+
+      std::map<int, std::vector<VehicleJob>> bySpeedKey;
+      for (const auto& job : jobs) {
+        bySpeedKey[static_cast<int>(std::lround(job.speedMs * 100.0))].push_back(job);
+      }
+
+      summary.vehicles.reserve(jobs.size());
+      const CsrGraph& csr = store.csr();
+      for (auto& kv : bySpeedKey) {
+        const double speedMs = kv.first / 100.0;
+        double groupMaxHorizon = 0.0;
+        for (const auto& job : kv.second) {
+          groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
+        }
+
+        const RoutedTimeField field = computeRoutedTimeFieldFromGoalCsr(
+            store, csr, goalPos, speedMs, dest.type, routeParam, groupMaxHorizon, &allowedEdges);
+
+        for (const auto& job : kv.second) {
+          const GraphPosition startPos =
+              matchVehicleToGraphIndexed(store, matchIndex, *job.vehicle);
+          if (!startPos.valid) {
+            continue;
+          }
+
+          const RouteToGoal path = routeFromRoutedFieldCsr(store, csr, field, startPos, goalPos,
+                                                         job.speedMs, job.vehicle->type, routeParam);
+          const double travel = path.travelTimeSec;
+          if (travel >= kInfTime / 2.0 || travel > job.maxHorizon + 1e-6) {
+            continue;
+          }
+
+          const double eta = static_cast<double>(job.vehicle->timestamp) + travel;
+          if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+            continue;
+          }
+
+          VehicleArrivalResult row;
+          row.vehicleId = job.vehicle->id;
+          row.reachable = true;
+          row.travelDurationSec = travel;
+          row.etaUnix = eta;
+          row.routeDistanceM = polylineLengthMeters(path.polyline);
+          row.route = path.polyline;
+          simplifyRoutePolyline(row.route, 120);
+          summary.vehicles.push_back(std::move(row));
+        }
+      }
+
+      sortDestinationArrivals(summary.vehicles, dest.sortBy);
+
+      const auto t2 = std::chrono::steady_clock::now();
+      std::cerr << "[mmlp] destination indexed(csr) vehicles=" << vehicles.size()
+                << " pruned=" << pruned << " routable=" << routable.size()
+                << " filter_edges=" << allowedEdges.size() << " egeo=" << (store.hasEdgeGeo() ? 1 : 0)
+                << " csr=1 collect_ms=" << collectMs << " total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count()
+                << " predict_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+                << " reachable=" << summary.vehicles.size() << "\n"
                 << std::flush;
+      return summary;
+    }
+
+    GraphContext regionCtx;
+    std::string extractErr;
+    if (!store.loadGraphSubset(allowedEdges, regionCtx.graph, &extractErr)) {
+      std::cerr << "[mmlp] destination subset load failed: " << extractErr << "\n" << std::flush;
       return summary;
     }
 
     const auto t1 = std::chrono::steady_clock::now();
     summary = predictVehiclesToDestination(routable, histories, regionCtx, matchIndex, dest, param);
     summary.sortBy = dest.sortBy;
+    summary.locationId = graphLocationId(goalPos);
 
     const auto t2 = std::chrono::steady_clock::now();
     std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
               << " routable=" << routable.size() << " sub_edges=" << regionCtx.graph.edges().size()
+              << " egeo=" << (store.hasEdgeGeo() ? 1 : 0) << " csr=0 bbox="
+              << (useBboxExtract ? 1 : 0) << " collect_ms=" << collectMs
               << " extract_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
               << " predict_ms="

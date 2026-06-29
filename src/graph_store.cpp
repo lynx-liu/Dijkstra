@@ -13,9 +13,11 @@ namespace {
 
 constexpr char kBinMagic[] = "MMLPGRPH";
 constexpr char kNdxMagic[8] = {'M', 'M', 'L', 'P', 'N', 'D', 'X', '\0'};
+constexpr char kEgeoMagic[8] = {'M', 'M', 'L', 'P', 'E', 'G', 'E', 'O'};
 constexpr std::size_t kNodeRecord = 28;
 constexpr std::size_t kEdgeRecord = 44;
 constexpr std::size_t kIndexHeader = 20;  // magic(8) + version(4) + count(8)
+constexpr std::size_t kEdgeGeoRecord = 16;  // 4 x float32
 
 }  // namespace
 
@@ -23,6 +25,9 @@ GraphFileStore::~GraphFileStore() {
   bin_.unmap();
   nidx_.unmap();
   eidx_.unmap();
+  egeo_.unmap();
+  edgeGeo_ = nullptr;
+  edgeGeoCount_ = 0;
 }
 
 bool GraphFileStore::MmapFile::map(const std::string& path, std::string* error) {
@@ -146,7 +151,55 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
     return fail("graph file shorter than header claims");
   }
 
+  const std::string egeoPath = base + ".egeo";
+  if (egeo_.map(egeoPath, nullptr)) {
+    if (egeo_.size >= 20 && std::memcmp(egeo_.data, kEgeoMagic, 8) == 0) {
+      uint32_t gver = 0;
+      uint64_t gcnt = 0;
+      std::memcpy(&gver, static_cast<const char*>(egeo_.data) + 8, 4);
+      std::memcpy(&gcnt, static_cast<const char*>(egeo_.data) + 12, 8);
+      if (gver == 1 && gcnt == edgeCount &&
+          egeo_.size >= 20 + static_cast<std::size_t>(gcnt) * kEdgeGeoRecord) {
+        edgeGeo_ = reinterpret_cast<const float*>(static_cast<const char*>(egeo_.data) + 20);
+        edgeGeoCount_ = static_cast<std::size_t>(gcnt);
+      }
+    }
+    if (edgeGeo_ == nullptr) {
+      egeo_.unmap();
+    }
+  }
+
+  const std::string csrPath = base + ".csr";
+  (void)csrPath;
+  // CSR mmap (~5GB) is optional; do not load at startup (reserved for future CH).
+
   binPath_ = binPath;
+  return true;
+}
+
+int GraphFileStore::nodeRowIndex(int64_t nodeId) const {
+  const IdOffset* row = findOffset(nodeIndex_, nodeCount_, nodeId);
+  if (row == nullptr) {
+    return -1;
+  }
+  return static_cast<int>(row - nodeIndex_);
+}
+
+bool GraphFileStore::readEdge(int64_t edgeId, EdgeType& type, double& length,
+                              double& speedLimit) const {
+  const IdOffset* row = findOffset(edgeIndex_, edgeCount_, edgeId);
+  if (row == nullptr || row->offset + kEdgeRecord > bin_.size) {
+    return false;
+  }
+  const char* p = static_cast<const char*>(bin_.data) + row->offset;
+  int32_t t = 0;
+  int64_t id = 0;
+  std::memcpy(&id, p, 8);
+  (void)id;
+  std::memcpy(&t, p + 24, 4);
+  std::memcpy(&length, p + 28, 8);
+  std::memcpy(&speedLimit, p + 36, 8);
+  type = static_cast<EdgeType>(t);
   return true;
 }
 
@@ -177,6 +230,33 @@ bool GraphFileStore::edgeEndpoints(int64_t edgeId, int64_t& from, int64_t& to) c
   return true;
 }
 
+bool GraphFileStore::edgeEndpointLatLon(int64_t edgeId, double& flat, double& flon, double& tlat,
+                                        double& tlon) const {
+  const IdOffset* row = findOffset(edgeIndex_, edgeCount_, edgeId);
+  if (row == nullptr) {
+    return false;
+  }
+  if (edgeGeo_ != nullptr) {
+    const uint64_t idx = (row->offset - edgeRegionOffset_) / kEdgeRecord;
+    if (idx < edgeGeoCount_) {
+      const float* geo = edgeGeo_ + idx * 4;
+      flat = geo[0];
+      flon = geo[1];
+      tlat = geo[2];
+      tlon = geo[3];
+      if (flat == flat && tlat == tlat) {  // not NaN
+        return true;
+      }
+    }
+  }
+  int64_t from = 0;
+  int64_t to = 0;
+  if (!edgeEndpoints(edgeId, from, to)) {
+    return false;
+  }
+  return nodeLatLon(from, flat, flon) && nodeLatLon(to, tlat, tlon);
+}
+
 bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
                                     MultimodalGraph& graph, std::string* error) const {
   auto fail = [&](const std::string& msg) {
@@ -193,7 +273,6 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
   }
 
   struct EdgeAt {
-    uint64_t offset = 0;
     Edge edge;
   };
   std::vector<EdgeAt> edges;
@@ -206,7 +285,6 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     }
     const char* p = static_cast<const char*>(bin_.data) + row->offset;
     EdgeAt item;
-    item.offset = row->offset;
     int32_t type = 0;
     std::memcpy(&item.edge.id, p, 8);
     std::memcpy(&item.edge.from, p + 8, 8);
@@ -221,9 +299,6 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     return fail("no edges resolved");
   }
 
-  std::sort(edges.begin(), edges.end(),
-            [](const EdgeAt& a, const EdgeAt& b) { return a.offset < b.offset; });
-
   std::unordered_set<int64_t> nodeIds;
   nodeIds.reserve(edges.size() * 2);
   for (const auto& item : edges) {
@@ -231,39 +306,31 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     nodeIds.insert(item.edge.to);
   }
 
-  struct NodeAt {
-    uint64_t offset = 0;
-    Node node;
-  };
-  std::vector<NodeAt> nodes;
+  std::vector<Node> nodes;
   nodes.reserve(nodeIds.size());
   for (int64_t nodeId : nodeIds) {
     const IdOffset* row = findOffset(nodeIndex_, nodeCount_, nodeId);
     if (row == nullptr || row->offset + kNodeRecord > bin_.size) {
       continue;
     }
-    NodeAt item;
-    item.offset = row->offset;
     const char* p = static_cast<const char*>(bin_.data) + row->offset;
+    Node node;
     int32_t kind = 0;
-    std::memcpy(&item.node.id, p, 8);
-    std::memcpy(&item.node.lat, p + 8, 8);
-    std::memcpy(&item.node.lon, p + 16, 8);
+    std::memcpy(&node.id, p, 8);
+    std::memcpy(&node.lat, p + 8, 8);
+    std::memcpy(&node.lon, p + 16, 8);
     std::memcpy(&kind, p + 24, 4);
-    item.node.kind = static_cast<NodeKind>(kind);
-    nodes.push_back(item);
+    node.kind = static_cast<NodeKind>(kind);
+    nodes.push_back(node);
   }
-  std::sort(nodes.begin(), nodes.end(),
-            [](const NodeAt& a, const NodeAt& b) { return a.offset < b.offset; });
 
-  graph.clear();
-  graph.reserveGraph(nodes.size(), edges.size());
-  for (const auto& item : nodes) {
-    graph.addNodeBulk(item.node);
-  }
+  std::vector<Edge> edgeList;
+  edgeList.reserve(edges.size());
   for (const auto& item : edges) {
-    graph.addEdgeBulk(item.edge);
+    edgeList.push_back(item.edge);
   }
+
+  graph.buildFromSubset(std::move(nodes), std::move(edgeList));
   if (graph.nodes().empty()) {
     return fail("subset empty");
   }

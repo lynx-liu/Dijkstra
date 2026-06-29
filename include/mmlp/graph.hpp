@@ -25,6 +25,9 @@ class MultimodalGraph {
   void addNodeBulk(Node node);
   void addEdgeBulk(Edge edge);
 
+  // Fast path for mmap subgraph extract: dense vector adjacency, no hash adjacency build.
+  void buildFromSubset(std::vector<Node>&& nodes, std::vector<Edge>&& edges);
+
   const std::vector<Node>& nodes() const { return nodes_; }
   const std::vector<Edge>& edges() const { return edges_; }
   const std::vector<AdjacencyEdge>& neighbors(int64_t nodeId) const;
@@ -40,6 +43,8 @@ class MultimodalGraph {
   std::unordered_map<int64_t, std::size_t> nodeIndex_;
   std::unordered_map<int64_t, std::size_t> edgeIndex_;
   std::unordered_map<int64_t, std::vector<AdjacencyEdge>> adjacency_;
+  std::vector<std::vector<AdjacencyEdge>> denseAdjacency_;
+  bool useDenseAdjacency_ = false;
   static const std::vector<AdjacencyEdge> kEmptyNeighbors;
 };
 

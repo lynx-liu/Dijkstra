@@ -15,6 +15,7 @@ echo "arrive by    : ${ARRIVE_BY} (+24h)" >&2
 echo "destination  : 43.92, 87.50 (乌鲁木齐)" >&2
 echo >&2
 
+START=$(date +%s.%N)
 python3 - "${VEHICLE_TIME}" "${ARRIVE_BY}" <<'PY' | curl -s -X POST "${BASE}/api/destinations/arrive" \
   -H 'Content-Type: application/json' \
   -d @- | python3 -m json.tool
@@ -44,3 +45,5 @@ print(json.dumps({
     ],
 }, separators=(",", ":"), ensure_ascii=False))
 PY
+END=$(date +%s.%N)
+python3 -c "import sys; s,e=sys.argv[1:3]; print(f'elapsed={float(e)-float(s):.2f}s (HTTP+curl+json.tool)', file=sys.stderr)" "$START" "$END"

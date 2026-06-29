@@ -6,11 +6,17 @@
 
 namespace mmlp {
 
+class GraphFileStore;
+class SpatialIndex;
+
 constexpr double kMaxSnapDistanceMeters = 8000.0;
 
 class SpatialIndex;
 
 GraphPosition matchVehicleToGraph(const MultimodalGraph& graph, const VehicleInfo& vehicle,
                                   const SpatialIndex* index = nullptr);
+
+GraphPosition matchVehicleToGraphIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                         const VehicleInfo& vehicle);
 
 }  // namespace mmlp

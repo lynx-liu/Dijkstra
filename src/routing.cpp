@@ -1,6 +1,8 @@
 #include "mmlp/routing.hpp"
 
+#include "mmlp/csr_graph.hpp"
 #include "mmlp/geo.hpp"
+#include "mmlp/graph_store.hpp"
 #include "mmlp/motion.hpp"
 
 #include <algorithm>
@@ -424,6 +426,353 @@ RoutePolyline computeRoutePolyline(const MultimodalGraph& graph, const GraphPosi
                                    const GraphPosition& goal, double speedMs, VehicleType type,
                                    const PredictParam& param, double maxTime) {
   return computeRouteToGoal(graph, start, goal, speedMs, type, param, maxTime).polyline;
+}
+
+RoutedTimeField computeRoutedTimeFieldFromGoal(const MultimodalGraph& graph,
+                                               const GraphPosition& goal, double speedMs,
+                                               VehicleType type, const PredictParam& param,
+                                               double maxTime,
+                                               const std::unordered_set<int64_t>* targetNodes) {
+  RoutedTimeField field;
+  if (!goal.valid || maxTime <= 0.0) {
+    return field;
+  }
+
+  const Edge* goalEdge = goal.edgeId != 0 ? graph.findEdge(goal.edgeId) : nullptr;
+
+  using QueueItem = std::tuple<double, int64_t>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+
+  std::unordered_set<int64_t> pendingTargets;
+  if (targetNodes != nullptr) {
+    pendingTargets = *targetNodes;
+  }
+
+  auto relax = [&](int64_t nodeId, double t, int64_t parentNode) {
+    if (t > maxTime + 1e-9) {
+      return;
+    }
+    const auto it = field.atNode.find(nodeId);
+    if (it != field.atNode.end() && it->second <= t + 1e-9) {
+      return;
+    }
+    field.atNode[nodeId] = t;
+    if (parentNode != 0) {
+      field.parentTowardGoal[nodeId] = parentNode;
+    }
+    pq.push({t, nodeId});
+  };
+
+  if (goal.edgeId == 0) {
+    relax(goal.nodeId, 0.0, 0);
+  } else if (goalEdge != nullptr) {
+    relax(goalEdge->from, 0.0, 0);
+    relax(goalEdge->to, 0.0, 0);
+  }
+
+  const std::size_t visitCap =
+      param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
+
+  while (!pq.empty()) {
+    if (field.atNode.size() >= visitCap) {
+      break;
+    }
+    if (!pendingTargets.empty() && pendingTargets.empty()) {
+      break;
+    }
+    const auto [t, u] = pq.top();
+    pq.pop();
+    const auto it = field.atNode.find(u);
+    if (it == field.atNode.end() || t > it->second + 1e-6) {
+      continue;
+    }
+    if (pendingTargets.count(u) > 0) {
+      pendingTargets.erase(u);
+    }
+
+    for (const AdjacencyEdge& adj : graph.neighbors(u)) {
+      if (!edgeAllowedForVehicle(adj.type, type)) {
+        continue;
+      }
+      const double eff = edgeEffectiveSpeedMs(adj, type, speedMs);
+      const double w = travelTimeSeconds(adj.length, eff, type, param);
+      relax(adj.to, t + w, u);
+    }
+  }
+
+  return field;
+}
+
+RouteToGoal routeFromRoutedField(const MultimodalGraph& graph, const RoutedTimeField& field,
+                                 const GraphPosition& start, const GraphPosition& goal,
+                                 double speedMs, VehicleType type, const PredictParam& param) {
+  RouteToGoal result;
+  if (!start.valid || !goal.valid) {
+    return result;
+  }
+
+  auto nodeTime = [&](int64_t nodeId) -> double {
+    const auto it = field.atNode.find(nodeId);
+    if (it == field.atNode.end()) {
+      return kInfTime;
+    }
+    return it->second;
+  };
+
+  double travel = kInfTime;
+  if (start.edgeId == 0) {
+    travel = nodeTime(start.nodeId);
+  } else {
+    const Edge* edge = graph.findEdge(start.edgeId);
+    if (edge != nullptr) {
+      const double toFrom =
+          nodeTime(edge->from) +
+          travelTimeSeconds(start.alongMeters, speedMs, type, param);
+      const double toTo =
+          nodeTime(edge->to) +
+          travelTimeSeconds(std::max(0.0, edge->length - start.alongMeters), speedMs, type,
+                            param);
+      travel = std::min(toFrom, toTo);
+    }
+  }
+
+  if (travel >= kInfTime / 2.0) {
+    return result;
+  }
+  result.travelTimeSec = travel;
+
+  int64_t startNode = 0;
+  if (start.edgeId == 0) {
+    startNode = start.nodeId;
+  } else {
+    const Edge* edge = graph.findEdge(start.edgeId);
+    if (edge == nullptr) {
+      return result;
+    }
+    const double toFrom =
+        nodeTime(edge->from) +
+        travelTimeSeconds(start.alongMeters, speedMs, type, param);
+    const double toTo =
+        nodeTime(edge->to) +
+        travelTimeSeconds(std::max(0.0, edge->length - start.alongMeters), speedMs, type, param);
+    startNode = (toFrom <= toTo) ? edge->from : edge->to;
+  }
+
+  std::vector<int64_t> nodes;
+  int64_t cur = startNode;
+  while (cur != 0) {
+    nodes.push_back(cur);
+    const auto pit = field.parentTowardGoal.find(cur);
+    if (pit == field.parentTowardGoal.end()) {
+      break;
+    }
+    cur = pit->second;
+  }
+
+  RoutePolyline& route = result.polyline;
+  if (start.edgeId != 0) {
+    route.points.push_back(positionLatLon(graph, start));
+  }
+  for (int64_t nodeId : nodes) {
+    const Node* node = graph.findNode(nodeId);
+    if (node != nullptr) {
+      route.points.push_back({node->lat, node->lon});
+    }
+  }
+  const LatLon endLoc = positionLatLon(graph, goal);
+  if (route.points.empty() || haversineMeters(route.points.back(), endLoc) > 1.0) {
+    route.points.push_back(endLoc);
+  }
+  return result;
+}
+
+namespace {
+
+LatLon positionLatLonStore(const GraphFileStore& store, const GraphPosition& pos) {
+  if (!pos.valid) {
+    return {};
+  }
+  if (pos.edgeId == 0) {
+    double lat = 0.0;
+    double lon = 0.0;
+    if (!store.nodeLatLon(pos.nodeId, lat, lon)) {
+      return {};
+    }
+    return {lat, lon};
+  }
+  double flat = 0.0;
+  double flon = 0.0;
+  double tlat = 0.0;
+  double tlon = 0.0;
+  EdgeType type = EdgeType::ROAD;
+  double length = 0.0;
+  double speedLimit = 0.0;
+  if (!store.edgeEndpointLatLon(pos.edgeId, flat, flon, tlat, tlon) ||
+      !store.readEdge(pos.edgeId, type, length, speedLimit) || length <= 1e-6) {
+    return {flat, flon};
+  }
+  const double t = std::max(0.0, std::min(1.0, pos.alongMeters / length));
+  return {flat + t * (tlat - flat), flon + t * (tlon - flon)};
+}
+
+}  // namespace
+
+RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
+    const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
+    VehicleType type, const PredictParam& param, double maxTime,
+    const std::unordered_set<int64_t>* allowedEdgeIds) {
+  RoutedTimeField field;
+  if (!goal.valid || maxTime <= 0.0 || !csr.isOpen()) {
+    return field;
+  }
+
+  using QueueItem = std::tuple<double, int64_t>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+
+  auto relax = [&](int64_t nodeId, double t, int64_t parentNode) {
+    if (t > maxTime + 1e-9) {
+      return;
+    }
+    const auto it = field.atNode.find(nodeId);
+    if (it != field.atNode.end() && it->second <= t + 1e-9) {
+      return;
+    }
+    field.atNode[nodeId] = t;
+    if (parentNode != 0) {
+      field.parentTowardGoal[nodeId] = parentNode;
+    }
+    pq.push({t, nodeId});
+  };
+
+  if (goal.edgeId == 0) {
+    relax(goal.nodeId, 0.0, 0);
+  } else {
+    int64_t from = 0;
+    int64_t to = 0;
+    if (store.edgeEndpoints(goal.edgeId, from, to)) {
+      relax(from, 0.0, 0);
+      relax(to, 0.0, 0);
+    }
+  }
+
+  const std::size_t visitCap =
+      param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
+
+  while (!pq.empty()) {
+    if (field.atNode.size() >= visitCap) {
+      break;
+    }
+    const auto [t, u] = pq.top();
+    pq.pop();
+    const auto it = field.atNode.find(u);
+    if (it == field.atNode.end() || t > it->second + 1e-6) {
+      continue;
+    }
+
+    csr.forEachNeighbor(store, u, allowedEdgeIds, [&](const CsrArc& adj) {
+      if (!edgeAllowedForVehicle(adj.type, type)) {
+        return;
+      }
+      const double eff = csrArcEffectiveSpeedMs(adj.speedLimit, type, speedMs);
+      const double w = travelTimeSeconds(adj.length, eff, type, param);
+      relax(adj.toNodeId, t + w, u);
+    });
+  }
+
+  return field;
+}
+
+RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph& csr,
+                                    const RoutedTimeField& field, const GraphPosition& start,
+                                    const GraphPosition& goal, double speedMs, VehicleType type,
+                                    const PredictParam& param) {
+  RouteToGoal result;
+  if (!start.valid || !goal.valid) {
+    return result;
+  }
+
+  auto nodeTime = [&](int64_t nodeId) -> double {
+    const auto it = field.atNode.find(nodeId);
+    if (it == field.atNode.end()) {
+      return kInfTime;
+    }
+    return it->second;
+  };
+
+  double travel = kInfTime;
+  if (start.edgeId == 0) {
+    travel = nodeTime(start.nodeId);
+  } else {
+    int64_t from = 0;
+    int64_t to = 0;
+    EdgeType edgeType = EdgeType::ROAD;
+    double length = 0.0;
+    double speedLimit = 0.0;
+    if (store.edgeEndpoints(start.edgeId, from, to) &&
+        store.readEdge(start.edgeId, edgeType, length, speedLimit)) {
+      const double toFrom =
+          nodeTime(from) + travelTimeSeconds(start.alongMeters, speedMs, type, param);
+      const double toTo =
+          nodeTime(to) +
+          travelTimeSeconds(std::max(0.0, length - start.alongMeters), speedMs, type, param);
+      travel = std::min(toFrom, toTo);
+    }
+  }
+
+  if (travel >= kInfTime / 2.0) {
+    return result;
+  }
+  result.travelTimeSec = travel;
+
+  int64_t startNode = 0;
+  if (start.edgeId == 0) {
+    startNode = start.nodeId;
+  } else {
+    int64_t from = 0;
+    int64_t to = 0;
+    EdgeType edgeType = EdgeType::ROAD;
+    double length = 0.0;
+    double speedLimit = 0.0;
+    if (!store.edgeEndpoints(start.edgeId, from, to) ||
+        !store.readEdge(start.edgeId, edgeType, length, speedLimit)) {
+      return result;
+    }
+    const double toFrom =
+        nodeTime(from) + travelTimeSeconds(start.alongMeters, speedMs, type, param);
+    const double toTo =
+        nodeTime(to) +
+        travelTimeSeconds(std::max(0.0, length - start.alongMeters), speedMs, type, param);
+    startNode = (toFrom <= toTo) ? from : to;
+  }
+
+  std::vector<int64_t> nodes;
+  int64_t cur = startNode;
+  while (cur != 0) {
+    nodes.push_back(cur);
+    const auto pit = field.parentTowardGoal.find(cur);
+    if (pit == field.parentTowardGoal.end()) {
+      break;
+    }
+    cur = pit->second;
+  }
+
+  RoutePolyline& route = result.polyline;
+  if (start.edgeId != 0) {
+    route.points.push_back(positionLatLonStore(store, start));
+  }
+  for (int64_t nodeId : nodes) {
+    double lat = 0.0;
+    double lon = 0.0;
+    if (store.nodeLatLon(nodeId, lat, lon)) {
+      route.points.push_back({lat, lon});
+    }
+  }
+  const LatLon endLoc = positionLatLonStore(store, goal);
+  if (route.points.empty() || haversineMeters(route.points.back(), endLoc) > 1.0) {
+    route.points.push_back(endLoc);
+  }
+  (void)csr;
+  return result;
 }
 
 }  // namespace mmlp

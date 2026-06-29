@@ -2,6 +2,8 @@
 
 #include "mmlp/graph.hpp"
 
+#include "mmlp/csr_graph.hpp"
+
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -23,6 +25,17 @@ class GraphFileStore {
 
   bool nodeLatLon(int64_t nodeId, double& lat, double& lon) const;
   bool edgeEndpoints(int64_t edgeId, int64_t& from, int64_t& to) const;
+  // Endpoint lat/lon from mmap .egeo (O(1) after eidx lookup). Falls back to nodeLatLon.
+  bool edgeEndpointLatLon(int64_t edgeId, double& flat, double& flon, double& tlat,
+                        double& tlon) const;
+  bool hasEdgeGeo() const { return egeo_.data != nullptr; }
+  bool hasCsr() const { return csr_.isOpen(); }
+  const CsrGraph& csr() const { return csr_; }
+
+  // Row in nidx / CSR tables for a node id (-1 if missing).
+  int nodeRowIndex(int64_t nodeId) const;
+
+  bool readEdge(int64_t edgeId, EdgeType& type, double& length, double& speedLimit) const;
 
   bool loadGraphSubset(const std::unordered_set<int64_t>& edgeIds, MultimodalGraph& graph,
                        std::string* error = nullptr) const;
@@ -46,6 +59,10 @@ class GraphFileStore {
   MmapFile bin_;
   MmapFile nidx_;
   MmapFile eidx_;
+  MmapFile egeo_;
+  const float* edgeGeo_ = nullptr;
+  std::size_t edgeGeoCount_ = 0;
+  CsrGraph csr_;
   const IdOffset* nodeIndex_ = nullptr;
   std::size_t nodeCount_ = 0;
   const IdOffset* edgeIndex_ = nullptr;

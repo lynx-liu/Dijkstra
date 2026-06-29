@@ -11,6 +11,8 @@
 
 namespace mmlp {
 
+class GraphFileStore;
+
 // Uniform grid for fast nearest-edge map matching (nationwide graphs).
 class SpatialIndex {
  public:
@@ -22,11 +24,16 @@ class SpatialIndex {
   bool nearestEdge(const MultimodalGraph& graph, double lat, double lon, VehicleType type,
                    GraphPosition& out, double* distanceMeters = nullptr) const;
 
+  bool nearestEdgeMmap(const GraphFileStore& store, double lat, double lon, VehicleType type,
+                       GraphPosition& out, double* distanceMeters = nullptr) const;
+
   void collectEdgesInBBox(const GeoBBox& bbox, std::unordered_set<int64_t>& edgeIds) const;
 
   // Edges with at least one endpoint within radiusMeters of (lat, lon).
   void collectEdgesInRadius(const MultimodalGraph& graph, double lat, double lon,
                             double radiusMeters, std::unordered_set<int64_t>& edgeIds) const;
+
+  double cellSizeDeg() const { return cellSizeDeg_; }
 
  private:
   double cellSizeDeg_ = 0.02;
