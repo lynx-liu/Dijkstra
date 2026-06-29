@@ -539,6 +539,9 @@ bool extractGraphContextForPairIndexed(const GraphFileStore& store, const Spatia
   const GeoBBox destBox = bboxAroundSegment(destLl, destLl, 8000.0);
   index.collectEdgesInBBox(destBox, edgeIds);
 
+  const GeoBBox vehBox = bboxAroundSegment(vehicleLl, vehicleLl, 8000.0);
+  index.collectEdgesInBBox(vehBox, edgeIds);
+
   if (edgeIds.empty()) {
     if (error) {
       *error = "no edges in vehicle-destination corridor";
@@ -585,6 +588,50 @@ bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
   index.collectEdgesInBBox(box, edgeIds);
   if (edgeIds.empty()) {
     return fail("no graph edges in destination bbox");
+  }
+  if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
+    return false;
+  }
+  return true;
+}
+
+bool extractGraphContextForDestinationCorridorsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, GraphContext& out, std::string* error) {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (vehicles.empty()) {
+    return fail("no vehicles for corridor extract");
+  }
+
+  const LatLon destLl{destLat, destLon};
+  std::unordered_set<int64_t> edgeIds;
+  edgeIds.reserve(80000);
+
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.id == "__destination__") {
+      continue;
+    }
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
+    const double dist = haversineMeters(vehLl, destLl);
+    const double width =
+        dist > 40000.0 ? std::min(maxCorridorWidthM, 22000.0)
+                       : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    collectCorridorEdgeIdsIndexed(store, index, vehLl, destLl, width, edgeIds);
+    const GeoBBox vehBox = bboxAroundSegment(vehLl, vehLl, 8000.0);
+    index.collectEdgesInBBox(vehBox, edgeIds);
+  }
+
+  const GeoBBox destBox = bboxAroundSegment(destLl, destLl, 8000.0);
+  index.collectEdgesInBBox(destBox, edgeIds);
+
+  if (edgeIds.empty()) {
+    return fail("no edges in destination corridors");
   }
   if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
     return false;

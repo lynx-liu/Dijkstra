@@ -119,9 +119,7 @@ std::optional<VehicleArrivalResult> predictVehicleToDestination(
   }
 
   PredictParam routeParam = param;
-  if (routeParam.maxVisitedNodes > 0 && routeParam.maxVisitedNodes < 250000) {
-    routeParam.maxVisitedNodes = 250000;
-  }
+  routeParam.maxVisitedNodes = 0;  // destination A* must not truncate long hauls
 
   const RouteToGoal path = computeRouteToGoal(graph, prepared.position, goalPos, prepared.speedMs,
                                               vehicle.type, routeParam, maxHorizon);
@@ -174,7 +172,7 @@ DestinationArrivalSummary predictVehiclesToDestination(
   summary.vehicles.reserve(vehicles.size());
   const std::size_t maxWorkers =
       std::max<std::size_t>(1, static_cast<std::size_t>(std::thread::hardware_concurrency()));
-  const bool parallel = vehicles.size() > 2 && maxWorkers > 1;
+  const bool parallel = vehicles.size() > 1 && maxWorkers > 1;
   if (parallel) {
     std::vector<std::future<std::optional<VehicleArrivalResult>>> futures;
     futures.reserve(vehicles.size());
@@ -224,27 +222,10 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
   destProbe.speed = 60.0;
   destProbe.timestamp = dest.arriveByUnix;
 
-  GraphContext destCtx;
-  std::string destErr;
-  const std::vector<VehicleInfo> destOnly = {destProbe};
-  if (!extractGraphContextForDestinationIndexed(store, matchIndex, destOnly, 8000.0, destCtx,
-                                                &destErr)) {
-    std::cerr << "[mmlp] destination snap extract failed: " << destErr << "\n" << std::flush;
-    return summary;
-  }
-
-  const GraphPosition goalPos =
-      matchVehicleToGraph(destCtx.graph, destProbe, &matchIndex);
-  summary.locationId = graphLocationId(goalPos);
-  if (!goalPos.valid) {
-    return summary;
-  }
-
-  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<VehicleInfo> routable;
+  routable.reserve(vehicles.size());
   std::size_t pruned = 0;
-  std::size_t routed = 0;
-  summary.vehicles.reserve(vehicles.size());
-
+  double maxSpanM = 0.0;
   for (const auto& vehicle : vehicles) {
     const VehicleHistory* hist = findHistory(histories, vehicle.id);
     const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
@@ -252,11 +233,75 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
       ++pruned;
       continue;
     }
+    maxSpanM = std::max(
+        maxSpanM, haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon}));
+    routable.push_back(vehicle);
+  }
 
+  if (routable.empty()) {
+    std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
+              << " reachable=0\n"
+              << std::flush;
+    return summary;
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+
+  constexpr double kPerVehicleThresholdM = 600000.0;
+  constexpr double kBBoxExtractMaxSpanM = 50000.0;
+  if (maxSpanM <= kPerVehicleThresholdM) {
+    GraphContext regionCtx;
+    std::string extractErr;
+    bool extracted = false;
+    if (maxSpanM <= kBBoxExtractMaxSpanM) {
+      std::vector<VehicleInfo> forExtract = routable;
+      forExtract.push_back(destProbe);
+      const double padM =
+          std::min(maxCorridorWidthM, std::max(20000.0, maxSpanM * 0.15 + 12000.0));
+      extracted = extractGraphContextForDestinationIndexed(store, matchIndex, forExtract, padM,
+                                                         regionCtx, &extractErr);
+    } else {
+      extracted = extractGraphContextForDestinationCorridorsIndexed(
+          store, matchIndex, routable, dest.lat, dest.lon, maxCorridorWidthM, regionCtx,
+          &extractErr);
+    }
+    if (!extracted) {
+      std::cerr << "[mmlp] destination region extract failed: " << extractErr << "\n"
+                << std::flush;
+      return summary;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    summary = predictVehiclesToDestination(routable, histories, regionCtx, matchIndex, dest, param);
+    summary.sortBy = dest.sortBy;
+
+    const auto t2 = std::chrono::steady_clock::now();
+    std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
+              << " routable=" << routable.size() << " sub_edges=" << regionCtx.graph.edges().size()
+              << " extract_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " predict_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+              << " reachable=" << summary.vehicles.size() << "\n"
+              << std::flush;
+    return summary;
+  }
+
+  GraphContext destCtx;
+  std::string destErr;
+  if (!extractGraphContextForDestinationIndexed(store, matchIndex, {destProbe}, 8000.0, destCtx,
+                                              &destErr)) {
+    return summary;
+  }
+  summary.locationId =
+      graphLocationId(matchVehicleToGraph(destCtx.graph, destProbe, &matchIndex));
+
+  for (const auto& vehicle : routable) {
+    const VehicleHistory* hist = findHistory(histories, vehicle.id);
     const double dist =
         haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
     const double corridorW =
-        dist > 40000.0 ? maxCorridorWidthM
+        dist > 40000.0 ? std::min(maxCorridorWidthM, 22000.0)
                        : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
 
     GraphContext corridorCtx;
@@ -277,14 +322,12 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     if (auto row = predictVehicleToDestination(vehicle, hist, corridorCtx, matchIndex, dest,
                                                goalOnCorridor, param)) {
       summary.vehicles.push_back(std::move(*row));
-      ++routed;
     }
   }
 
   const auto t1 = std::chrono::steady_clock::now();
-  std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
-            << " routed=" << routed << " reachable=" << summary.vehicles.size()
-            << " total_ms="
+  std::cerr << "[mmlp] destination indexed (multi-region) vehicles=" << vehicles.size()
+            << " pruned=" << pruned << " reachable=" << summary.vehicles.size() << " total_ms="
             << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << "\n"
             << std::flush;
 

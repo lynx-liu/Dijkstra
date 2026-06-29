@@ -77,4 +77,10 @@ bool extractGraphContextForDestinationIndexed(const GraphFileStore& store,
                                               double paddingMeters, GraphContext& out,
                                               std::string* error = nullptr);
 
+// Union of vehicle→destination corridors (smaller than bbox when fleet is spread out).
+bool extractGraphContextForDestinationCorridorsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, GraphContext& out, std::string* error = nullptr);
+
 }  // namespace mmlp

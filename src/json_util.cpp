@@ -122,6 +122,63 @@ bool extractNumber(const std::string& json, const std::string& key, double& out)
   return true;
 }
 
+bool extractNumberOutsideArray(const std::string& json, const std::string& key,
+                               const std::string& arrayKey, double& out) {
+  const std::string apat = "\"" + arrayKey + "\"";
+  std::size_t arrBegin = std::string::npos;
+  std::size_t arrEnd = std::string::npos;
+  const auto ak = json.find(apat);
+  if (ak != std::string::npos) {
+    arrBegin = json.find('[', ak);
+    if (arrBegin != std::string::npos) {
+      int depth = 0;
+      for (std::size_t i = arrBegin; i < json.size(); ++i) {
+        if (json[i] == '[') {
+          ++depth;
+        } else if (json[i] == ']') {
+          --depth;
+          if (depth == 0) {
+            arrEnd = i;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const std::string pat = "\"" + key + "\"";
+  for (std::size_t search = 0; search < json.size();) {
+    const auto pos = json.find(pat, search);
+    if (pos == std::string::npos) {
+      return false;
+    }
+    if (arrBegin != std::string::npos && pos > arrBegin && pos < arrEnd) {
+      search = pos + pat.size();
+      continue;
+    }
+    const auto colon = json.find(':', pos + pat.size());
+    if (colon == std::string::npos) {
+      return false;
+    }
+    std::size_t i = colon + 1;
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i]))) {
+      ++i;
+    }
+    std::size_t j = i;
+    while (j < json.size() &&
+           (std::isdigit(static_cast<unsigned char>(json[j])) || json[j] == '.' || json[j] == '-' ||
+            json[j] == '+' || json[j] == 'e' || json[j] == 'E')) {
+      ++j;
+    }
+    if (j == i) {
+      return false;
+    }
+    out = std::stod(json.substr(i, j - i));
+    return true;
+  }
+  return false;
+}
+
 std::string formatUtcFromUnix(double unixSec) {
   const auto sec = static_cast<std::time_t>(std::floor(unixSec));
   std::tm tm{};
@@ -420,7 +477,7 @@ bool parseDestinationArrivalJson(const std::string& json, DestinationQuery& dest
                                  std::vector<VehicleInfo>* vehicles,
                                  std::vector<VehicleHistory>* histories, std::string* error) {
   double v = 0.0;
-  if (!extractNumber(json, "lat", v)) {
+  if (!extractNumberOutsideArray(json, "lat", "vehicles", v)) {
     if (error) {
       *error = "missing lat";
     }
@@ -428,7 +485,7 @@ bool parseDestinationArrivalJson(const std::string& json, DestinationQuery& dest
   }
   dest.lat = v;
 
-  if (!extractNumber(json, "lon", v)) {
+  if (!extractNumberOutsideArray(json, "lon", "vehicles", v)) {
     if (error) {
       *error = "missing lon";
     }

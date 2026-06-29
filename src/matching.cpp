@@ -27,9 +27,7 @@ GraphPosition matchVehicleToGraph(const MultimodalGraph& graph, const VehicleInf
     if (index->nearestEdge(graph, vehicle.lat, vehicle.lon, vehicle.type, snapped)) {
       return snapped;
     }
-    GraphPosition invalid;
-    invalid.valid = false;
-    return invalid;
+    // Regional subgraphs only contain a fraction of indexed edges; scan local graph next.
   }
 
   GraphPosition best;
