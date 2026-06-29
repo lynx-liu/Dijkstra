@@ -470,6 +470,13 @@ bool loadGraphContextIndexOnly(const std::string& binPath, GraphContext& ctx, st
 
 namespace {
 
+double destinationCorridorWidthM(double distM, double maxCorridorWidthM) {
+  if (distM > 40000.0) {
+    return std::min(maxCorridorWidthM, 22000.0);
+  }
+  return std::min(maxCorridorWidthM, distM * 0.35 + 12000.0);
+}
+
 void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
                                    const LatLon& a, const LatLon& b, double widthMeters,
                                    std::unordered_set<int64_t>& edgeIds) {
@@ -936,18 +943,36 @@ bool collectDestinationCorridorEdgeIdsIndexed(
   const LatLon destLl{destLat, destLon};
   edgeIds.reserve(80000);
 
+  struct VehicleCorridorJob {
+    LatLon veh;
+    double width = 0.0;
+  };
+  std::vector<VehicleCorridorJob> jobs;
+  jobs.reserve(vehicles.size());
   for (const auto& vehicle : vehicles) {
     if (vehicle.id == "__destination__") {
       continue;
     }
     const LatLon vehLl{vehicle.lat, vehicle.lon};
     const double dist = haversineMeters(vehLl, destLl);
-    const double width =
-        dist > 40000.0 ? std::min(maxCorridorWidthM, 22000.0)
-                       : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
-    collectCorridorEdgeIdsIndexed(store, index, vehLl, destLl, width, edgeIds);
-    const GeoBBox vehBox = bboxAroundSegment(vehLl, vehLl, 8000.0);
-    index.collectEdgesInBBox(vehBox, edgeIds);
+    jobs.push_back({vehLl, destinationCorridorWidthM(dist, maxCorridorWidthM)});
+  }
+
+  std::vector<std::unordered_set<int64_t>> partial(jobs.size());
+  std::vector<std::future<void>> futures;
+  futures.reserve(jobs.size());
+  for (std::size_t i = 0; i < jobs.size(); ++i) {
+    futures.push_back(std::async(std::launch::async, [&, i]() {
+      collectCorridorEdgeIdsIndexed(store, index, jobs[i].veh, destLl, jobs[i].width, partial[i]);
+      const GeoBBox vehBox = bboxAroundSegment(jobs[i].veh, jobs[i].veh, 8000.0);
+      index.collectEdgesInBBox(vehBox, partial[i]);
+    }));
+  }
+  for (auto& future : futures) {
+    future.get();
+  }
+  for (const auto& bucket : partial) {
+    edgeIds.insert(bucket.begin(), bucket.end());
   }
 
   const GeoBBox destBox = bboxAroundSegment(destLl, destLl, 8000.0);

@@ -302,27 +302,60 @@ bool GraphFileStore::materializeGraphFromEdges(std::vector<Edge>&& edges, Multim
 
   std::vector<Node> nodes;
   nodes.reserve(sortedNodeIds.size());
-  std::size_t j = 0;
-  for (int64_t nodeId : sortedNodeIds) {
-    while (j < nodeCount_ && nodeIndex_[j].id < nodeId) {
-      ++j;
+  const std::size_t nNodeWorkers =
+      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  const std::size_t nodeChunk = (sortedNodeIds.size() + nNodeWorkers - 1) / nNodeWorkers;
+  std::vector<std::vector<Node>> nodePartial(nNodeWorkers);
+  std::vector<std::future<void>> nodeFutures;
+  nodeFutures.reserve(nNodeWorkers);
+
+  for (std::size_t w = 0; w < nNodeWorkers; ++w) {
+    const std::size_t begin = w * nodeChunk;
+    const std::size_t end = std::min(sortedNodeIds.size(), begin + nodeChunk);
+    if (begin >= end) {
+      break;
     }
-    if (j >= nodeCount_ || nodeIndex_[j].id != nodeId) {
-      continue;
-    }
-    const IdOffset& row = nodeIndex_[j];
-    if (row.offset + kNodeRecord > bin_.size) {
-      continue;
-    }
-    const char* p = static_cast<const char*>(bin_.data) + row.offset;
-    Node node;
-    int32_t kind = 0;
-    std::memcpy(&node.id, p, 8);
-    std::memcpy(&node.lat, p + 8, 8);
-    std::memcpy(&node.lon, p + 16, 8);
-    std::memcpy(&kind, p + 24, 4);
-    node.kind = static_cast<NodeKind>(kind);
-    nodes.push_back(node);
+    nodeFutures.push_back(std::async(std::launch::async, [&, begin, end, w]() {
+      auto& out = nodePartial[w];
+      out.reserve(end - begin);
+      std::size_t j = 0;
+      if (begin < sortedNodeIds.size()) {
+        const int64_t firstId = sortedNodeIds[begin];
+        const IdOffset* it = std::lower_bound(
+            nodeIndex_, nodeIndex_ + nodeCount_, firstId,
+            [](const IdOffset& row, int64_t id) { return row.id < id; });
+        j = static_cast<std::size_t>(it - nodeIndex_);
+      }
+      for (std::size_t i = begin; i < end; ++i) {
+        const int64_t nodeId = sortedNodeIds[i];
+        while (j < nodeCount_ && nodeIndex_[j].id < nodeId) {
+          ++j;
+        }
+        if (j >= nodeCount_ || nodeIndex_[j].id != nodeId) {
+          continue;
+        }
+        const IdOffset& row = nodeIndex_[j];
+        if (row.offset + kNodeRecord > bin_.size) {
+          continue;
+        }
+        const char* p = static_cast<const char*>(bin_.data) + row.offset;
+        Node node;
+        int32_t kind = 0;
+        std::memcpy(&node.id, p, 8);
+        std::memcpy(&node.lat, p + 8, 8);
+        std::memcpy(&node.lon, p + 16, 8);
+        std::memcpy(&kind, p + 24, 4);
+        node.kind = static_cast<NodeKind>(kind);
+        out.push_back(node);
+      }
+    }));
+  }
+  for (auto& future : nodeFutures) {
+    future.get();
+  }
+  for (auto& bucket : nodePartial) {
+    nodes.insert(nodes.end(), std::make_move_iterator(bucket.begin()),
+                 std::make_move_iterator(bucket.end()));
   }
 
   graph.buildFromSubset(std::move(nodes), std::move(edges));
@@ -347,9 +380,6 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     return fail("empty edge set");
   }
 
-  struct EdgeAt {
-    Edge edge;
-  };
   std::vector<const IdOffset*> edgeRows;
   edgeRows.reserve(edgeIds.size());
   for (int64_t edgeId : edgeIds) {
@@ -362,29 +392,42 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
   std::sort(edgeRows.begin(), edgeRows.end(),
             [](const IdOffset* a, const IdOffset* b) { return a->offset < b->offset; });
 
-  std::vector<EdgeAt> edges;
-  edges.reserve(edgeRows.size());
-  for (const IdOffset* row : edgeRows) {
-    const char* p = static_cast<const char*>(bin_.data) + row->offset;
-    EdgeAt item;
-    int32_t type = 0;
-    std::memcpy(&item.edge.id, p, 8);
-    std::memcpy(&item.edge.from, p + 8, 8);
-    std::memcpy(&item.edge.to, p + 16, 8);
-    std::memcpy(&type, p + 24, 4);
-    std::memcpy(&item.edge.length, p + 28, 8);
-    std::memcpy(&item.edge.speedLimit, p + 36, 8);
-    item.edge.type = static_cast<EdgeType>(type);
-    edges.push_back(item);
+  std::vector<Edge> edgeList;
+  edgeList.resize(edgeRows.size());
+  const std::size_t nWorkers =
+      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  const std::size_t chunk = (edgeRows.size() + nWorkers - 1) / nWorkers;
+  std::vector<std::future<void>> futures;
+  futures.reserve(nWorkers);
+  const char* binBase = static_cast<const char*>(bin_.data);
+
+  for (std::size_t w = 0; w < nWorkers; ++w) {
+    const std::size_t begin = w * chunk;
+    const std::size_t end = std::min(edgeRows.size(), begin + chunk);
+    if (begin >= end) {
+      break;
+    }
+    futures.push_back(std::async(std::launch::async, [&, begin, end]() {
+      for (std::size_t i = begin; i < end; ++i) {
+        const char* p = binBase + edgeRows[i]->offset;
+        Edge& edge = edgeList[i];
+        int32_t type = 0;
+        std::memcpy(&edge.id, p, 8);
+        std::memcpy(&edge.from, p + 8, 8);
+        std::memcpy(&edge.to, p + 16, 8);
+        std::memcpy(&type, p + 24, 4);
+        std::memcpy(&edge.length, p + 28, 8);
+        std::memcpy(&edge.speedLimit, p + 36, 8);
+        edge.type = static_cast<EdgeType>(type);
+      }
+    }));
   }
-  if (edges.empty()) {
-    return fail("no edges resolved");
+  for (auto& future : futures) {
+    future.get();
   }
 
-  std::vector<Edge> edgeList;
-  edgeList.reserve(edges.size());
-  for (const auto& item : edges) {
-    edgeList.push_back(item.edge);
+  if (edgeRows.empty()) {
+    return fail("no edges resolved");
   }
 
   return materializeGraphFromEdges(std::move(edgeList), graph, error);
