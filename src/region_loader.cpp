@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -472,20 +474,55 @@ void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialInd
                                    const LatLon& a, const LatLon& b, double widthMeters,
                                    std::unordered_set<int64_t>& edgeIds) {
   const GeoBBox box = bboxAroundSegment(a, b, widthMeters);
-  std::unordered_set<int64_t> candidates;
+  std::vector<int64_t> candidates;
   candidates.reserve(80000);
-  index.collectEdgesInBBox(box, candidates);
+  {
+    std::unordered_set<int64_t> bucket;
+    bucket.reserve(80000);
+    index.collectEdgesInBBox(box, bucket);
+    candidates.assign(bucket.begin(), bucket.end());
+  }
+  if (candidates.empty()) {
+    return;
+  }
 
-  for (int64_t edgeId : candidates) {
-    double flat = 0.0;
-    double flon = 0.0;
-    double tlat = 0.0;
-    double tlon = 0.0;
-    if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
-      continue;
+  const std::size_t nWorkers =
+      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  const std::size_t chunk = (candidates.size() + nWorkers - 1) / nWorkers;
+  std::vector<std::vector<int64_t>> partial(nWorkers);
+  std::vector<std::future<void>> futures;
+  futures.reserve(nWorkers);
+
+  for (std::size_t w = 0; w < nWorkers; ++w) {
+    const std::size_t begin = w * chunk;
+    const std::size_t end = std::min(candidates.size(), begin + chunk);
+    if (begin >= end) {
+      break;
     }
-    const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
-    if (pointToSegmentDistanceLatLon(mid, a, b) <= widthMeters) {
+    futures.push_back(std::async(std::launch::async, [&, w, begin, end]() {
+      auto& kept = partial[w];
+      kept.reserve((end - begin) / 3 + 1);
+      for (std::size_t i = begin; i < end; ++i) {
+        const int64_t edgeId = candidates[i];
+        double flat = 0.0;
+        double flon = 0.0;
+        double tlat = 0.0;
+        double tlon = 0.0;
+        if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+          continue;
+        }
+        const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+        if (pointToSegmentDistanceLatLon(mid, a, b) <= widthMeters) {
+          kept.push_back(edgeId);
+        }
+      }
+    }));
+  }
+  for (auto& future : futures) {
+    future.get();
+  }
+  for (const auto& kept : partial) {
+    for (int64_t edgeId : kept) {
       edgeIds.insert(edgeId);
     }
   }
@@ -602,6 +639,183 @@ bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const Spa
   return true;
 }
 
+void buildDestinationCorridorSegments(const std::vector<VehicleInfo>& vehicles, double destLat,
+                                      double destLon, double maxCorridorWidthM,
+                                      std::vector<CorridorSegment>& corridors,
+                                      std::vector<LatLon>& anchorPoints) {
+  corridors.clear();
+  anchorPoints.clear();
+  anchorPoints.push_back({destLat, destLon});
+
+  const LatLon destLl{destLat, destLon};
+  corridors.reserve(vehicles.size());
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.id == "__destination__") {
+      continue;
+    }
+    anchorPoints.push_back({vehicle.lat, vehicle.lon});
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
+    const double dist = haversineMeters(vehLl, destLl);
+    const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    corridors.push_back({vehicle.lat, vehicle.lon, destLat, destLon, width});
+  }
+}
+
+bool loadDestinationGraphCorridorsIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                          const std::vector<VehicleInfo>& vehicles,
+                                          double destLat, double destLon, double maxCorridorWidthM,
+                                          MultimodalGraph& graph, std::string* error) {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (vehicles.empty()) {
+    return fail("no vehicles for corridor graph");
+  }
+
+  const LatLon destLl{destLat, destLon};
+  std::unordered_set<int64_t> seen;
+  std::vector<Edge> edges;
+  edges.reserve(120000);
+
+  const auto appendCorridor = [&](const LatLon& a, const LatLon& b, double widthMeters) {
+    const GeoBBox box = bboxAroundSegment(a, b, widthMeters);
+    std::vector<int64_t> candidates;
+    candidates.reserve(80000);
+    {
+      std::unordered_set<int64_t> bucket;
+      bucket.reserve(80000);
+      index.collectEdgesInBBox(box, bucket);
+      candidates.assign(bucket.begin(), bucket.end());
+    }
+    if (candidates.empty()) {
+      return;
+    }
+
+    const std::size_t nWorkers =
+        std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+    const std::size_t chunk = (candidates.size() + nWorkers - 1) / nWorkers;
+    std::vector<std::vector<Edge>> partial(nWorkers);
+    std::vector<std::future<void>> futures;
+    futures.reserve(nWorkers);
+
+    for (std::size_t w = 0; w < nWorkers; ++w) {
+      const std::size_t begin = w * chunk;
+      const std::size_t end = std::min(candidates.size(), begin + chunk);
+      if (begin >= end) {
+        break;
+      }
+      futures.push_back(std::async(std::launch::async, [&, w, begin, end]() {
+        auto& kept = partial[w];
+        kept.reserve((end - begin) / 3 + 1);
+        for (std::size_t i = begin; i < end; ++i) {
+          const int64_t edgeId = candidates[i];
+          double flat = 0.0;
+          double flon = 0.0;
+          double tlat = 0.0;
+          double tlon = 0.0;
+          if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+            continue;
+          }
+          const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+          if (pointToSegmentDistanceLatLon(mid, a, b) > widthMeters) {
+            continue;
+          }
+          Edge edge;
+          if (!store.readEdgeRecord(edgeId, edge)) {
+            continue;
+          }
+          kept.push_back(edge);
+        }
+      }));
+    }
+    for (auto& future : futures) {
+      future.get();
+    }
+    for (auto& kept : partial) {
+      for (Edge& edge : kept) {
+        if (seen.insert(edge.id).second) {
+          edges.push_back(std::move(edge));
+        }
+      }
+    }
+  };
+
+  const auto appendLocalBox = [&](const LatLon& center) {
+    std::unordered_set<int64_t> bucket;
+    bucket.reserve(20000);
+    index.collectEdgesInBBox(bboxAroundSegment(center, center, 8000.0), bucket);
+    for (int64_t edgeId : bucket) {
+      if (!seen.insert(edgeId).second) {
+        continue;
+      }
+      Edge edge;
+      if (store.readEdgeRecord(edgeId, edge)) {
+        edges.push_back(std::move(edge));
+      }
+    }
+  };
+
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.id == "__destination__") {
+      continue;
+    }
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
+    const double dist = haversineMeters(vehLl, destLl);
+    const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    appendCorridor(vehLl, destLl, width);
+    appendLocalBox(vehLl);
+  }
+  appendLocalBox(destLl);
+
+  if (edges.empty()) {
+    return fail("no edges in destination corridors");
+  }
+  return store.materializeGraphFromEdges(std::move(edges), graph, error);
+}
+
+bool collectDestinationCorridorBboxEdgeIdsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, std::unordered_set<int64_t>& edgeIds, std::string* error) {
+  (void)store;
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (vehicles.empty()) {
+    return fail("no vehicles for corridor extract");
+  }
+
+  const LatLon destLl{destLat, destLon};
+  edgeIds.reserve(80000);
+
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.id == "__destination__") {
+      continue;
+    }
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
+    const double dist = haversineMeters(vehLl, destLl);
+    const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    const GeoBBox box = bboxAroundSegment(vehLl, destLl, width);
+    index.collectEdgesInBBox(box, edgeIds);
+    const GeoBBox vehBox = bboxAroundSegment(vehLl, vehLl, 8000.0);
+    index.collectEdgesInBBox(vehBox, edgeIds);
+  }
+
+  const GeoBBox destBox = bboxAroundSegment(destLl, destLl, 8000.0);
+  index.collectEdgesInBBox(destBox, edgeIds);
+
+  if (edgeIds.empty()) {
+    return fail("no edges in destination corridors");
+  }
+  return true;
+}
+
 void pruneDestinationEdgeIdsToCorridors(const GraphFileStore& store,
                                         const std::vector<VehicleInfo>& vehicles, double destLat,
                                         double destLon, double maxCorridorWidthM,
@@ -633,48 +847,74 @@ void pruneDestinationEdgeIdsToCorridors(const GraphFileStore& store,
   }
 
   constexpr double kLocalKeepM = 8000.0;
-  for (auto it = edgeIds.begin(); it != edgeIds.end();) {
-    double flat = 0.0;
-    double flon = 0.0;
-    double tlat = 0.0;
-    double tlon = 0.0;
-    if (!store.edgeEndpointLatLon(*it, flat, flon, tlat, tlon)) {
-      it = edgeIds.erase(it);
-      continue;
-    }
-    const LatLon from{flat, flon};
-    const LatLon to{tlat, tlon};
-    const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+  std::vector<int64_t> edgeList(edgeIds.begin(), edgeIds.end());
+  edgeIds.clear();
 
-    bool keep = false;
-    for (const Corridor& corridor : corridors) {
-      if (pointToSegmentDistanceLatLon(from, corridor.a, corridor.b) <= corridor.widthM ||
-          pointToSegmentDistanceLatLon(to, corridor.a, corridor.b) <= corridor.widthM ||
-          pointToSegmentDistanceLatLon(mid, corridor.a, corridor.b) <= corridor.widthM) {
-        keep = true;
-        break;
-      }
+  const std::size_t nWorkers =
+      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  const std::size_t chunk = (edgeList.size() + nWorkers - 1) / nWorkers;
+  std::vector<std::vector<int64_t>> partial(nWorkers);
+  std::vector<std::future<void>> futures;
+  futures.reserve(nWorkers);
+
+  for (std::size_t w = 0; w < nWorkers; ++w) {
+    const std::size_t begin = w * chunk;
+    const std::size_t end = std::min(edgeList.size(), begin + chunk);
+    if (begin >= end) {
+      break;
     }
-    if (!keep) {
-      if (haversineMeters(mid, destLl) <= kLocalKeepM) {
-        keep = true;
-      } else {
-        for (const auto& vehicle : vehicles) {
-          if (vehicle.id == "__destination__") {
-            continue;
-          }
-          if (haversineMeters(mid, {vehicle.lat, vehicle.lon}) <= kLocalKeepM) {
+    futures.push_back(std::async(std::launch::async, [&, w, begin, end]() {
+      auto& kept = partial[w];
+      kept.reserve((end - begin) / 4 + 1);
+      for (std::size_t i = begin; i < end; ++i) {
+        const int64_t edgeId = edgeList[i];
+        double flat = 0.0;
+        double flon = 0.0;
+        double tlat = 0.0;
+        double tlon = 0.0;
+        if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+          continue;
+        }
+        const LatLon from{flat, flon};
+        const LatLon to{tlat, tlon};
+        const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+
+        bool keep = false;
+        for (const Corridor& corridor : corridors) {
+          if (pointToSegmentDistanceLatLon(from, corridor.a, corridor.b) <= corridor.widthM ||
+              pointToSegmentDistanceLatLon(to, corridor.a, corridor.b) <= corridor.widthM ||
+              pointToSegmentDistanceLatLon(mid, corridor.a, corridor.b) <= corridor.widthM) {
             keep = true;
             break;
           }
         }
+        if (!keep) {
+          if (haversineMeters(mid, destLl) <= kLocalKeepM) {
+            keep = true;
+          } else {
+            for (const auto& vehicle : vehicles) {
+              if (vehicle.id == "__destination__") {
+                continue;
+              }
+              if (haversineMeters(mid, {vehicle.lat, vehicle.lon}) <= kLocalKeepM) {
+                keep = true;
+                break;
+              }
+            }
+          }
+        }
+        if (keep) {
+          kept.push_back(edgeId);
+        }
       }
-    }
-
-    if (keep) {
-      ++it;
-    } else {
-      it = edgeIds.erase(it);
+    }));
+  }
+  for (auto& future : futures) {
+    future.get();
+  }
+  for (const auto& kept : partial) {
+    for (int64_t edgeId : kept) {
+      edgeIds.insert(edgeId);
     }
   }
 }

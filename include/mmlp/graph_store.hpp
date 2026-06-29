@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mmlp/graph.hpp"
+#include "mmlp/geo.hpp"
 
 #include "mmlp/csr_graph.hpp"
 
@@ -10,6 +11,14 @@
 #include <vector>
 
 namespace mmlp {
+
+struct CorridorSegment {
+  double aLat = 0.0;
+  double aLon = 0.0;
+  double bLat = 0.0;
+  double bLon = 0.0;
+  double widthM = 0.0;
+};
 
 // mmap-backed nationwide graph accessor (index mode). Loaded once at startup.
 class GraphFileStore {
@@ -39,6 +48,17 @@ class GraphFileStore {
 
   bool loadGraphSubset(const std::unordered_set<int64_t>& edgeIds, MultimodalGraph& graph,
                        std::string* error = nullptr) const;
+
+  // One mmap pass: keep edges near vehicle→destination corridors (parallel filter+load).
+  bool loadGraphSubsetNearCorridors(const std::unordered_set<int64_t>& candidates,
+                                    const std::vector<CorridorSegment>& corridors,
+                                    const std::vector<LatLon>& anchorPoints,
+                                    double anchorRadiusM, MultimodalGraph& graph,
+                                    std::string* error = nullptr) const;
+
+  bool readEdgeRecord(int64_t edgeId, Edge& edge) const;
+  bool materializeGraphFromEdges(std::vector<Edge>&& edges, MultimodalGraph& graph,
+                                 std::string* error = nullptr) const;
 
  private:
   struct IdOffset {

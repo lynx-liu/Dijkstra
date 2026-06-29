@@ -345,35 +345,41 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
 
   const auto t0 = std::chrono::steady_clock::now();
   std::int64_t collectMs = 0;
-  std::int64_t pruneMs = 0;
 
   constexpr double kPerVehicleThresholdM = 600000.0;
-  constexpr double kBBoxExtractMaxSpanM = 50000.0;
-  // Pearl River Delta etc.: bbox pulls ~1M edges; use corridors instead.
-  const bool denseSouthChina =
-      dest.lat >= 18.0 && dest.lat <= 35.0 && dest.lon >= 105.0 && dest.lon <= 122.0;
-  const bool useBboxExtract =
-      maxSpanM <= kBBoxExtractMaxSpanM ||
-      (routable.size() >= 4 && maxSpanM <= kPerVehicleThresholdM && !denseSouthChina);
+  constexpr double kCompactSpanM = 60000.0;
+  constexpr std::size_t kCompactMaxVehicles = 4;
 
   if (maxSpanM <= kPerVehicleThresholdM) {
     const auto tc0 = std::chrono::steady_clock::now();
     std::unordered_set<int64_t> allowedEdges;
     std::string collectErr;
     bool collected = false;
-    if (useBboxExtract) {
+
+    const bool compactCluster =
+        maxSpanM <= kCompactSpanM && routable.size() <= kCompactMaxVehicles;
+    const bool dispersedFleet = routable.size() >= 4 && maxSpanM > kCompactSpanM;
+
+    GraphContext regionCtx;
+    std::string extractErr;
+
+    if (compactCluster) {
+      std::vector<VehicleInfo> forExtract = routable;
+      forExtract.push_back(destProbe);
+      const double padM =
+          std::min(maxCorridorWidthM, std::max(15000.0, maxSpanM * 0.12 + 10000.0));
+      collected = collectDestinationBBoxEdgeIdsIndexed(store, matchIndex, forExtract, padM,
+                                                       allowedEdges, &collectErr);
+    } else if (dispersedFleet) {
       std::vector<VehicleInfo> forExtract = routable;
       forExtract.push_back(destProbe);
       const double padM =
           std::min(maxCorridorWidthM, std::max(20000.0, maxSpanM * 0.15 + 12000.0));
       collected = collectDestinationBBoxEdgeIdsIndexed(store, matchIndex, forExtract, padM,
-                                                     allowedEdges, &collectErr);
-      if (collected && maxSpanM > kBBoxExtractMaxSpanM) {
-        const auto tp0 = std::chrono::steady_clock::now();
+                                                       allowedEdges, &collectErr);
+      if (collected) {
         pruneDestinationEdgeIdsToCorridors(store, routable, dest.lat, dest.lon, maxCorridorWidthM,
                                            allowedEdges);
-        const auto tp1 = std::chrono::steady_clock::now();
-        pruneMs = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
       }
     } else {
       collected = collectDestinationCorridorEdgeIdsIndexed(
@@ -484,8 +490,6 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
       return summary;
     }
 
-    GraphContext regionCtx;
-    std::string extractErr;
     if (!store.loadGraphSubset(allowedEdges, regionCtx.graph, &extractErr)) {
       std::cerr << "[mmlp] destination subset load failed: " << extractErr << "\n" << std::flush;
       return summary;
@@ -499,8 +503,9 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     const auto t2 = std::chrono::steady_clock::now();
     std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
               << " routable=" << routable.size() << " sub_edges=" << regionCtx.graph.edges().size()
-              << " egeo=" << (store.hasEdgeGeo() ? 1 : 0) << " csr=0 bbox="
-              << (useBboxExtract ? 1 : 0) << " collect_ms=" << collectMs << " prune_ms=" << pruneMs
+              << " candidates=" << allowedEdges.size() << " egeo=" << (store.hasEdgeGeo() ? 1 : 0)
+              << " csr=0 compact=" << (compactCluster ? 1 : 0)
+              << " dispersed=" << (dispersedFleet ? 1 : 0) << " collect_ms=" << collectMs
               << " extract_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
               << " predict_ms="

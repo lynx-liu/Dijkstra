@@ -1,10 +1,14 @@
 #include "mmlp/graph_store.hpp"
 
+#include "mmlp/geo.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace mmlp {
@@ -257,6 +261,77 @@ bool GraphFileStore::edgeEndpointLatLon(int64_t edgeId, double& flat, double& fl
   return nodeLatLon(from, flat, flon) && nodeLatLon(to, tlat, tlon);
 }
 
+bool GraphFileStore::readEdgeRecord(int64_t edgeId, Edge& edge) const {
+  const IdOffset* row = findOffset(edgeIndex_, edgeCount_, edgeId);
+  if (row == nullptr || row->offset + kEdgeRecord > bin_.size) {
+    return false;
+  }
+  const char* p = static_cast<const char*>(bin_.data) + row->offset;
+  int32_t type = 0;
+  std::memcpy(&edge.id, p, 8);
+  std::memcpy(&edge.from, p + 8, 8);
+  std::memcpy(&edge.to, p + 16, 8);
+  std::memcpy(&type, p + 24, 4);
+  std::memcpy(&edge.length, p + 28, 8);
+  std::memcpy(&edge.speedLimit, p + 36, 8);
+  edge.type = static_cast<EdgeType>(type);
+  return true;
+}
+
+bool GraphFileStore::materializeGraphFromEdges(std::vector<Edge>&& edges, MultimodalGraph& graph,
+                                               std::string* error) const {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (edges.empty()) {
+    return fail("no edges to materialize");
+  }
+
+  std::unordered_set<int64_t> nodeIds;
+  nodeIds.reserve(edges.size() * 2);
+  for (const Edge& edge : edges) {
+    nodeIds.insert(edge.from);
+    nodeIds.insert(edge.to);
+  }
+
+  std::vector<int64_t> sortedNodeIds(nodeIds.begin(), nodeIds.end());
+  std::sort(sortedNodeIds.begin(), sortedNodeIds.end());
+
+  std::vector<Node> nodes;
+  nodes.reserve(sortedNodeIds.size());
+  std::size_t j = 0;
+  for (int64_t nodeId : sortedNodeIds) {
+    while (j < nodeCount_ && nodeIndex_[j].id < nodeId) {
+      ++j;
+    }
+    if (j >= nodeCount_ || nodeIndex_[j].id != nodeId) {
+      continue;
+    }
+    const IdOffset& row = nodeIndex_[j];
+    if (row.offset + kNodeRecord > bin_.size) {
+      continue;
+    }
+    const char* p = static_cast<const char*>(bin_.data) + row.offset;
+    Node node;
+    int32_t kind = 0;
+    std::memcpy(&node.id, p, 8);
+    std::memcpy(&node.lat, p + 8, 8);
+    std::memcpy(&node.lon, p + 16, 8);
+    std::memcpy(&kind, p + 24, 4);
+    node.kind = static_cast<NodeKind>(kind);
+    nodes.push_back(node);
+  }
+
+  graph.buildFromSubset(std::move(nodes), std::move(edges));
+  if (graph.nodes().empty()) {
+    return fail("materialized empty graph");
+  }
+  return true;
+}
+
 bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
                                     MultimodalGraph& graph, std::string* error) const {
   auto fail = [&](const std::string& msg) {
@@ -306,16 +381,161 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     return fail("no edges resolved");
   }
 
-  std::unordered_set<int64_t> nodeIds;
-  nodeIds.reserve(edges.size() * 2);
+  std::vector<Edge> edgeList;
+  edgeList.reserve(edges.size());
   for (const auto& item : edges) {
-    nodeIds.insert(item.edge.from);
-    nodeIds.insert(item.edge.to);
+    edgeList.push_back(item.edge);
   }
 
+  return materializeGraphFromEdges(std::move(edgeList), graph, error);
+}
+
+namespace {
+
+bool edgeNearDestinationCorridors(const GraphFileStore& store, int64_t edgeId,
+                                  const std::vector<CorridorSegment>& corridors,
+                                  const std::vector<LatLon>& anchorPoints, double anchorRadiusM) {
+  double flat = 0.0;
+  double flon = 0.0;
+  double tlat = 0.0;
+  double tlon = 0.0;
+  if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+    return false;
+  }
+  const LatLon from{flat, flon};
+  const LatLon to{tlat, tlon};
+  const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+
+  for (const CorridorSegment& corridor : corridors) {
+    const LatLon a{corridor.aLat, corridor.aLon};
+    const LatLon b{corridor.bLat, corridor.bLon};
+    if (pointToSegmentDistanceLatLon(from, a, b) <= corridor.widthM ||
+        pointToSegmentDistanceLatLon(to, a, b) <= corridor.widthM ||
+        pointToSegmentDistanceLatLon(mid, a, b) <= corridor.widthM) {
+      return true;
+    }
+  }
+  for (const LatLon& anchor : anchorPoints) {
+    if (haversineMeters(mid, anchor) <= anchorRadiusM ||
+        haversineMeters(from, anchor) <= anchorRadiusM ||
+        haversineMeters(to, anchor) <= anchorRadiusM) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool readEdgeAtOffset(const void* data, std::size_t binSize, uint64_t offset, Edge& edge) {
+  constexpr std::size_t kEdgeRecord = 44;
+  if (offset + kEdgeRecord > binSize) {
+    return false;
+  }
+  const char* p = static_cast<const char*>(data) + offset;
+  int32_t type = 0;
+  std::memcpy(&edge.id, p, 8);
+  std::memcpy(&edge.from, p + 8, 8);
+  std::memcpy(&edge.to, p + 16, 8);
+  std::memcpy(&type, p + 24, 4);
+  std::memcpy(&edge.length, p + 28, 8);
+  std::memcpy(&edge.speedLimit, p + 36, 8);
+  edge.type = static_cast<EdgeType>(type);
+  return true;
+}
+
+}  // namespace
+
+bool GraphFileStore::loadGraphSubsetNearCorridors(
+    const std::unordered_set<int64_t>& candidates, const std::vector<CorridorSegment>& corridors,
+    const std::vector<LatLon>& anchorPoints, double anchorRadiusM, MultimodalGraph& graph,
+    std::string* error) const {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  if (!isOpen()) {
+    return fail("graph store not open");
+  }
+  if (candidates.empty()) {
+    return fail("empty candidate edge set");
+  }
+  if (corridors.empty()) {
+    return loadGraphSubset(candidates, graph, error);
+  }
+
+  std::vector<int64_t> edgeIds;
+  edgeIds.reserve(candidates.size());
+  for (int64_t edgeId : candidates) {
+    edgeIds.push_back(edgeId);
+  }
+
+  const std::size_t nWorkers =
+      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  const std::size_t chunk = (edgeIds.size() + nWorkers - 1) / nWorkers;
+
+  std::vector<std::vector<Edge>> partialEdges(nWorkers);
+  std::vector<std::future<void>> futures;
+  futures.reserve(nWorkers);
+
+  for (std::size_t w = 0; w < nWorkers; ++w) {
+    const std::size_t begin = w * chunk;
+    const std::size_t end = std::min(edgeIds.size(), begin + chunk);
+    if (begin >= end) {
+      break;
+    }
+    futures.push_back(std::async(std::launch::async, [&, w, begin, end]() {
+      auto& out = partialEdges[w];
+      out.reserve((end - begin) / 4 + 1);
+      for (std::size_t i = begin; i < end; ++i) {
+        const int64_t edgeId = edgeIds[i];
+        if (!edgeNearDestinationCorridors(*this, edgeId, corridors, anchorPoints, anchorRadiusM)) {
+          continue;
+        }
+        const IdOffset* row = findOffset(edgeIndex_, edgeCount_, edgeId);
+        if (row == nullptr) {
+          continue;
+        }
+        Edge edge;
+        if (!readEdgeAtOffset(bin_.data, bin_.size, row->offset, edge)) {
+          continue;
+        }
+        out.push_back(edge);
+      }
+    }));
+  }
+  for (auto& future : futures) {
+    future.get();
+  }
+
+  std::vector<Edge> edges;
+  std::size_t total = 0;
+  for (const auto& part : partialEdges) {
+    total += part.size();
+  }
+  edges.reserve(total);
+  for (auto& part : partialEdges) {
+    for (Edge& edge : part) {
+      edges.push_back(std::move(edge));
+    }
+  }
+  if (edges.empty()) {
+    return fail("no edges after corridor filter");
+  }
+
+  std::unordered_set<int64_t> nodeIds;
+  nodeIds.reserve(edges.size() * 2);
+  for (const Edge& edge : edges) {
+    nodeIds.insert(edge.from);
+    nodeIds.insert(edge.to);
+  }
+
+  std::vector<int64_t> sortedNodeIds(nodeIds.begin(), nodeIds.end());
+  std::sort(sortedNodeIds.begin(), sortedNodeIds.end());
+
   std::vector<Node> nodes;
-  nodes.reserve(nodeIds.size());
-  for (int64_t nodeId : nodeIds) {
+  nodes.reserve(sortedNodeIds.size());
+  for (int64_t nodeId : sortedNodeIds) {
     const IdOffset* row = findOffset(nodeIndex_, nodeCount_, nodeId);
     if (row == nullptr || row->offset + kNodeRecord > bin_.size) {
       continue;
@@ -331,13 +551,7 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
     nodes.push_back(node);
   }
 
-  std::vector<Edge> edgeList;
-  edgeList.reserve(edges.size());
-  for (const auto& item : edges) {
-    edgeList.push_back(item.edge);
-  }
-
-  graph.buildFromSubset(std::move(nodes), std::move(edgeList));
+  graph.buildFromSubset(std::move(nodes), std::move(edges));
   if (graph.nodes().empty()) {
     return fail("subset empty");
   }

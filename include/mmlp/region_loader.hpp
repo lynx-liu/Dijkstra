@@ -95,6 +95,22 @@ bool collectDestinationCorridorEdgeIdsIndexed(
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
     double maxCorridorWidthM, std::unordered_set<int64_t>& edgeIds, std::string* error = nullptr);
 
+// Fast union of per-vehicle corridor bboxes (no per-edge geometry filter).
+bool collectDestinationCorridorBboxEdgeIdsIndexed(
+    const GraphFileStore& store, const SpatialIndex& index,
+    const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
+    double maxCorridorWidthM, std::unordered_set<int64_t>& edgeIds, std::string* error = nullptr);
+
+void buildDestinationCorridorSegments(const std::vector<VehicleInfo>& vehicles, double destLat,
+                                      double destLon, double maxCorridorWidthM,
+                                      std::vector<CorridorSegment>& corridors,
+                                      std::vector<LatLon>& anchorPoints);
+
+bool loadDestinationGraphCorridorsIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                          const std::vector<VehicleInfo>& vehicles,
+                                          double destLat, double destLon, double maxCorridorWidthM,
+                                          MultimodalGraph& graph, std::string* error = nullptr);
+
 // Shrink a bbox edge set to corridors vehicle→destination (drops empty interior).
 void pruneDestinationEdgeIdsToCorridors(const GraphFileStore& store,
                                         const std::vector<VehicleInfo>& vehicles, double destLat,
