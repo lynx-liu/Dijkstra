@@ -602,6 +602,83 @@ bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const Spa
   return true;
 }
 
+void pruneDestinationEdgeIdsToCorridors(const GraphFileStore& store,
+                                        const std::vector<VehicleInfo>& vehicles, double destLat,
+                                        double destLon, double maxCorridorWidthM,
+                                        std::unordered_set<int64_t>& edgeIds) {
+  if (edgeIds.empty() || vehicles.empty()) {
+    return;
+  }
+
+  const LatLon destLl{destLat, destLon};
+  struct Corridor {
+    LatLon a;
+    LatLon b;
+    double widthM = 0.0;
+  };
+  std::vector<Corridor> corridors;
+  corridors.reserve(vehicles.size());
+
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.id == "__destination__") {
+      continue;
+    }
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
+    const double dist = haversineMeters(vehLl, destLl);
+    const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    corridors.push_back({vehLl, destLl, width});
+  }
+  if (corridors.empty()) {
+    return;
+  }
+
+  constexpr double kLocalKeepM = 8000.0;
+  for (auto it = edgeIds.begin(); it != edgeIds.end();) {
+    double flat = 0.0;
+    double flon = 0.0;
+    double tlat = 0.0;
+    double tlon = 0.0;
+    if (!store.edgeEndpointLatLon(*it, flat, flon, tlat, tlon)) {
+      it = edgeIds.erase(it);
+      continue;
+    }
+    const LatLon from{flat, flon};
+    const LatLon to{tlat, tlon};
+    const LatLon mid{0.5 * (flat + tlat), 0.5 * (flon + tlon)};
+
+    bool keep = false;
+    for (const Corridor& corridor : corridors) {
+      if (pointToSegmentDistanceLatLon(from, corridor.a, corridor.b) <= corridor.widthM ||
+          pointToSegmentDistanceLatLon(to, corridor.a, corridor.b) <= corridor.widthM ||
+          pointToSegmentDistanceLatLon(mid, corridor.a, corridor.b) <= corridor.widthM) {
+        keep = true;
+        break;
+      }
+    }
+    if (!keep) {
+      if (haversineMeters(mid, destLl) <= kLocalKeepM) {
+        keep = true;
+      } else {
+        for (const auto& vehicle : vehicles) {
+          if (vehicle.id == "__destination__") {
+            continue;
+          }
+          if (haversineMeters(mid, {vehicle.lat, vehicle.lon}) <= kLocalKeepM) {
+            keep = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (keep) {
+      ++it;
+    } else {
+      it = edgeIds.erase(it);
+    }
+  }
+}
+
 bool collectDestinationCorridorEdgeIdsIndexed(
     const GraphFileStore& store, const SpatialIndex& index,
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,

@@ -275,14 +275,21 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
   struct EdgeAt {
     Edge edge;
   };
-  std::vector<EdgeAt> edges;
-  edges.reserve(edgeIds.size());
-
+  std::vector<const IdOffset*> edgeRows;
+  edgeRows.reserve(edgeIds.size());
   for (int64_t edgeId : edgeIds) {
     const IdOffset* row = findOffset(edgeIndex_, edgeCount_, edgeId);
     if (row == nullptr || row->offset + kEdgeRecord > bin_.size) {
       continue;
     }
+    edgeRows.push_back(row);
+  }
+  std::sort(edgeRows.begin(), edgeRows.end(),
+            [](const IdOffset* a, const IdOffset* b) { return a->offset < b->offset; });
+
+  std::vector<EdgeAt> edges;
+  edges.reserve(edgeRows.size());
+  for (const IdOffset* row : edgeRows) {
     const char* p = static_cast<const char*>(bin_.data) + row->offset;
     EdgeAt item;
     int32_t type = 0;

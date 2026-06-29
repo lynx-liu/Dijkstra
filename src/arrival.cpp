@@ -223,55 +223,77 @@ DestinationArrivalSummary predictVehiclesToDestination(
     bySpeedKey[key].push_back(job);
   }
 
-  summary.vehicles.reserve(jobs.size());
+  std::vector<std::pair<int, std::vector<VehicleJob>>> speedGroups;
+  speedGroups.reserve(bySpeedKey.size());
   for (auto& kv : bySpeedKey) {
-    const double speedMs = kv.first / 100.0;
-    double groupMaxHorizon = 0.0;
-    std::vector<std::pair<const VehicleJob*, PreparedVehicle>> preparedJobs;
-    preparedJobs.reserve(kv.second.size());
-    std::unordered_set<int64_t> targetNodes;
-    targetNodes.reserve(kv.second.size() * 2);
+    speedGroups.emplace_back(kv.first, std::move(kv.second));
+  }
 
-    for (const auto& job : kv.second) {
-      groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
-      const PreparedVehicle prepared =
-          prepareVehicle(graph, *job.vehicle, job.history, job.vehicle->timestamp, param,
-                         &matchIndex);
-      if (!prepared.valid) {
-        continue;
-      }
-      addRoutingTargetNodes(graph, prepared.position, targetNodes);
-      preparedJobs.push_back({&job, prepared});
-    }
-    if (preparedJobs.empty()) {
-      continue;
-    }
+  summary.vehicles.reserve(jobs.size());
+  std::vector<std::future<std::vector<VehicleArrivalResult>>> futures;
+  futures.reserve(speedGroups.size());
+  for (auto& [speedKey, groupJobs] : speedGroups) {
+    futures.push_back(std::async(
+        std::launch::async,
+        [&graph, &matchIndex, &goalPos, &dest, &param, routeParam, speedKey,
+         groupJobs = std::move(groupJobs)]() {
+          std::vector<VehicleArrivalResult> rows;
+          const double speedMs = speedKey / 100.0;
+          double groupMaxHorizon = 0.0;
+          std::vector<std::pair<const VehicleJob*, PreparedVehicle>> preparedJobs;
+          preparedJobs.reserve(groupJobs.size());
+          std::unordered_set<int64_t> targetNodes;
+          targetNodes.reserve(groupJobs.size() * 2);
 
-    const RoutedTimeField field = computeRoutedTimeFieldFromGoal(
-        graph, goalPos, speedMs, dest.type, routeParam, groupMaxHorizon, &targetNodes);
+          for (const auto& job : groupJobs) {
+            groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
+            const PreparedVehicle prepared =
+                prepareVehicle(graph, *job.vehicle, job.history, job.vehicle->timestamp, param,
+                               &matchIndex);
+            if (!prepared.valid) {
+              continue;
+            }
+            addRoutingTargetNodes(graph, prepared.position, targetNodes);
+            preparedJobs.push_back({&job, prepared});
+          }
+          if (preparedJobs.empty()) {
+            return rows;
+          }
 
-    for (const auto& [job, prepared] : preparedJobs) {
-      const RouteToGoal path =
-          routeFromRoutedField(graph, field, prepared.position, goalPos, prepared.speedMs,
-                               job->vehicle->type, routeParam);
-      const double travel = path.travelTimeSec;
-      if (travel >= kInfTime / 2.0 || travel > job->maxHorizon + 1e-6) {
-        continue;
-      }
+          const RoutedTimeField field = computeRoutedTimeFieldFromGoal(
+              graph, goalPos, speedMs, dest.type, routeParam, groupMaxHorizon, &targetNodes);
 
-      const double eta = static_cast<double>(job->vehicle->timestamp) + travel;
-      if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
-        continue;
-      }
+          for (const auto& [job, prepared] : preparedJobs) {
+            const RouteToGoal path =
+                routeFromRoutedField(graph, field, prepared.position, goalPos, prepared.speedMs,
+                                     job->vehicle->type, routeParam);
+            const double travel = path.travelTimeSec;
+            if (travel >= kInfTime / 2.0 || travel > job->maxHorizon + 1e-6) {
+              continue;
+            }
 
-      VehicleArrivalResult row;
-      row.vehicleId = job->vehicle->id;
-      row.reachable = true;
-      row.travelDurationSec = travel;
-      row.etaUnix = eta;
-      row.routeDistanceM = polylineLengthMeters(path.polyline);
-      row.route = path.polyline;
-      simplifyRoutePolyline(row.route, 120);
+            const double eta = static_cast<double>(job->vehicle->timestamp) + travel;
+            if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+              continue;
+            }
+
+            VehicleArrivalResult row;
+            row.vehicleId = job->vehicle->id;
+            row.reachable = true;
+            row.travelDurationSec = travel;
+            row.etaUnix = eta;
+            row.routeDistanceM = polylineLengthMeters(path.polyline);
+            row.route = path.polyline;
+            simplifyRoutePolyline(row.route, 120);
+            rows.push_back(std::move(row));
+          }
+          return rows;
+        }));
+  }
+
+  for (auto& future : futures) {
+    std::vector<VehicleArrivalResult> rows = future.get();
+    for (auto& row : rows) {
       summary.vehicles.push_back(std::move(row));
     }
   }
@@ -323,6 +345,7 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
 
   const auto t0 = std::chrono::steady_clock::now();
   std::int64_t collectMs = 0;
+  std::int64_t pruneMs = 0;
 
   constexpr double kPerVehicleThresholdM = 600000.0;
   constexpr double kBBoxExtractMaxSpanM = 50000.0;
@@ -345,6 +368,13 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
           std::min(maxCorridorWidthM, std::max(20000.0, maxSpanM * 0.15 + 12000.0));
       collected = collectDestinationBBoxEdgeIdsIndexed(store, matchIndex, forExtract, padM,
                                                      allowedEdges, &collectErr);
+      if (collected && maxSpanM > kBBoxExtractMaxSpanM) {
+        const auto tp0 = std::chrono::steady_clock::now();
+        pruneDestinationEdgeIdsToCorridors(store, routable, dest.lat, dest.lon, maxCorridorWidthM,
+                                           allowedEdges);
+        const auto tp1 = std::chrono::steady_clock::now();
+        pruneMs = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+      }
     } else {
       collected = collectDestinationCorridorEdgeIdsIndexed(
           store, matchIndex, routable, dest.lat, dest.lon, maxCorridorWidthM, allowedEdges,
@@ -470,7 +500,7 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
               << " routable=" << routable.size() << " sub_edges=" << regionCtx.graph.edges().size()
               << " egeo=" << (store.hasEdgeGeo() ? 1 : 0) << " csr=0 bbox="
-              << (useBboxExtract ? 1 : 0) << " collect_ms=" << collectMs
+              << (useBboxExtract ? 1 : 0) << " collect_ms=" << collectMs << " prune_ms=" << pruneMs
               << " extract_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
               << " predict_ms="
