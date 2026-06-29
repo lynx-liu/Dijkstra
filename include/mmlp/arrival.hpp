@@ -24,6 +24,12 @@ DestinationArrivalSummary predictVehiclesToDestination(
     const GraphContext& routeCtx, const SpatialIndex& matchIndex, const DestinationQuery& dest,
     const PredictParam& param = PredictParam{});
 
+// Index-only: per-vehicle corridors (avoids national bbox when fleet is spread out).
+DestinationArrivalSummary predictVehiclesToDestinationIndexed(
+    const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
+    const GraphFileStore& store, const SpatialIndex& matchIndex, const DestinationQuery& dest,
+    double maxCorridorWidthM, const PredictParam& param = PredictParam{});
+
 void sortDestinationArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy);
 
 std::string graphLocationId(const GraphPosition& pos);

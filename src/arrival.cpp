@@ -7,8 +7,10 @@
 #include "mmlp/routing.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <future>
+#include <iostream>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -33,6 +35,22 @@ double polylineLengthMeters(const RoutePolyline& route) {
     sum += haversineMeters(route.points[i - 1], route.points[i]);
   }
   return sum;
+}
+
+bool vehicleMayReachDestination(const VehicleInfo& vehicle, const DestinationQuery& dest,
+                                double speedMs) {
+  if (vehicle.type != dest.type) {
+    return false;
+  }
+  const double horizon = static_cast<double>(dest.arriveByUnix - vehicle.timestamp);
+  if (horizon < 1.0) {
+    return false;
+  }
+  const double dist =
+      haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+  // Straight line at ~65% of road speed is a conservative travel-time lower bound.
+  const double minTravelSec = dist / (std::max(speedMs, 5.0) * 0.65);
+  return minTravelSec <= horizon + 120.0;
 }
 
 }  // namespace
@@ -82,6 +100,17 @@ std::optional<VehicleArrivalResult> predictVehicleToDestination(
     return std::nullopt;
   }
 
+  const double maxHorizon =
+      std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+  if (maxHorizon < 1.0) {
+    return std::nullopt;
+  }
+
+  const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, history, nullptr, vehicle.type));
+  if (!vehicleMayReachDestination(vehicle, dest, speedMs)) {
+    return std::nullopt;
+  }
+
   const MultimodalGraph& graph = routeCtx.graph;
   const PreparedVehicle prepared =
       prepareVehicle(graph, vehicle, history, vehicle.timestamp, param, &matchIndex);
@@ -89,14 +118,13 @@ std::optional<VehicleArrivalResult> predictVehicleToDestination(
     return std::nullopt;
   }
 
-  const double maxHorizon =
-      std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
-  if (maxHorizon < 1.0) {
-    return std::nullopt;
+  PredictParam routeParam = param;
+  if (routeParam.maxVisitedNodes > 0 && routeParam.maxVisitedNodes < 250000) {
+    routeParam.maxVisitedNodes = 250000;
   }
 
   const RouteToGoal path = computeRouteToGoal(graph, prepared.position, goalPos, prepared.speedMs,
-                                              vehicle.type, param, maxHorizon);
+                                              vehicle.type, routeParam, maxHorizon);
   const double travel = path.travelTimeSec;
   if (travel >= kInfTime / 2.0 || travel > maxHorizon + 1e-6) {
     return std::nullopt;
@@ -173,6 +201,92 @@ DestinationArrivalSummary predictVehiclesToDestination(
       }
     }
   }
+
+  sortDestinationArrivals(summary.vehicles, dest.sortBy);
+  return summary;
+}
+
+DestinationArrivalSummary predictVehiclesToDestinationIndexed(
+    const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
+    const GraphFileStore& store, const SpatialIndex& matchIndex, const DestinationQuery& dest,
+    double maxCorridorWidthM, const PredictParam& param) {
+  DestinationArrivalSummary summary;
+  summary.lat = dest.lat;
+  summary.lon = dest.lon;
+  summary.arriveByUnix = dest.arriveByUnix;
+  summary.sortBy = dest.sortBy;
+
+  VehicleInfo destProbe;
+  destProbe.id = "__destination__";
+  destProbe.lat = dest.lat;
+  destProbe.lon = dest.lon;
+  destProbe.type = dest.type;
+  destProbe.speed = 60.0;
+  destProbe.timestamp = dest.arriveByUnix;
+
+  GraphContext destCtx;
+  std::string destErr;
+  const std::vector<VehicleInfo> destOnly = {destProbe};
+  if (!extractGraphContextForDestinationIndexed(store, matchIndex, destOnly, 8000.0, destCtx,
+                                                &destErr)) {
+    std::cerr << "[mmlp] destination snap extract failed: " << destErr << "\n" << std::flush;
+    return summary;
+  }
+
+  const GraphPosition goalPos =
+      matchVehicleToGraph(destCtx.graph, destProbe, &matchIndex);
+  summary.locationId = graphLocationId(goalPos);
+  if (!goalPos.valid) {
+    return summary;
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::size_t pruned = 0;
+  std::size_t routed = 0;
+  summary.vehicles.reserve(vehicles.size());
+
+  for (const auto& vehicle : vehicles) {
+    const VehicleHistory* hist = findHistory(histories, vehicle.id);
+    const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
+    if (!vehicleMayReachDestination(vehicle, dest, speedMs)) {
+      ++pruned;
+      continue;
+    }
+
+    const double dist =
+        haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+    const double corridorW =
+        dist > 40000.0 ? maxCorridorWidthM
+                       : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+
+    GraphContext corridorCtx;
+    std::string corridorErr;
+    if (!extractGraphContextForPairIndexed(store, matchIndex, vehicle, dest.lat, dest.lon,
+                                           corridorW, corridorCtx, &corridorErr)) {
+      std::cerr << "[mmlp] corridor extract " << vehicle.id << ": " << corridorErr << "\n"
+                << std::flush;
+      continue;
+    }
+
+    const GraphPosition goalOnCorridor =
+        matchVehicleToGraph(corridorCtx.graph, destProbe, &matchIndex);
+    if (!goalOnCorridor.valid) {
+      continue;
+    }
+
+    if (auto row = predictVehicleToDestination(vehicle, hist, corridorCtx, matchIndex, dest,
+                                               goalOnCorridor, param)) {
+      summary.vehicles.push_back(std::move(*row));
+      ++routed;
+    }
+  }
+
+  const auto t1 = std::chrono::steady_clock::now();
+  std::cerr << "[mmlp] destination indexed vehicles=" << vehicles.size() << " pruned=" << pruned
+            << " routed=" << routed << " reachable=" << summary.vehicles.size()
+            << " total_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << "\n"
+            << std::flush;
 
   sortDestinationArrivals(summary.vehicles, dest.sortBy);
   return summary;

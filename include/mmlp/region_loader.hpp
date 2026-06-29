@@ -59,6 +59,12 @@ bool extractGraphContextForMeetingIndexed(const GraphFileStore& store, const Spa
                                          double maxCorridorWidthM, GraphContext& out,
                                          std::string* error = nullptr);
 
+// Index-only: corridor between one vehicle and a destination point (not national bbox).
+bool extractGraphContextForPairIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                       const VehicleInfo& vehicle, double destLat, double destLon,
+                                       double maxCorridorWidthM, GraphContext& out,
+                                       std::string* error = nullptr);
+
 // Destination batch: one bbox around all vehicles + destination (faster than N corridors).
 bool extractGraphContextForDestination(const GraphContext& full,
                                        const std::vector<VehicleInfo>& vehicles,

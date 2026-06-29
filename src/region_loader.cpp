@@ -523,6 +523,34 @@ bool extractGraphContextForMeetingIndexed(const GraphFileStore& store, const Spa
   return true;
 }
 
+bool extractGraphContextForPairIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                                       const VehicleInfo& vehicle, double destLat, double destLon,
+                                       double maxCorridorWidthM, GraphContext& out,
+                                       std::string* error) {
+  const LatLon vehicleLl{vehicle.lat, vehicle.lon};
+  const LatLon destLl{destLat, destLon};
+  const double dist = haversineMeters(vehicleLl, destLl);
+  const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+
+  std::unordered_set<int64_t> edgeIds;
+  edgeIds.reserve(50000);
+  collectCorridorEdgeIdsIndexed(store, index, vehicleLl, destLl, width, edgeIds);
+
+  const GeoBBox destBox = bboxAroundSegment(destLl, destLl, 8000.0);
+  index.collectEdgesInBBox(destBox, edgeIds);
+
+  if (edgeIds.empty()) {
+    if (error) {
+      *error = "no edges in vehicle-destination corridor";
+    }
+    return false;
+  }
+  if (!store.loadGraphSubset(edgeIds, out.graph, error)) {
+    return false;
+  }
+  return true;
+}
+
 bool extractGraphContextForDestination(const GraphContext& full,
                                        const std::vector<VehicleInfo>& vehicles,
                                        double paddingMeters, GraphContext& out,

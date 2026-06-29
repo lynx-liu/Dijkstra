@@ -543,28 +543,8 @@ DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
   }
 
   if (indexOnlyLoaded_) {
-    const auto t0 = std::chrono::steady_clock::now();
-    const GraphContext* sub = nullptr;
-    std::string subErr;
-    if (!getOrBuildSubgraph(destProbe, forGraph, padM, sub, &subErr)) {
-      if (error) {
-        *error = subErr;
-      }
-      return empty;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    const auto summary =
-        predictVehiclesToDestination(vehicles, histories, *sub, ctx_.index, q, p);
-    const auto t2 = std::chrono::steady_clock::now();
-    std::cerr << "[mmlp] destination vehicles=" << vehicles.size()
-              << " sub_nodes=" << sub->graph.nodes().size()
-              << " extract_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-              << " predict_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
-              << " reachable=" << summary.vehicles.size() << "\n"
-              << std::flush;
-    return summary;
+    return predictVehiclesToDestinationIndexed(vehicles, histories, graphStore_, ctx_.index, q, padM,
+                                             p);
   }
 
   return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);
