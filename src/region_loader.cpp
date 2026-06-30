@@ -468,6 +468,18 @@ bool loadGraphContextIndexOnly(const std::string& binPath, GraphContext& ctx, st
   return true;
 }
 
+void collectEdgesInBboxIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                               const GeoBBox& box, std::unordered_set<int64_t>& edgeIds) {
+  // Broken/legacy rtidx files can hold tens of millions of one-cell tiles; sidx is faster.
+  constexpr std::size_t kMaxRtilesLinear = 500000;
+  if (store.hasRtiles() && store.rtiles().tileCount() <= kMaxRtilesLinear) {
+    store.rtiles().collectEdgesInBBox(box, edgeIds);
+  }
+  if (edgeIds.empty()) {
+    index.collectEdgesInBBox(box, edgeIds);
+  }
+}
+
 namespace {
 
 double destinationCorridorWidthM(double distM, double maxCorridorWidthM) {
@@ -486,7 +498,7 @@ void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialInd
   {
     std::unordered_set<int64_t> bucket;
     bucket.reserve(80000);
-    index.collectEdgesInBBox(box, bucket);
+    collectEdgesInBboxIndexed(store, index, box, bucket);
     candidates.assign(bucket.begin(), bucket.end());
   }
   if (candidates.empty()) {
@@ -639,7 +651,7 @@ bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const Spa
   }
 
   const GeoBBox box = bboxFromVehicles(vehicles, paddingMeters);
-  index.collectEdgesInBBox(box, edgeIds);
+  collectEdgesInBboxIndexed(store, index, box, edgeIds);
   if (edgeIds.empty()) {
     return fail("no graph edges in destination bbox");
   }

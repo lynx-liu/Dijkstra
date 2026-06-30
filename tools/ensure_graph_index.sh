@@ -22,8 +22,33 @@ if [[ -f "${BASE}.sidx" && -f "${BASE}.nidx" && -f "${BASE}.eidx" ]]; then
     fi
     "${ROOT}/build/mmlp_build_aux" "${GRAPH}" --egeo-only
   fi
+  if [[ ! -f "${BASE}.hwy.csr" ]]; then
+    echo "=== Building .hwy.csr (arterial overlay, ~2 minutes) ==="
+    cmake --build "${ROOT}/build" --target mmlp_build_hwy_csr 2>/dev/null || {
+      cmake -S "${ROOT}" -B "${ROOT}/build"
+      cmake --build "${ROOT}/build" --target mmlp_build_hwy_csr
+    }
+    "${ROOT}/build/mmlp_build_hwy_csr" "${GRAPH}"
+  fi
+  if [[ ! -f "${BASE}.hwy.ch" ]] || [[ "$(stat -c%s "${BASE}.hwy.ch" 2>/dev/null || echo 0)" -lt 1000000 ]]; then
+    echo "=== Building .hwy.ch (CH preprocess, ~10-30 minutes) ==="
+    cmake --build "${ROOT}/build" --target mmlp_build_hwy_ch 2>/dev/null || {
+      cmake -S "${ROOT}" -B "${ROOT}/build"
+      cmake --build "${ROOT}/build" --target mmlp_build_hwy_ch
+    }
+    "${ROOT}/build/mmlp_build_hwy_ch" "${GRAPH}"
+  fi
+  if [[ ! -f "${BASE}.rtidx" ]]; then
+    echo "=== Building .rtidx (partition tiles, ~3 minutes) ==="
+    cmake --build "${ROOT}/build" --target mmlp_build_rtiles 2>/dev/null || {
+      cmake -S "${ROOT}" -B "${ROOT}/build"
+      cmake --build "${ROOT}/build" --target mmlp_build_rtiles
+    }
+    "${ROOT}/build/mmlp_build_rtiles" "${GRAPH}"
+  fi
   echo "Index files OK:"
-  ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx" "${BASE}.egeo" 2>/dev/null || ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx"
+  ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx" "${BASE}.egeo" "${BASE}.hwy.csr" \
+    "${BASE}.hwy.ch" "${BASE}.rtidx" 2>/dev/null || ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx"
   exit 0
 fi
 

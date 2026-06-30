@@ -84,6 +84,9 @@ bool extractGraphContextForDestinationCorridorsIndexed(
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
     double maxCorridorWidthM, GraphContext& out, std::string* error = nullptr);
 
+void collectEdgesInBboxIndexed(const GraphFileStore& store, const SpatialIndex& index,
+                               const GeoBBox& box, std::unordered_set<int64_t>& edgeIds);
+
 bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
                                           const std::vector<VehicleInfo>& vehicles,
                                           double paddingMeters,

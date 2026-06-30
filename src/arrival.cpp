@@ -1,9 +1,11 @@
 #include "mmlp/arrival.hpp"
 
+#include "mmlp/ch_graph.hpp"
 #include "mmlp/geo.hpp"
 #include "mmlp/matching.hpp"
 #include "mmlp/meeting.hpp"
 #include "mmlp/motion.hpp"
+#include "mmlp/region_loader.hpp"
 #include "mmlp/routing.hpp"
 
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -70,6 +73,336 @@ void addRoutingTargetNodes(const MultimodalGraph& graph, const GraphPosition& po
   }
   targets.insert(edge->from);
   targets.insert(edge->to);
+}
+
+std::optional<int64_t> chNodeFromSnap(const GraphFileStore& store, const ChGraph& ch,
+                                      const GraphPosition& pos) {
+  if (!pos.valid) {
+    return std::nullopt;
+  }
+  if (pos.edgeId == 0) {
+    if (ch.nodeIndex(pos.nodeId) >= 0) {
+      return pos.nodeId;
+    }
+    return std::nullopt;
+  }
+  int64_t from = 0;
+  int64_t to = 0;
+  if (!store.edgeEndpoints(pos.edgeId, from, to)) {
+    return std::nullopt;
+  }
+  if (ch.nodeIndex(from) >= 0) {
+    return from;
+  }
+  if (ch.nodeIndex(to) >= 0) {
+    return to;
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> nearestChNodeViaHighwayCsr(const GraphFileStore& store, const ChGraph& ch,
+                                                  const CsrGraph& hwyCsr, const GraphPosition& pos,
+                                                  double maxStubMeters) {
+  if (!pos.valid || maxStubMeters <= 0.0) {
+    return std::nullopt;
+  }
+
+  std::vector<int64_t> seeds;
+  if (pos.edgeId == 0) {
+    seeds.push_back(pos.nodeId);
+  } else {
+    int64_t from = 0;
+    int64_t to = 0;
+    if (store.edgeEndpoints(pos.edgeId, from, to)) {
+      seeds.push_back(from);
+      seeds.push_back(to);
+    }
+  }
+  if (seeds.empty()) {
+    return std::nullopt;
+  }
+
+  for (int64_t nodeId : seeds) {
+    if (ch.nodeIndex(nodeId) >= 0) {
+      return nodeId;
+    }
+  }
+
+  using QItem = std::pair<double, int64_t>;
+  std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
+  std::unordered_map<int64_t, double> best;
+  best.reserve(4096);
+  for (int64_t nodeId : seeds) {
+    best[nodeId] = 0.0;
+    pq.push({0.0, nodeId});
+  }
+
+  while (!pq.empty()) {
+    const auto [distM, nodeId] = pq.top();
+    pq.pop();
+    const auto bestIt = best.find(nodeId);
+    if (bestIt == best.end() || distM > bestIt->second + 1e-6) {
+      continue;
+    }
+    if (distM > maxStubMeters || best.size() > 4000) {
+      break;
+    }
+    if (ch.nodeIndex(nodeId) >= 0) {
+      return nodeId;
+    }
+
+    hwyCsr.forEachNeighbor(store, nodeId, nullptr, [&](const CsrArc& arc) {
+      const double nextM = distM + static_cast<double>(arc.length);
+      if (nextM > maxStubMeters) {
+        return;
+      }
+      const auto it = best.find(arc.toNodeId);
+      if (it == best.end() || nextM < it->second - 1e-6) {
+        best[arc.toNodeId] = nextM;
+        pq.push({nextM, arc.toNodeId});
+      }
+    });
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> nearestChNodeViaLocalBBox(
+    const GraphFileStore& store, const SpatialIndex& index, const ChGraph& ch,
+    const VehicleInfo& anchor, double radiusM, const GraphPosition& startPos, double speedMs,
+    VehicleType type, const PredictParam& param, double maxHorizon) {
+  if (radiusM <= 0.0 || !startPos.valid) {
+    return std::nullopt;
+  }
+
+  std::unordered_set<int64_t> edgeIds;
+  const LatLon center{anchor.lat, anchor.lon};
+  collectEdgesInBboxIndexed(store, index, bboxAroundSegment(center, center, radiusM), edgeIds);
+  if (edgeIds.empty()) {
+    return std::nullopt;
+  }
+
+  GraphContext localCtx;
+  std::string err;
+  if (!store.loadGraphSubset(edgeIds, localCtx.graph, &err)) {
+    return std::nullopt;
+  }
+
+  std::unordered_set<int64_t> chTargets;
+  for (const Node& node : localCtx.graph.nodes()) {
+    if (ch.nodeIndex(node.id) >= 0) {
+      chTargets.insert(node.id);
+    }
+  }
+  if (chTargets.empty()) {
+    return std::nullopt;
+  }
+
+  GraphPosition localStart = matchVehicleToGraph(localCtx.graph, anchor, &index);
+  if (!localStart.valid) {
+    return std::nullopt;
+  }
+
+  PredictParam localParam = param;
+  localParam.maxVisitedNodes = 40000;
+  const TimeField field = computeTimeField(localCtx.graph, localStart, speedMs, type, localParam,
+                                          maxHorizon);
+
+  int64_t bestNode = 0;
+  double bestT = kInfTime;
+  for (int64_t nodeId : chTargets) {
+    const auto it = field.atNode.find(nodeId);
+    if (it != field.atNode.end() && it->second < bestT) {
+      bestT = it->second;
+      bestNode = nodeId;
+    }
+  }
+  if (bestNode == 0 || bestT >= kInfTime / 2.0) {
+    return std::nullopt;
+  }
+  return bestNode;
+}
+
+std::optional<int64_t> nearestChNodeViaLocalGraph(
+    const GraphFileStore& store, const SpatialIndex& index, const ChGraph& ch,
+    const VehicleInfo& anchor, double partnerLat, double partnerLon, double corridorWidthM,
+    const GraphPosition& startPos, double speedMs, VehicleType type, const PredictParam& param,
+    double maxHorizon) {
+  GraphContext corridorCtx;
+  std::string err;
+  if (!extractGraphContextForPairIndexed(store, index, anchor, partnerLat, partnerLon,
+                                         corridorWidthM, corridorCtx, &err)) {
+    return std::nullopt;
+  }
+
+  std::unordered_set<int64_t> chTargets;
+  for (const Node& node : corridorCtx.graph.nodes()) {
+    if (ch.nodeIndex(node.id) >= 0) {
+      chTargets.insert(node.id);
+    }
+  }
+  if (chTargets.empty()) {
+    return std::nullopt;
+  }
+
+  GraphPosition localStart = startPos;
+  if (!localStart.valid || localStart.edgeId == 0) {
+    localStart = matchVehicleToGraph(corridorCtx.graph, anchor, &index);
+  } else {
+    localStart = matchVehicleToGraph(corridorCtx.graph, anchor, &index);
+  }
+  if (!localStart.valid) {
+    return std::nullopt;
+  }
+
+  PredictParam localParam = param;
+  localParam.maxVisitedNodes = 120000;
+  const TimeField field = computeTimeField(corridorCtx.graph, localStart, speedMs, type, localParam,
+                                          maxHorizon);
+
+  int64_t bestNode = 0;
+  double bestT = kInfTime;
+  for (int64_t nodeId : chTargets) {
+    const auto it = field.atNode.find(nodeId);
+    if (it != field.atNode.end() && it->second < bestT) {
+      bestT = it->second;
+      bestNode = nodeId;
+    }
+  }
+  if (bestNode == 0 || bestT >= kInfTime / 2.0) {
+    return std::nullopt;
+  }
+  return bestNode;
+}
+
+RoutePolyline appendPolylines(RoutePolyline a, const RoutePolyline& b) {
+  if (a.points.empty()) {
+    return b;
+  }
+  for (const LatLon& p : b.points) {
+    if (a.points.empty() || haversineMeters(a.points.back(), p) > 1.0) {
+      a.points.push_back(p);
+    }
+  }
+  return a;
+}
+
+std::optional<VehicleArrivalResult> predictOneVehicleHighwayCh(
+    const VehicleInfo& vehicle, const VehicleHistory* history, const GraphFileStore& store,
+    const SpatialIndex& matchIndex, const DestinationQuery& dest, const VehicleInfo& destProbe,
+    const GraphPosition& goalSnap, const PredictParam& param) {
+  const ChGraph& ch = store.highwayCh();
+  const CsrGraph& hwyCsr = store.highwayCsr();
+  if (!ch.isOpen() || !hwyCsr.isOpen() || !goalSnap.valid) {
+    return std::nullopt;
+  }
+
+  const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, history, nullptr, vehicle.type));
+  const double maxHorizon =
+      std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+  if (maxHorizon < 1.0) {
+    return std::nullopt;
+  }
+
+  const GraphPosition startSnap = matchVehicleToGraphIndexed(store, matchIndex, vehicle);
+  if (!startSnap.valid) {
+    return std::nullopt;
+  }
+
+  const double distM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+  const double stubM = std::min(25000.0, distM * 0.2 + 8000.0);
+
+  std::optional<int64_t> startCh = chNodeFromSnap(store, ch, startSnap);
+  if (!startCh) {
+    startCh = nearestChNodeViaHighwayCsr(store, ch, hwyCsr, startSnap, stubM);
+  }
+  if (!startCh) {
+    startCh = nearestChNodeViaLocalBBox(store, matchIndex, ch, vehicle, std::min(8000.0, stubM),
+                                      startSnap, speedMs, vehicle.type, param, maxHorizon);
+  }
+  std::optional<int64_t> goalCh = chNodeFromSnap(store, ch, goalSnap);
+  if (!goalCh) {
+    goalCh = nearestChNodeViaHighwayCsr(store, ch, hwyCsr, goalSnap, stubM);
+  }
+  if (!goalCh) {
+    goalCh = nearestChNodeViaLocalBBox(store, matchIndex, ch, destProbe, std::min(8000.0, stubM),
+                                       goalSnap, speedMs, dest.type, param, maxHorizon);
+  }
+  if (!startCh || !goalCh) {
+    return std::nullopt;
+  }
+
+  RouteToGoal total;
+  if (*startCh != *goalCh) {
+    total = ch.query(store, hwyCsr, *startCh, *goalCh, vehicle.type, param, maxHorizon);
+    if (total.travelTimeSec >= kInfTime / 2.0) {
+      return std::nullopt;
+    }
+  } else {
+    total.travelTimeSec = 0.0;
+  }
+
+  double travel = total.travelTimeSec;
+  RoutePolyline route = total.polyline;
+
+  const bool startOnCh = chNodeFromSnap(store, ch, startSnap).has_value();
+  if (!startOnCh) {
+    GraphContext localCtx;
+    std::string err;
+    const double localW = std::min(8000.0, stubM);
+    if (extractGraphContextForPairIndexed(store, matchIndex, vehicle, dest.lat, dest.lon, localW,
+                                          localCtx, &err)) {
+      GraphPosition lg;
+      lg.valid = true;
+      lg.nodeId = *startCh;
+      lg.edgeId = 0;
+      const RouteToGoal local = computeRouteToGoal(
+          localCtx.graph, matchVehicleToGraph(localCtx.graph, vehicle, &matchIndex), lg, speedMs,
+          vehicle.type, param, maxHorizon);
+      if (local.travelTimeSec < kInfTime / 2.0) {
+        travel += local.travelTimeSec;
+        route = appendPolylines(local.polyline, route);
+      }
+    }
+  }
+
+  const bool goalOnCh = chNodeFromSnap(store, ch, goalSnap).has_value();
+  if (!goalOnCh) {
+    GraphContext localCtx;
+    std::string err;
+    const double localW = std::min(8000.0, stubM);
+    if (extractGraphContextForPairIndexed(store, matchIndex, destProbe, vehicle.lat, vehicle.lon,
+                                          localW, localCtx, &err)) {
+      GraphPosition lg;
+      lg.valid = true;
+      lg.nodeId = *goalCh;
+      lg.edgeId = 0;
+      const RouteToGoal local = computeRouteToGoal(
+          localCtx.graph, lg, matchVehicleToGraph(localCtx.graph, destProbe, &matchIndex), speedMs,
+          dest.type, param, maxHorizon);
+      if (local.travelTimeSec < kInfTime / 2.0) {
+        travel += local.travelTimeSec;
+        route = appendPolylines(route, local.polyline);
+      }
+    }
+  }
+
+  if (travel > maxHorizon + 1e-6) {
+    return std::nullopt;
+  }
+  const double eta = static_cast<double>(vehicle.timestamp) + travel;
+  if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+    return std::nullopt;
+  }
+
+  VehicleArrivalResult row;
+  row.vehicleId = vehicle.id;
+  row.reachable = true;
+  row.travelDurationSec = travel;
+  row.etaUnix = eta;
+  row.route = route;
+  row.routeDistanceM = polylineLengthMeters(row.route);
+  simplifyRoutePolyline(row.route, 120);
+  return row;
 }
 
 }  // namespace
@@ -413,14 +746,34 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
           const SmallJob& job = jobs[i];
           const double dist = haversineMeters({job.vehicle->lat, job.vehicle->lon},
                                               {dest.lat, dest.lon});
-          const double corridorW =
-              dist > 40000.0 ? std::min(maxCorridorWidthM, 22000.0)
-                             : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
           GraphContext corridorCtx;
           std::string corridorErr;
-          if (!extractGraphContextForPairIndexed(store, matchIndex, *job.vehicle, dest.lat,
-                                                 dest.lon, corridorW, corridorCtx,
-                                                 &corridorErr)) {
+          bool loaded = false;
+
+          constexpr double kNearDestM = 45000.0;
+          constexpr double kMediumDestM = 120000.0;
+          if (dist <= kNearDestM) {
+            std::unordered_set<int64_t> edgeIds;
+            if (collectDestinationCorridorEdgeIdsIndexed(store, matchIndex, {*job.vehicle},
+                                                         dest.lat, dest.lon, maxCorridorWidthM,
+                                                         edgeIds, &corridorErr)) {
+              loaded = store.loadGraphSubset(edgeIds, corridorCtx.graph, &corridorErr);
+            }
+          } else if (dist <= kMediumDestM) {
+            const double corridorW =
+                std::min(maxCorridorWidthM, std::max(8000.0, dist * 0.08 + 6000.0));
+            loaded = extractGraphContextForPairIndexed(store, matchIndex, *job.vehicle, dest.lat,
+                                                       dest.lon, corridorW, corridorCtx,
+                                                       &corridorErr);
+          } else {
+            const double corridorW =
+                dist > 40000.0 ? std::min(maxCorridorWidthM, 22000.0)
+                               : std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+            loaded = extractGraphContextForPairIndexed(store, matchIndex, *job.vehicle, dest.lat,
+                                                       dest.lon, corridorW, corridorCtx,
+                                                       &corridorErr);
+          }
+          if (!loaded) {
             return;
           }
           const GraphPosition goalOnCorridor =

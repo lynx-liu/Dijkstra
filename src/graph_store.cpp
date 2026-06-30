@@ -175,7 +175,15 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
 
   const std::string csrPath = base + ".csr";
   (void)csrPath;
-  // CSR mmap (~5GB) is optional; do not load at startup (reserved for future CH).
+  // National CSR mmap (~5GB) optional; not loaded by default.
+
+  const std::string hwyCsrPath = base + ".hwy.csr";
+  hwyCsr_.open(hwyCsrPath, nullptr);
+
+  const std::string hwyChPath = base + ".hwy.ch";
+  hwyCh_.open(hwyChPath, nullptr);
+
+  rtiles_.open(base, nullptr);
 
   binPath_ = binPath;
   return true;

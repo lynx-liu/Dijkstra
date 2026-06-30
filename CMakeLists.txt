@@ -24,6 +24,8 @@ add_library(mmlp
   src/region_loader.cpp
   src/routing.cpp
   src/csr_graph.cpp
+  src/ch_graph.cpp
+  src/rtile_index.cpp
   src/spatial_index.cpp
 )
 target_include_directories(mmlp PUBLIC include)
@@ -54,6 +56,10 @@ target_link_libraries(mmlp_service PRIVATE mmlp)
 
 add_executable(mmlp_build_aux apps/mmlp_build_aux.cpp)
 target_link_libraries(mmlp_build_aux PRIVATE mmlp)
+
+add_executable(mmlp_build_hwy_csr apps/mmlp_build_hwy_csr.cpp)
+add_executable(mmlp_build_hwy_ch apps/mmlp_build_hwy_ch.cpp)
+add_executable(mmlp_build_rtiles apps/mmlp_build_rtiles.cpp)
 
 add_executable(test_graph_io tests/test_graph_io.cpp)
 target_link_libraries(test_graph_io PRIVATE mmlp)
