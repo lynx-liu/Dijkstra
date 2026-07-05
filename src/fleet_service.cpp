@@ -2,12 +2,15 @@
 
 #include "mmlp/geo.hpp"
 #include "mmlp/motion.hpp"
+#include "mmlp/thread_pool.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <functional>
+#include <fstream>
+#include <future>
+#include <cstring>
 #include <iostream>
 
 namespace mmlp {
@@ -78,6 +81,87 @@ std::size_t maxPairChecks() {
   return 32;
 }
 
+struct RegionBBox {
+  const char* suffix;
+  double minLon;
+  double minLat;
+  double maxLon;
+  double maxLat;
+};
+
+constexpr RegionBBox kRegionBoxes[] = {
+    {"prd", 112.0, 22.0, 114.8, 24.2},
+    {"sc", 108.0, 20.0, 118.5, 26.5},
+    {"nx", 104.0, 35.0, 108.5, 40.5},
+    {"xj", 73.0, 34.0, 96.5, 49.5},
+};
+
+const char* regionSuffixForPoint(double lat, double lon) {
+  for (const RegionBBox& region : kRegionBoxes) {
+    if (lon >= region.minLon && lon <= region.maxLon && lat >= region.minLat &&
+        lat <= region.maxLat) {
+      return region.suffix;
+    }
+  }
+  return nullptr;
+}
+
+std::string regionalGraphPath(const std::string& nationalPath, const std::string& suffix) {
+  const std::size_t slash = nationalPath.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? "" : nationalPath.substr(0, slash + 1);
+  const std::string name =
+      slash == std::string::npos ? nationalPath : nationalPath.substr(slash + 1);
+  std::string base = name;
+  if (base.size() > 4 && base.substr(base.size() - 4) == ".bin") {
+    base = base.substr(0, base.size() - 4);
+  }
+  if (base.size() > 5 && base.substr(base.size() - 5) == ".mmlp") {
+    base = base.substr(0, base.size() - 5);
+  }
+  return dir + base + "_" + suffix + ".mmlp.bin";
+}
+
+bool regionalGraphFileExists(const std::string& nationalPath, const std::string& suffix) {
+  std::ifstream probe(regionalGraphPath(nationalPath, suffix));
+  return probe.good();
+}
+
+// Prefer the tightest regional graph that exists (prd -> sc -> nx -> xj).
+std::string resolveRegionalSuffix(const std::string& nationalPath, double lat, double lon) {
+  const char* preferred = regionSuffixForPoint(lat, lon);
+  if (preferred == nullptr) {
+    return {};
+  }
+  if (std::strcmp(preferred, "prd") == 0) {
+    if (regionalGraphFileExists(nationalPath, "prd")) {
+      return "prd";
+    }
+    if (regionalGraphFileExists(nationalPath, "sc")) {
+      return "sc";
+    }
+    return {};
+  }
+  if (regionalGraphFileExists(nationalPath, preferred)) {
+    return preferred;
+  }
+  return {};
+}
+
+bool vehicleInDestRegion(const std::string& destSuffix, double lat, double lon) {
+  const char* vehicleRegion = regionSuffixForPoint(lat, lon);
+  if (vehicleRegion == nullptr) {
+    return false;
+  }
+  if (destSuffix == vehicleRegion) {
+    return true;
+  }
+  // Routing on the wider sc graph should include prd-local vehicles.
+  if (destSuffix == "sc" && std::strcmp(vehicleRegion, "prd") == 0) {
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 FleetMeetingService::FleetMeetingService(std::string graphPath, double regionPaddingMeters)
@@ -123,12 +207,25 @@ bool FleetMeetingService::preloadIndexOnly(std::string* error) {
     indexOnlyLoaded_ = false;
     return false;
   }
+  if (graphStore_.hasCh()) {
+    const auto tCh0 = std::chrono::steady_clock::now();
+    graphStore_.ch().warmReverseDown();
+    const auto tCh1 = std::chrono::steady_clock::now();
+    std::cerr << "[mmlp] national ch warm_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(tCh1 - tCh0).count() << "\n"
+              << std::flush;
+  }
   ctx_ = std::move(fresh);
   graphReady_ = true;
   indexOnlyLoaded_ = true;
   fullGraphLoaded_ = false;
   loadedBBox_ = {73.0, 15.0, 135.0, 54.0};
   std::cerr << "[mmlp] index-only mode ready (mmap on-demand subgraph)\n" << std::flush;
+  // Warm-mmap the tightest regional graph for destination routing (best-effort).
+  if (regionalGraphFileExists(graphPath_, "prd")) {
+    std::string warmErr;
+    ensureRegionalGraph("prd", &warmErr);
+  }
   return true;
 }
 
@@ -467,6 +564,44 @@ std::vector<FocalBestMeeting> FleetMeetingService::meetingsWithLead(
   return predictMeetingsWithLead(vehicles, histories, ctx_, ctx_.index, p);
 }
 
+bool FleetMeetingService::ensureRegionalGraph(const std::string& suffix, std::string* error) {
+  auto found = regionalGraphs_.find(suffix);
+  if (found != regionalGraphs_.end() && found->second.ready) {
+    return true;
+  }
+
+  const std::string path = regionalGraphPath(graphPath_, suffix);
+  std::ifstream probe(path);
+  if (!probe.good()) {
+    return false;
+  }
+
+  RegionalGraph& regional = regionalGraphs_[suffix];
+  regional.ready = false;
+  regional.fullGraph = false;
+
+  // PRD: mmap index + optional regional CSR (avoid 4M-node RAM Dijkstra on full graph).
+  if (!loadGraphContextIndexOnly(path, regional.ctx, error)) {
+    regionalGraphs_.erase(suffix);
+    return false;
+  }
+  if (!regional.store.open(path, error)) {
+    regionalGraphs_.erase(suffix);
+    return false;
+  }
+  if (regional.store.hasCh()) {
+    regional.store.ch().warmReverseDown();
+  }
+  regional.ready = true;
+  std::cerr << "[mmlp] regional graph ready suffix=" << suffix << " path=" << path << "\n"
+            << std::flush;
+  return true;
+}
+
+const char* FleetMeetingService::regionSuffixForPoint(double lat, double lon) const {
+  return mmlp::regionSuffixForPoint(lat, lon);
+}
+
 DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
     double destLat, double destLon, int64_t arriveByUnix, VehicleType destType,
     ArrivalSortBy sortBy, const std::vector<VehicleInfo>* overrideVehicles,
@@ -543,8 +678,15 @@ DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
   }
 
   if (indexOnlyLoaded_) {
-    return predictVehiclesToDestinationIndexed(vehicles, histories, graphStore_, ctx_.index, q, padM,
-                                             p);
+    const std::string destRegion = resolveRegionalSuffix(graphPath_, destLat, destLon);
+    if (!destRegion.empty() && ensureRegionalGraph(destRegion, error)) {
+      RegionalGraph& regional = regionalGraphs_.at(destRegion);
+      return predictVehiclesToDestinationIndexed(vehicles, histories, regional.store,
+                                                 regional.ctx.index, q, padM, p, nullptr);
+    }
+
+    return predictVehiclesToDestinationIndexed(vehicles, histories, graphStore_, ctx_.index, q,
+                                               padM, p, graphStore_.hasCh() ? &graphStore_ : nullptr);
   }
 
   return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);

@@ -8,6 +8,7 @@
 #include <future>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <iostream>
 #include <thread>
 #include <unistd.h>
 
@@ -174,16 +175,33 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
   }
 
   const std::string csrPath = base + ".csr";
-  (void)csrPath;
-  // National CSR mmap (~5GB) optional; not loaded by default.
+  struct stat st {};
+  if (stat(csrPath.c_str(), &st) == 0 && st.st_size > 0 &&
+      static_cast<std::uint64_t>(st.st_size) <= 2'000'000'000ULL) {
+    std::string csrErr;
+    if (!csr_.open(csrPath, &csrErr)) {
+      std::cerr << "[mmlp] csr mmap skipped: " << csrErr << "\n" << std::flush;
+    }
+  }
 
   const std::string hwyCsrPath = base + ".hwy.csr";
-  hwyCsr_.open(hwyCsrPath, nullptr);
+  if (stat(hwyCsrPath.c_str(), &st) == 0 && st.st_size > 0) {
+    std::string hwyErr;
+    if (!hwyCsr_.open(hwyCsrPath, &hwyErr)) {
+      std::cerr << "[mmlp] hwy csr mmap skipped: " << hwyErr << "\n" << std::flush;
+    }
+  }
 
-  const std::string hwyChPath = base + ".hwy.ch";
-  hwyCh_.open(hwyChPath, nullptr);
-
-  rtiles_.open(base, nullptr);
+  const std::string chPath = base + ".hwy.ch";
+  if (stat(chPath.c_str(), &st) == 0 && st.st_size > 0) {
+    std::string chErr;
+    if (!ch_.open(chPath, &chErr)) {
+      std::cerr << "[mmlp] ch mmap skipped: " << chErr << "\n" << std::flush;
+    } else {
+      std::cerr << "[mmlp] ch mmap ok nodes=" << ch_.nodeCount() << " path=" << chPath << "\n"
+                << std::flush;
+    }
+  }
 
   binPath_ = binPath;
   return true;
@@ -402,36 +420,18 @@ bool GraphFileStore::loadGraphSubset(const std::unordered_set<int64_t>& edgeIds,
 
   std::vector<Edge> edgeList;
   edgeList.resize(edgeRows.size());
-  const std::size_t nWorkers =
-      std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
-  const std::size_t chunk = (edgeRows.size() + nWorkers - 1) / nWorkers;
-  std::vector<std::future<void>> futures;
-  futures.reserve(nWorkers);
   const char* binBase = static_cast<const char*>(bin_.data);
-
-  for (std::size_t w = 0; w < nWorkers; ++w) {
-    const std::size_t begin = w * chunk;
-    const std::size_t end = std::min(edgeRows.size(), begin + chunk);
-    if (begin >= end) {
-      break;
-    }
-    futures.push_back(std::async(std::launch::async, [&, begin, end]() {
-      for (std::size_t i = begin; i < end; ++i) {
-        const char* p = binBase + edgeRows[i]->offset;
-        Edge& edge = edgeList[i];
-        int32_t type = 0;
-        std::memcpy(&edge.id, p, 8);
-        std::memcpy(&edge.from, p + 8, 8);
-        std::memcpy(&edge.to, p + 16, 8);
-        std::memcpy(&type, p + 24, 4);
-        std::memcpy(&edge.length, p + 28, 8);
-        std::memcpy(&edge.speedLimit, p + 36, 8);
-        edge.type = static_cast<EdgeType>(type);
-      }
-    }));
-  }
-  for (auto& future : futures) {
-    future.get();
+  for (std::size_t i = 0; i < edgeRows.size(); ++i) {
+    const char* p = binBase + edgeRows[i]->offset;
+    Edge& edge = edgeList[i];
+    int32_t type = 0;
+    std::memcpy(&edge.id, p, 8);
+    std::memcpy(&edge.from, p + 8, 8);
+    std::memcpy(&edge.to, p + 16, 8);
+    std::memcpy(&type, p + 24, 4);
+    std::memcpy(&edge.length, p + 28, 8);
+    std::memcpy(&edge.speedLimit, p + 36, 8);
+    edge.type = static_cast<EdgeType>(type);
   }
 
   if (edgeRows.empty()) {

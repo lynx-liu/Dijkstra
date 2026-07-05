@@ -432,7 +432,8 @@ RoutedTimeField computeRoutedTimeFieldFromGoal(const MultimodalGraph& graph,
                                                const GraphPosition& goal, double speedMs,
                                                VehicleType type, const PredictParam& param,
                                                double maxTime,
-                                               const std::unordered_set<int64_t>* targetNodes) {
+                                               const std::unordered_set<int64_t>* targetNodes,
+                                               const LatLon* goalLatLon, double maxRadiusM) {
   RoutedTimeField field;
   if (!goal.valid || maxTime <= 0.0) {
     return field;
@@ -477,7 +478,7 @@ RoutedTimeField computeRoutedTimeFieldFromGoal(const MultimodalGraph& graph,
     if (field.atNode.size() >= visitCap) {
       break;
     }
-    if (!pendingTargets.empty() && pendingTargets.empty()) {
+    if (targetNodes != nullptr && pendingTargets.empty()) {
       break;
     }
     const auto [t, u] = pq.top();
@@ -493,6 +494,13 @@ RoutedTimeField computeRoutedTimeFieldFromGoal(const MultimodalGraph& graph,
     for (const AdjacencyEdge& adj : graph.neighbors(u)) {
       if (!edgeAllowedForVehicle(adj.type, type)) {
         continue;
+      }
+      if (goalLatLon != nullptr && maxRadiusM > 0.0) {
+        const Node* node = graph.findNode(adj.to);
+        if (node != nullptr &&
+            haversineMeters(*goalLatLon, {node->lat, node->lon}) > maxRadiusM) {
+          continue;
+        }
       }
       const double eff = edgeEffectiveSpeedMs(adj, type, speedMs);
       const double w = travelTimeSeconds(adj.length, eff, type, param);
@@ -620,7 +628,9 @@ LatLon positionLatLonStore(const GraphFileStore& store, const GraphPosition& pos
 RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
     const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
     VehicleType type, const PredictParam& param, double maxTime,
-    const std::unordered_set<int64_t>* allowedEdgeIds) {
+    const std::unordered_set<int64_t>* allowedEdgeIds,
+    const std::unordered_set<int64_t>* targetNodes, const LatLon* goalLatLon,
+    double maxRadiusM) {
   RoutedTimeField field;
   if (!goal.valid || maxTime <= 0.0 || !csr.isOpen()) {
     return field;
@@ -628,6 +638,11 @@ RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
 
   using QueueItem = std::tuple<double, int64_t>;
   std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+
+  std::unordered_set<int64_t> pendingTargets;
+  if (targetNodes != nullptr) {
+    pendingTargets = *targetNodes;
+  }
 
   auto relax = [&](int64_t nodeId, double t, int64_t parentNode) {
     if (t > maxTime + 1e-9) {
@@ -662,16 +677,32 @@ RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
     if (field.atNode.size() >= visitCap) {
       break;
     }
+    if (targetNodes != nullptr && pendingTargets.empty()) {
+      break;
+    }
     const auto [t, u] = pq.top();
     pq.pop();
     const auto it = field.atNode.find(u);
     if (it == field.atNode.end() || t > it->second + 1e-6) {
       continue;
     }
+    if (pendingTargets.count(u) > 0) {
+      pendingTargets.erase(u);
+    }
 
     csr.forEachNeighbor(store, u, allowedEdgeIds, [&](const CsrArc& adj) {
       if (!edgeAllowedForVehicle(adj.type, type)) {
         return;
+      }
+      if (goalLatLon != nullptr && maxRadiusM > 0.0) {
+        double lat = 0.0;
+        double lon = 0.0;
+        if (!store.nodeLatLon(adj.toNodeId, lat, lon)) {
+          return;
+        }
+        if (haversineMeters(*goalLatLon, {lat, lon}) > maxRadiusM) {
+          return;
+        }
       }
       const double eff = csrArcEffectiveSpeedMs(adj.speedLimit, type, speedMs);
       const double w = travelTimeSeconds(adj.length, eff, type, param);
@@ -680,6 +711,186 @@ RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
   }
 
   return field;
+}
+
+std::vector<double> computeRoutedDistFromGoalCsrDense(
+    const GraphFileStore& store, const CsrGraph& csr, int64_t goalNodeId, double speedMs,
+    VehicleType type, const PredictParam& param, double maxTime,
+    const std::unordered_set<int64_t>* targetNodes, const LatLon* goalLatLon,
+    double maxRadiusM, std::vector<int64_t>* parentNodeByRow,
+    std::vector<int64_t>* parentEdgeByRow) {
+  const std::size_t n = csr.nodeCount();
+  std::vector<double> dist(n, kInfTime);
+  if (goalNodeId == 0 || maxTime <= 0.0 || !csr.isOpen() || n == 0) {
+    return dist;
+  }
+  const int goalRow = csr.nodeRow(store, goalNodeId);
+  if (goalRow < 0) {
+    return dist;
+  }
+  if (parentNodeByRow != nullptr) {
+    parentNodeByRow->assign(n, 0);
+  }
+  if (parentEdgeByRow != nullptr) {
+    parentEdgeByRow->assign(n, 0);
+  }
+
+  using QueueItem = std::tuple<double, int64_t>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+
+  std::unordered_set<int64_t> pendingTargets;
+  if (targetNodes != nullptr) {
+    pendingTargets = *targetNodes;
+  }
+
+  const std::size_t visitCap =
+      param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
+  std::size_t visited = 0;
+
+  auto relax = [&](int64_t nodeId, double t, int64_t parentNode, int64_t parentEdge) {
+    if (t > maxTime + 1e-9) {
+      return;
+    }
+    const int row = csr.nodeRow(store, nodeId);
+    if (row < 0) {
+      return;
+    }
+    if (t >= dist[static_cast<std::size_t>(row)] - 1e-9) {
+      return;
+    }
+    const bool firstReach = dist[static_cast<std::size_t>(row)] >= kInfTime / 2.0;
+    dist[static_cast<std::size_t>(row)] = t;
+    if (parentNodeByRow != nullptr && parentNode != 0) {
+      (*parentNodeByRow)[static_cast<std::size_t>(row)] = parentNode;
+    }
+    if (parentEdgeByRow != nullptr && parentEdge != 0) {
+      (*parentEdgeByRow)[static_cast<std::size_t>(row)] = parentEdge;
+    }
+    if (firstReach) {
+      ++visited;
+    }
+    pq.push({t, nodeId});
+  };
+
+  relax(goalNodeId, 0.0, 0, 0);
+
+  while (!pq.empty()) {
+    if (visited >= visitCap) {
+      break;
+    }
+    if (targetNodes != nullptr && pendingTargets.empty()) {
+      break;
+    }
+    const auto [t, u] = pq.top();
+    pq.pop();
+    const int uRow = csr.nodeRow(store, u);
+    if (uRow < 0 || t > dist[static_cast<std::size_t>(uRow)] + 1e-6) {
+      continue;
+    }
+    if (pendingTargets.count(u) > 0) {
+      pendingTargets.erase(u);
+    }
+
+    csr.forEachNeighbor(store, u, nullptr, [&](const CsrArc& adj) {
+      if (!edgeAllowedForVehicle(adj.type, type)) {
+        return;
+      }
+      if (goalLatLon != nullptr && maxRadiusM > 0.0) {
+        double lat = 0.0;
+        double lon = 0.0;
+        if (!store.nodeLatLon(adj.toNodeId, lat, lon)) {
+          return;
+        }
+        if (haversineMeters(*goalLatLon, {lat, lon}) > maxRadiusM) {
+          return;
+        }
+      }
+      const double eff = csrArcEffectiveSpeedMs(adj.speedLimit, type, speedMs);
+      const double w = travelTimeSeconds(adj.length, eff, type, param);
+      relax(adj.toNodeId, t + w, u, adj.edgeId);
+    });
+  }
+
+  return dist;
+}
+
+RoutePolyline polylineFromGoalCsrParents(const GraphFileStore& store, const CsrGraph& csr,
+                                         const std::vector<int64_t>& parentNodeByRow,
+                                         const std::vector<int64_t>& parentEdgeByRow,
+                                         int64_t startNodeId, int64_t goalNodeId) {
+  RoutePolyline route;
+  if (startNodeId == 0 || goalNodeId == 0 || parentNodeByRow.empty()) {
+    return route;
+  }
+
+  auto appendPt = [&](const LatLon& p) {
+    if (route.points.empty() || haversineMeters(route.points.back(), p) > 1.0) {
+      route.points.push_back(p);
+    }
+  };
+
+  int64_t cur = startNodeId;
+  double clat = 0.0;
+  double clon = 0.0;
+  if (store.nodeLatLon(cur, clat, clon)) {
+    appendPt({clat, clon});
+  }
+
+  while (cur != 0 && cur != goalNodeId) {
+    const int row = csr.nodeRow(store, cur);
+    if (row < 0 || static_cast<std::size_t>(row) >= parentNodeByRow.size()) {
+      break;
+    }
+    const int64_t parent = parentNodeByRow[static_cast<std::size_t>(row)];
+    if (parent == 0) {
+      break;
+    }
+    const int64_t edgeId =
+        static_cast<std::size_t>(row) < parentEdgeByRow.size()
+            ? parentEdgeByRow[static_cast<std::size_t>(row)]
+            : 0;
+    if (edgeId != 0) {
+      double flat = 0.0;
+      double flon = 0.0;
+      double tlat = 0.0;
+      double tlon = 0.0;
+      if (store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+        double plat = 0.0;
+        double plon = 0.0;
+        if (store.nodeLatLon(parent, plat, plon)) {
+          const double toFlat = haversineMeters({clat, clon}, {flat, flon});
+          const double toTlat = haversineMeters({clat, clon}, {tlat, tlon});
+          const double pToFlat = haversineMeters({plat, plon}, {flat, flon});
+          const double pToTlat = haversineMeters({plat, plon}, {tlat, tlon});
+          if (toFlat + pToTlat <= toTlat + pToFlat) {
+            appendPt({flat, flon});
+            appendPt({tlat, tlon});
+          } else {
+            appendPt({tlat, tlon});
+            appendPt({flat, flon});
+          }
+        } else {
+          appendPt({flat, flon});
+          appendPt({tlat, tlon});
+        }
+      }
+    } else if (store.nodeLatLon(parent, clat, clon)) {
+      appendPt({clat, clon});
+    }
+    cur = parent;
+    if (!store.nodeLatLon(cur, clat, clon)) {
+      break;
+    }
+  }
+
+  if (cur == goalNodeId) {
+    double glat = 0.0;
+    double glon = 0.0;
+    if (store.nodeLatLon(goalNodeId, glat, glon)) {
+      appendPt({glat, glon});
+    }
+  }
+  return route;
 }
 
 RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph& csr,
@@ -691,6 +902,12 @@ RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph&
     return result;
   }
 
+  const double travel = travelTimeFromRoutedFieldCsr(store, field, start, speedMs, type, param);
+  if (travel >= kInfTime / 2.0) {
+    return result;
+  }
+  result.travelTimeSec = travel;
+
   auto nodeTime = [&](int64_t nodeId) -> double {
     const auto it = field.atNode.find(nodeId);
     if (it == field.atNode.end()) {
@@ -698,31 +915,6 @@ RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph&
     }
     return it->second;
   };
-
-  double travel = kInfTime;
-  if (start.edgeId == 0) {
-    travel = nodeTime(start.nodeId);
-  } else {
-    int64_t from = 0;
-    int64_t to = 0;
-    EdgeType edgeType = EdgeType::ROAD;
-    double length = 0.0;
-    double speedLimit = 0.0;
-    if (store.edgeEndpoints(start.edgeId, from, to) &&
-        store.readEdge(start.edgeId, edgeType, length, speedLimit)) {
-      const double toFrom =
-          nodeTime(from) + travelTimeSeconds(start.alongMeters, speedMs, type, param);
-      const double toTo =
-          nodeTime(to) +
-          travelTimeSeconds(std::max(0.0, length - start.alongMeters), speedMs, type, param);
-      travel = std::min(toFrom, toTo);
-    }
-  }
-
-  if (travel >= kInfTime / 2.0) {
-    return result;
-  }
-  result.travelTimeSec = travel;
 
   int64_t startNode = 0;
   if (start.edgeId == 0) {
@@ -773,6 +965,42 @@ RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph&
   }
   (void)csr;
   return result;
+}
+
+double travelTimeFromRoutedFieldCsr(const GraphFileStore& store, const RoutedTimeField& field,
+                                    const GraphPosition& start, double speedMs, VehicleType type,
+                                    const PredictParam& param) {
+  if (!start.valid) {
+    return kInfTime;
+  }
+
+  auto nodeTime = [&](int64_t nodeId) -> double {
+    const auto it = field.atNode.find(nodeId);
+    if (it == field.atNode.end()) {
+      return kInfTime;
+    }
+    return it->second;
+  };
+
+  if (start.edgeId == 0) {
+    return nodeTime(start.nodeId);
+  }
+
+  int64_t from = 0;
+  int64_t to = 0;
+  EdgeType edgeType = EdgeType::ROAD;
+  double length = 0.0;
+  double speedLimit = 0.0;
+  if (!store.edgeEndpoints(start.edgeId, from, to) ||
+      !store.readEdge(start.edgeId, edgeType, length, speedLimit)) {
+    return kInfTime;
+  }
+  const double toFrom =
+      nodeTime(from) + travelTimeSeconds(start.alongMeters, speedMs, type, param);
+  const double toTo =
+      nodeTime(to) +
+      travelTimeSeconds(std::max(0.0, length - start.alongMeters), speedMs, type, param);
+  return std::min(toFrom, toTo);
 }
 
 }  // namespace mmlp

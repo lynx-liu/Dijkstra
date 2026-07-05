@@ -5,7 +5,6 @@
 
 #include "mmlp/ch_graph.hpp"
 #include "mmlp/csr_graph.hpp"
-#include "mmlp/rtile_index.hpp"
 
 #include <cstdint>
 #include <string>
@@ -42,12 +41,10 @@ class GraphFileStore {
   bool hasEdgeGeo() const { return egeo_.data != nullptr; }
   bool hasCsr() const { return csr_.isOpen(); }
   const CsrGraph& csr() const { return csr_; }
-  bool hasHighwayCsr() const { return hwyCsr_.isOpen(); }
-  const CsrGraph& highwayCsr() const { return hwyCsr_; }
-  bool hasHighwayCh() const { return hwyCh_.isOpen(); }
-  const ChGraph& highwayCh() const { return hwyCh_; }
-  bool hasRtiles() const { return rtiles_.isOpen(); }
-  const RtileIndex& rtiles() const { return rtiles_; }
+  bool hasHwyCsr() const { return hwyCsr_.isOpen(); }
+  const CsrGraph& hwyCsr() const { return hwyCsr_; }
+  bool hasCh() const { return ch_.isOpen(); }
+  const ChGraph& ch() const { return ch_; }
 
   // Row in nidx / CSR tables for a node id (-1 if missing).
   int nodeRowIndex(int64_t nodeId) const;
@@ -92,8 +89,7 @@ class GraphFileStore {
   std::size_t edgeGeoCount_ = 0;
   CsrGraph csr_;
   CsrGraph hwyCsr_;
-  ChGraph hwyCh_;
-  RtileIndex rtiles_;
+  ChGraph ch_;
   const IdOffset* nodeIndex_ = nullptr;
   std::size_t nodeCount_ = 0;
   const IdOffset* edgeIndex_ = nullptr;

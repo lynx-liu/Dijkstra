@@ -9,8 +9,9 @@ HOST="${HOST:-0.0.0.0}"
 GRAPH="${MMLP_GRAPH_PATH:-${ROOT}/data/graph/china.mmlp.bin}"
 BINARY="${ROOT}/build/mmlp_service"
 LOAD_MODE="${MMLP_LOAD_MODE:-index}"
-# Set to 0 to fail instead of auto-building missing index files.
 AUTO_BUILD_INDEX="${AUTO_BUILD_INDEX:-1}"
+RESTART="${RESTART:-1}"
+MMLP_WORKERS="${MMLP_WORKERS:-12}"
 
 if [[ ! -x "${BINARY}" ]]; then
   echo "ERROR: binaries not built. Run: bash tools/bootstrap_service.sh" >&2
@@ -24,6 +25,17 @@ fi
 BASE="${GRAPH%.bin}"
 index_ready() {
   [[ -f "${BASE}.sidx" && -f "${BASE}.nidx" && -f "${BASE}.eidx" ]]
+}
+
+regional_ready() {
+  local graph_dir graph_base prd
+  graph_dir="$(dirname "${GRAPH}")"
+  graph_base="$(basename "${GRAPH}" .bin)"
+  if [[ "${graph_base}" == *.mmlp ]]; then
+    graph_base="${graph_base%.mmlp}"
+  fi
+  prd="${graph_dir}/${graph_base}_prd.mmlp.bin"
+  [[ -f "${prd}" && -f "${prd%.bin}.sidx" && -f "${prd%.bin}.hwy.csr" && -f "${prd%.bin}.hwy.ch" ]]
 }
 
 if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
@@ -40,6 +52,17 @@ if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
   exit 1
 fi
 
+if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
+  echo "Regional PRD overlay missing; building (first time may take several minutes)..."
+  bash "${ROOT}/tools/build_region_graphs.sh" "${GRAPH}"
+fi
+
+if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
+  echo "ERROR: PRD regional graph or hwy overlay still missing after build." >&2
+  echo "Run: bash tools/bootstrap_service.sh" >&2
+  exit 1
+fi
+
 echo "=== MMLP HTTP service ==="
 echo "Graph: ${GRAPH}"
 MBTILES="${MMLP_MBTILES:-${ROOT}/data/map/china.mbtiles}"
@@ -49,12 +72,15 @@ else
   echo "Map: graph render — install: bash tools/download_mbtiles.sh"
 fi
 echo "Load mode: ${LOAD_MODE}"
+echo "Workers: ${MMLP_WORKERS}"
 if [[ "${LOAD_MODE}" == "full" ]]; then
   echo "Startup: full graph in RAM (~5 minutes)"
 else
   echo "Startup: spatial index only (usually under 1 minute)"
 fi
-echo "Listen: http://${HOST}:${PORT}  (GET /health, POST /api/vehicle, POST /api/meetings/lead)"
+echo "Listen: http://${HOST}:${PORT}"
+echo "  GET  /health /map"
+echo "  POST /api/vehicle /api/meetings/lead /api/destinations/arrive"
 echo ""
 
 port_in_use() {
@@ -70,7 +96,7 @@ port_in_use() {
 }
 
 if port_in_use; then
-  if [[ "${RESTART:-0}" == "1" ]]; then
+  if [[ "${RESTART}" == "1" ]]; then
     echo "Restarting: stopping existing service on port ${PORT} ..."
     pkill -f mmlp_http_server.py 2>/dev/null || true
     pkill -f mmlp_service 2>/dev/null || true
@@ -78,7 +104,7 @@ if port_in_use; then
   elif pgrep -f "mmlp_http_server.py" >/dev/null 2>&1; then
     echo "ERROR: port ${PORT} already in use (mmlp HTTP probably already running)." >&2
     echo "  curl http://127.0.0.1:${PORT}/health" >&2
-    echo "  To replace: pkill -f mmlp_http_server; RESTART=1 bash $0" >&2
+    echo "  To replace: RESTART=1 bash $0" >&2
     exit 1
   else
     echo "ERROR: port ${PORT} is in use by another process. Try PORT=8081 bash $0" >&2
@@ -87,4 +113,6 @@ if port_in_use; then
 fi
 
 export MMLP_LOAD_MODE="${LOAD_MODE}"
-exec python3 "${ROOT}/tools/mmlp_http_server.py" --host "${HOST}" --port "${PORT}" --graph "${GRAPH}" --binary "${BINARY}" --load-mode "${LOAD_MODE}"
+export MMLP_WORKERS="${MMLP_WORKERS}"
+exec python3 "${ROOT}/tools/mmlp_http_server.py" --host "${HOST}" --port "${PORT}" --graph "${GRAPH}" \
+  --binary "${BINARY}" --load-mode "${LOAD_MODE}"

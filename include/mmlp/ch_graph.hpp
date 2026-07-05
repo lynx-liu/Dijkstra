@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <mutex>
 #include <tuple>
 #include <vector>
 
@@ -39,6 +40,9 @@ class ChGraph {
                     int64_t toNodeId, VehicleType type, const PredictParam& param,
                     double maxTime) const;
 
+  // Build reverse adjacency once (deferred from mmap open for fast startup).
+  void warmReverseDown() const { ensureReverseDown(); }
+
  private:
   void* data_ = nullptr;
   std::size_t size_ = 0;
@@ -49,7 +53,11 @@ class ChGraph {
   const uint32_t* ranks_ = nullptr;
   const uint64_t* upRow_ = nullptr;
   const void* upArcs_ = nullptr;
+  mutable bool reverseDownBuilt_ = false;
+  mutable std::mutex reverseDownMu_;
   mutable std::vector<std::vector<std::tuple<int, int64_t, float>>> reverseDown_;
+
+  void ensureReverseDown() const;
 };
 
 }  // namespace mmlp

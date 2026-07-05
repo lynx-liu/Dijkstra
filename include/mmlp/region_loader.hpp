@@ -33,6 +33,10 @@ bool loadGraphContextRegion(const std::string& path, const GeoBBox& bbox, GraphC
 bool loadGraphContextFull(const std::string& path, GraphContext& ctx,
                           std::string* error = nullptr);
 
+// Regional: load graph into RAM + mmap .sidx (startup cost once, no per-request subgraph).
+bool loadGraphContextRegionalFull(const std::string& path, GraphContext& ctx,
+                                  std::string* error = nullptr);
+
 // Fast startup: load .sidx only; graph filled on demand per request.
 bool loadGraphContextIndexOnly(const std::string& binPath, GraphContext& ctx,
                                std::string* error = nullptr);
@@ -83,9 +87,6 @@ bool extractGraphContextForDestinationCorridorsIndexed(
     const GraphFileStore& store, const SpatialIndex& index,
     const std::vector<VehicleInfo>& vehicles, double destLat, double destLon,
     double maxCorridorWidthM, GraphContext& out, std::string* error = nullptr);
-
-void collectEdgesInBboxIndexed(const GraphFileStore& store, const SpatialIndex& index,
-                               const GeoBBox& box, std::unordered_set<int64_t>& edgeIds);
 
 bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
                                           const std::vector<VehicleInfo>& vehicles,

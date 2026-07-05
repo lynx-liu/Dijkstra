@@ -27,6 +27,7 @@ class MultimodalGraph {
 
   // Fast path for mmap subgraph extract: dense vector adjacency, no hash adjacency build.
   void buildFromSubset(std::vector<Node>&& nodes, std::vector<Edge>&& edges);
+  void buildDenseAdjacency();
 
   const std::vector<Node>& nodes() const { return nodes_; }
   const std::vector<Edge>& edges() const { return edges_; }

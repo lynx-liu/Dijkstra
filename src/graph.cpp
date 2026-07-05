@@ -117,6 +117,51 @@ void MultimodalGraph::buildFromSubset(std::vector<Node>&& nodes, std::vector<Edg
   }
 }
 
+void MultimodalGraph::buildDenseAdjacency() {
+  if (nodes_.empty() || edges_.empty()) {
+    return;
+  }
+  denseAdjacency_.assign(nodes_.size(), {});
+  std::vector<std::size_t> degree(nodes_.size(), 0);
+  for (const Edge& edge : edges_) {
+    const auto fromIt = nodeIndex_.find(edge.from);
+    const auto toIt = nodeIndex_.find(edge.to);
+    if (fromIt == nodeIndex_.end() || toIt == nodeIndex_.end()) {
+      continue;
+    }
+    degree[fromIt->second]++;
+    degree[toIt->second]++;
+  }
+  for (std::size_t i = 0; i < nodes_.size(); ++i) {
+    denseAdjacency_[i].reserve(degree[i]);
+  }
+  for (const Edge& edge : edges_) {
+    const auto fromIt = nodeIndex_.find(edge.from);
+    const auto toIt = nodeIndex_.find(edge.to);
+    if (fromIt == nodeIndex_.end() || toIt == nodeIndex_.end()) {
+      continue;
+    }
+    AdjacencyEdge out;
+    out.edgeId = edge.id;
+    out.to = edge.to;
+    out.type = edge.type;
+    out.length = edge.length;
+    out.speedLimit = edge.speedLimit;
+    denseAdjacency_[fromIt->second].push_back(out);
+
+    AdjacencyEdge back;
+    back.edgeId = edge.id;
+    back.to = edge.from;
+    back.type = edge.type;
+    back.length = edge.length;
+    back.speedLimit = edge.speedLimit;
+    denseAdjacency_[toIt->second].push_back(back);
+  }
+  adjacency_.clear();
+  adjacency_.rehash(0);
+  useDenseAdjacency_ = true;
+}
+
 void MultimodalGraph::addNode(Node node) {
   if (nodeIndex_.count(node.id) > 0) {
     return;

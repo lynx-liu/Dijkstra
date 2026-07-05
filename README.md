@@ -26,6 +26,14 @@ bash tools/bootstrap_service.sh
 bash tools/start_http_server.sh
 ```
 
+`bootstrap` 会增量编译并确保 **PRD 区域图 + hwy overlay**（广州/珠三角目的地到达所需）。`start_http_server.sh` 默认 `MMLP_WORKERS=12`，端口占用时自动重启旧进程。
+
+验证目的地到达（需服务运行中）：
+
+```bash
+python3 tools/bench_dest_arrive.py --label verify --runs 3
+```
+
 启动后在浏览器打开 **http://127.0.0.1:8080/map**，可实时查看 POST 上报的车辆位置、会合点及两车路径（点击标记查看详情，页面每 2 秒自动刷新）。
 
 > **地图底图（推荐）**：运行 `bash tools/download_mbtiles.sh` 安装离线 Shortbread 矢量 mbtiles（约 2 GB，含道路与地名，无外网 CDN）；未安装时回退为路网实时渲染。详见 [tools/prepare_offline_map.md](tools/prepare_offline_map.md)。

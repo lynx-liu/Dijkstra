@@ -4,10 +4,14 @@
 #include "mmlp/routing.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <chrono>
+#include <iostream>
+#include <mutex>
 #include <queue>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -46,6 +50,7 @@ ChGraph::~ChGraph() {
   }
   data_ = nullptr;
   reverseDown_.clear();
+  reverseDownBuilt_ = false;
 }
 
 bool ChGraph::open(const std::string& path, std::string* error) {
@@ -61,6 +66,7 @@ bool ChGraph::open(const std::string& path, std::string* error) {
     data_ = nullptr;
   }
   reverseDown_.clear();
+  reverseDownBuilt_ = false;
 
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -117,7 +123,17 @@ bool ChGraph::open(const std::string& path, std::string* error) {
   upRow_ = reinterpret_cast<const uint64_t*>(base + off);
   off += rowBytes;
   upArcs_ = base + off;
+  return true;
+}
 
+void ChGraph::ensureReverseDown() const {
+  if (reverseDownBuilt_ || !isOpen()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(reverseDownMu_);
+  if (reverseDownBuilt_) {
+    return;
+  }
   reverseDown_.assign(nodeCount_, {});
   for (std::size_t u = 0; u < nodeCount_; ++u) {
     const uint64_t begin = upRow_[u];
@@ -132,7 +148,10 @@ bool ChGraph::open(const std::string& path, std::string* error) {
           {static_cast<int>(u), arc->edgeId, arc->length});
     }
   }
-  return true;
+  reverseDownBuilt_ = true;
+  std::cerr << "[mmlp] ch reverse-down ready nodes=" << nodeCount_ << " arcs=" << upArcCount_
+            << "\n"
+            << std::flush;
 }
 
 int ChGraph::nodeIndex(int64_t nodeId) const {
@@ -157,6 +176,8 @@ RouteToGoal ChGraph::query(const GraphFileStore& store, const CsrGraph& hwyCsr,
     return result;
   }
 
+  ensureReverseDown();
+
   const int fromIdx = nodeIndex(fromNodeId);
   const int toIdx = nodeIndex(toNodeId);
   if (fromIdx < 0 || toIdx < 0) {
@@ -167,116 +188,189 @@ RouteToGoal ChGraph::query(const GraphFileStore& store, const CsrGraph& hwyCsr,
     return result;
   }
 
+  const uint32_t rankFrom = ranks_[static_cast<std::size_t>(fromIdx)];
+  const uint32_t rankTo = ranks_[static_cast<std::size_t>(toIdx)];
+
   const auto weightOf = [&](int64_t edgeId, float lengthM) -> double {
-  (void)edgeId;
+    (void)edgeId;
     return arcWeightSec(lengthM, profileKmh_, type, param);
   };
 
   using QItem = std::tuple<double, int>;
-  std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pqUp;
-  std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pqDown;
+  std::vector<double> distFwd(nodeCount_, kInf);
+  std::vector<double> distBwd(nodeCount_, kInf);
+  std::vector<int> parentFwd(nodeCount_, -1);
+  std::vector<int64_t> parentEdgeFwd(nodeCount_, 0);
+  std::vector<int> parentBwd(nodeCount_, -1);
+  std::vector<int64_t> parentEdgeBwd(nodeCount_, 0);
 
-  std::vector<double> distUp(nodeCount_, kInf);
-  std::vector<double> distDown(nodeCount_, kInf);
-  std::vector<int> parentUp(nodeCount_, -1);
-  std::vector<int64_t> parentEdgeUp(nodeCount_, 0);
-  std::vector<int> parentDown(nodeCount_, -1);
-  std::vector<int64_t> parentEdgeDown(nodeCount_, 0);
+  const bool fwdUp = rankFrom <= rankTo;
+  const bool bwdUp = rankTo <= rankFrom;
 
-  distUp[static_cast<std::size_t>(fromIdx)] = 0.0;
-  pqUp.push({0.0, fromIdx});
-  distDown[static_cast<std::size_t>(toIdx)] = 0.0;
-  pqDown.push({0.0, toIdx});
+  auto runSearch = [&](int start, bool upward, std::vector<double>& dist, std::vector<int>& parent,
+                       std::vector<int64_t>& parentEdge) {
+    std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
+    dist[static_cast<std::size_t>(start)] = 0.0;
+    pq.push({0.0, start});
+    while (!pq.empty()) {
+      const auto [du, u] = pq.top();
+      pq.pop();
+      if (du > dist[static_cast<std::size_t>(u)] + 1e-9 || du > maxTime + 1e-9) {
+        continue;
+      }
+      if (upward) {
+        const uint64_t begin = upRow_[static_cast<std::size_t>(u)];
+        const uint64_t end = upRow_[static_cast<std::size_t>(u) + 1];
+        for (uint64_t i = begin; i < end; ++i) {
+          const auto* arc = reinterpret_cast<const ChUpArcRec*>(upArcs_) + i;
+          const int v = nodeIndex(arc->toNodeId);
+          if (v < 0) {
+            continue;
+          }
+          const double nd = du + weightOf(arc->edgeId, arc->length);
+          if (nd < dist[static_cast<std::size_t>(v)] - 1e-9) {
+            dist[static_cast<std::size_t>(v)] = nd;
+            parent[static_cast<std::size_t>(v)] = u;
+            parentEdge[static_cast<std::size_t>(v)] = arc->edgeId;
+            pq.push({nd, v});
+          }
+        }
+      } else {
+        for (const auto& downArc : reverseDown_[static_cast<std::size_t>(u)]) {
+          const int v = std::get<0>(downArc);
+          const int64_t edgeId = std::get<1>(downArc);
+          const float lengthM = std::get<2>(downArc);
+          const double nd = du + weightOf(edgeId, lengthM);
+          if (nd < dist[static_cast<std::size_t>(v)] - 1e-9) {
+            dist[static_cast<std::size_t>(v)] = nd;
+            parent[static_cast<std::size_t>(v)] = u;
+            parentEdge[static_cast<std::size_t>(v)] = edgeId;
+            pq.push({nd, v});
+          }
+        }
+      }
+    }
+  };
+
+  runSearch(fromIdx, fwdUp, distFwd, parentFwd, parentEdgeFwd);
+  runSearch(toIdx, bwdUp, distBwd, parentBwd, parentEdgeBwd);
 
   double best = kInf;
   int meet = -1;
-
-  while (!pqUp.empty() || !pqDown.empty()) {
-  if (!pqUp.empty() &&
-        (pqDown.empty() || std::get<0>(pqUp.top()) <= std::get<0>(pqDown.top()))) {
-      const auto [du, u] = pqUp.top();
-      pqUp.pop();
-      if (du > distUp[static_cast<std::size_t>(u)] + 1e-9) {
-        continue;
-      }
-      if (distDown[static_cast<std::size_t>(u)] < kInf / 2.0) {
-        const double total = du + distDown[static_cast<std::size_t>(u)];
-        if (total < best) {
-          best = total;
-          meet = u;
-        }
-      }
-      if (du > best + 1e-9 || du > maxTime + 1e-9) {
-        continue;
-      }
-
-      const uint64_t begin = upRow_[static_cast<std::size_t>(u)];
-      const uint64_t end = upRow_[static_cast<std::size_t>(u) + 1];
-      for (uint64_t i = begin; i < end; ++i) {
-        const auto* arc = reinterpret_cast<const ChUpArcRec*>(upArcs_) + i;
-        const int v = nodeIndex(arc->toNodeId);
-        if (v < 0) {
-          continue;
-        }
-        const double w = weightOf(arc->edgeId, arc->length);
-        const double nd = du + w;
-        if (nd < distUp[static_cast<std::size_t>(v)] - 1e-9) {
-          distUp[static_cast<std::size_t>(v)] = nd;
-          parentUp[static_cast<std::size_t>(v)] = u;
-          parentEdgeUp[static_cast<std::size_t>(v)] = arc->edgeId;
-          pqUp.push({nd, v});
-        }
-      }
-    } else if (!pqDown.empty()) {
-      const auto [dd, v] = pqDown.top();
-      pqDown.pop();
-      if (dd > distDown[static_cast<std::size_t>(v)] + 1e-9) {
-        continue;
-      }
-      if (distUp[static_cast<std::size_t>(v)] < kInf / 2.0) {
-        const double total = distUp[static_cast<std::size_t>(v)] + dd;
-        if (total < best) {
-          best = total;
-          meet = v;
-        }
-      }
-      if (dd > best + 1e-9 || dd > maxTime + 1e-9) {
-        continue;
-      }
-
-      for (const auto& downArc : reverseDown_[static_cast<std::size_t>(v)]) {
-        const int u = std::get<0>(downArc);
-        const int64_t edgeId = std::get<1>(downArc);
-        const float lengthM = std::get<2>(downArc);
-        const double w = weightOf(edgeId, lengthM);
-        const double nd = dd + w;
-        if (nd < distDown[static_cast<std::size_t>(u)] - 1e-9) {
-          distDown[static_cast<std::size_t>(u)] = nd;
-          parentDown[static_cast<std::size_t>(u)] = v;
-          parentEdgeDown[static_cast<std::size_t>(u)] = edgeId;
-          pqDown.push({nd, u});
-        }
+  for (std::size_t u = 0; u < nodeCount_; ++u) {
+    if (distFwd[u] < kInf / 2.0 && distBwd[u] < kInf / 2.0) {
+      const double total = distFwd[u] + distBwd[u];
+      if (total < best) {
+        best = total;
+        meet = static_cast<int>(u);
       }
     }
   }
 
   if (meet < 0 || best >= kInf / 2.0 || best > maxTime + 1e-6) {
+    if (!hwyCsr.isOpen()) {
+      return result;
+    }
+    const int fromRow = hwyCsr.nodeRow(store, fromNodeId);
+    const int toRow = hwyCsr.nodeRow(store, toNodeId);
+    if (fromRow < 0 || toRow < 0) {
+      return result;
+    }
+    using QItem = std::tuple<double, int64_t>;
+    std::vector<double> dist(hwyCsr.nodeCount(), kInf);
+    std::vector<int64_t> parent(hwyCsr.nodeCount(), 0);
+    std::vector<int64_t> parentEdge(hwyCsr.nodeCount(), 0);
+    std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
+    dist[static_cast<std::size_t>(fromRow)] = 0.0;
+    pq.push({0.0, fromNodeId});
+    while (!pq.empty()) {
+      const auto [du, u] = pq.top();
+      pq.pop();
+      const int uRow = hwyCsr.nodeRow(store, u);
+      if (uRow < 0 || du > dist[static_cast<std::size_t>(uRow)] + 1e-9 ||
+          du > maxTime + 1e-9) {
+        continue;
+      }
+      if (u == toNodeId) {
+        result.travelTimeSec = du;
+        std::vector<int64_t> edgePath;
+        for (int64_t cur = u; cur != fromNodeId;) {
+          const int curRow = hwyCsr.nodeRow(store, cur);
+          if (curRow < 0) {
+            break;
+          }
+          const int64_t edgeId = parentEdge[static_cast<std::size_t>(curRow)];
+          if (edgeId != 0) {
+            edgePath.push_back(edgeId);
+          }
+          const int64_t prev = parent[static_cast<std::size_t>(curRow)];
+          if (prev == 0 || prev == cur) {
+            break;
+          }
+          cur = prev;
+        }
+        std::reverse(edgePath.begin(), edgePath.end());
+        RoutePolyline& route = result.polyline;
+        route.points.reserve(edgePath.size() + 2);
+        double flat = 0.0;
+        double flon = 0.0;
+        double tlat = 0.0;
+        double tlon = 0.0;
+        if (store.nodeLatLon(fromNodeId, flat, flon)) {
+          route.points.push_back({flat, flon});
+        }
+        for (int64_t edgeId : edgePath) {
+          if (!store.edgeEndpointLatLon(edgeId, flat, flon, tlat, tlon)) {
+            continue;
+          }
+          if (route.points.empty() || haversineMeters(route.points.back(), {flat, flon}) > 1.0) {
+            route.points.push_back({flat, flon});
+          }
+          route.points.push_back({tlat, tlon});
+        }
+        if (store.nodeLatLon(toNodeId, flat, flon)) {
+          if (route.points.empty() || haversineMeters(route.points.back(), {flat, flon}) > 1.0) {
+            route.points.push_back({flat, flon});
+          }
+        }
+        if (std::getenv("MMLP_DEBUG_CH")) {
+          std::cerr << "[mmlp] ch csr_fallback travel=" << du << " pts=" << route.points.size()
+                    << "\n"
+                    << std::flush;
+        }
+        return result;
+      }
+      hwyCsr.forEachNeighbor(store, u, nullptr, [&](const CsrArc& arc) {
+        const int vRow = hwyCsr.nodeRow(store, arc.toNodeId);
+        if (vRow < 0) {
+          return;
+        }
+        const double w = arcWeightSec(arc.length, profileKmh_, type, param);
+        const double nd = du + w;
+        if (nd < dist[static_cast<std::size_t>(vRow)] - 1e-9) {
+          dist[static_cast<std::size_t>(vRow)] = nd;
+          parent[static_cast<std::size_t>(vRow)] = u;
+          parentEdge[static_cast<std::size_t>(vRow)] = arc.edgeId;
+          pq.push({nd, arc.toNodeId});
+        }
+      });
+    }
     return result;
   }
 
   std::vector<int64_t> edgePath;
-  for (int cur = meet; cur != fromIdx; cur = parentUp[static_cast<std::size_t>(cur)]) {
+  for (int cur = meet; cur != fromIdx; cur = parentFwd[static_cast<std::size_t>(cur)]) {
     if (cur < 0) {
       return result;
     }
-    edgePath.push_back(parentEdgeUp[static_cast<std::size_t>(cur)]);
+    edgePath.push_back(parentEdgeFwd[static_cast<std::size_t>(cur)]);
   }
   std::reverse(edgePath.begin(), edgePath.end());
-  for (int cur = meet; cur != toIdx; cur = parentDown[static_cast<std::size_t>(cur)]) {
+  for (int cur = meet; cur != toIdx; cur = parentBwd[static_cast<std::size_t>(cur)]) {
     if (cur < 0) {
       return result;
     }
-    const int64_t edgeId = parentEdgeDown[static_cast<std::size_t>(cur)];
+    const int64_t edgeId = parentEdgeBwd[static_cast<std::size_t>(cur)];
     if (edgeId != 0) {
       edgePath.push_back(edgeId);
     }

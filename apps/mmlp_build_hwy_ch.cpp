@@ -102,7 +102,8 @@ bool witnessPath(const Graph& g, int source, int target, int banned, float maxSe
   dist[static_cast<std::size_t>(source)] = 0.0f;
   pq.push({0.0f, source});
   std::size_t visited = 0;
-  while (!pq.empty() && visited < 800) {
+  constexpr std::size_t kWitnessVisitCap = 50000;
+  while (!pq.empty() && visited < kWitnessVisitCap) {
     const auto [d, u] = pq.top();
     pq.pop();
     if (d > dist[static_cast<std::size_t>(u)] + 1e-6f) {

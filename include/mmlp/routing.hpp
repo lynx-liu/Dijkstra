@@ -66,7 +66,9 @@ RoutedTimeField computeRoutedTimeFieldFromGoal(const MultimodalGraph& graph,
                                                VehicleType type, const PredictParam& param,
                                                double maxTime,
                                                const std::unordered_set<int64_t>* targetNodes =
-                                                   nullptr);
+                                                   nullptr,
+                                               const LatLon* goalLatLon = nullptr,
+                                               double maxRadiusM = 0.0);
 
 RouteToGoal routeFromRoutedField(const MultimodalGraph& graph, const RoutedTimeField& field,
                                  const GraphPosition& start, const GraphPosition& goal,
@@ -75,11 +77,32 @@ RouteToGoal routeFromRoutedField(const MultimodalGraph& graph, const RoutedTimeF
 RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
     const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
     VehicleType type, const PredictParam& param, double maxTime,
-    const std::unordered_set<int64_t>* allowedEdgeIds);
+    const std::unordered_set<int64_t>* allowedEdgeIds,
+    const std::unordered_set<int64_t>* targetNodes = nullptr,
+    const LatLon* goalLatLon = nullptr, double maxRadiusM = 0.0);
+
+// Row-indexed dist from goal on mmap CSR (overlay-sized graphs).
+// Optional parentNodeByRow / parentEdgeByRow (size csr.nodeCount) trace routes toward goal.
+std::vector<double> computeRoutedDistFromGoalCsrDense(
+    const GraphFileStore& store, const CsrGraph& csr, int64_t goalNodeId, double speedMs,
+    VehicleType type, const PredictParam& param, double maxTime,
+    const std::unordered_set<int64_t>* targetNodes = nullptr,
+    const LatLon* goalLatLon = nullptr, double maxRadiusM = 0.0,
+    std::vector<int64_t>* parentNodeByRow = nullptr,
+    std::vector<int64_t>* parentEdgeByRow = nullptr);
+
+RoutePolyline polylineFromGoalCsrParents(const GraphFileStore& store, const CsrGraph& csr,
+                                         const std::vector<int64_t>& parentNodeByRow,
+                                         const std::vector<int64_t>& parentEdgeByRow,
+                                         int64_t startNodeId, int64_t goalNodeId);
 
 RouteToGoal routeFromRoutedFieldCsr(const GraphFileStore& store, const CsrGraph& csr,
                                     const RoutedTimeField& field, const GraphPosition& start,
                                     const GraphPosition& goal, double speedMs, VehicleType type,
+                                    const PredictParam& param);
+
+double travelTimeFromRoutedFieldCsr(const GraphFileStore& store, const RoutedTimeField& field,
+                                    const GraphPosition& start, double speedMs, VehicleType type,
                                     const PredictParam& param);
 
 // Downsample for API/map (full junction trace can be 10k+ points on long haul).

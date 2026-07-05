@@ -3,6 +3,7 @@
 #include "mmlp/geo.hpp"
 #include "mmlp/graph_io.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -451,6 +452,37 @@ bool loadGraphContextFull(const std::string& path, GraphContext& ctx, std::strin
   return true;
 }
 
+bool loadGraphContextRegionalFull(const std::string& path, GraphContext& ctx, std::string* error) {
+  auto fail = [&](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  std::cerr << "[mmlp] loading regional full graph from " << path << " ...\n" << std::flush;
+  if (!loadGraphFromFile(path, ctx.graph, error)) {
+    return false;
+  }
+  ctx.graph.buildDenseAdjacency();
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto dot = path.rfind('.');
+  const std::string base = (dot == std::string::npos) ? path : path.substr(0, dot);
+  std::cerr << "[mmlp] mmap regional spatial index from " << base << ".sidx ...\n" << std::flush;
+  if (!ctx.index.loadFromFile(base + ".sidx", error)) {
+  std::cerr << "[mmlp] regional sidx mmap failed, rebuilding index ...\n" << std::flush;
+    ctx.index.build(ctx.graph);
+  }
+  const auto t2 = std::chrono::steady_clock::now();
+  std::cerr << "[mmlp] regional full ready nodes=" << ctx.graph.nodes().size()
+            << " edges=" << ctx.graph.edges().size()
+            << " load_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+            << " index_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+            << "\n"
+            << std::flush;
+  return true;
+}
+
 bool loadGraphContextIndexOnly(const std::string& binPath, GraphContext& ctx, std::string* error) {
   if (!graphAuxiliaryReady(binPath)) {
     if (error) {
@@ -468,26 +500,7 @@ bool loadGraphContextIndexOnly(const std::string& binPath, GraphContext& ctx, st
   return true;
 }
 
-void collectEdgesInBboxIndexed(const GraphFileStore& store, const SpatialIndex& index,
-                               const GeoBBox& box, std::unordered_set<int64_t>& edgeIds) {
-  // Broken/legacy rtidx files can hold tens of millions of one-cell tiles; sidx is faster.
-  constexpr std::size_t kMaxRtilesLinear = 500000;
-  if (store.hasRtiles() && store.rtiles().tileCount() <= kMaxRtilesLinear) {
-    store.rtiles().collectEdgesInBBox(box, edgeIds);
-  }
-  if (edgeIds.empty()) {
-    index.collectEdgesInBBox(box, edgeIds);
-  }
-}
-
 namespace {
-
-double destinationCorridorWidthM(double distM, double maxCorridorWidthM) {
-  if (distM > 40000.0) {
-    return std::min(maxCorridorWidthM, 22000.0);
-  }
-  return std::min(maxCorridorWidthM, distM * 0.35 + 12000.0);
-}
 
 void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialIndex& index,
                                    const LatLon& a, const LatLon& b, double widthMeters,
@@ -498,7 +511,7 @@ void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialInd
   {
     std::unordered_set<int64_t> bucket;
     bucket.reserve(80000);
-    collectEdgesInBboxIndexed(store, index, box, bucket);
+    index.collectEdgesInBBox(box, bucket);
     candidates.assign(bucket.begin(), bucket.end());
   }
   if (candidates.empty()) {
@@ -548,6 +561,23 @@ void collectCorridorEdgeIdsIndexed(const GraphFileStore& store, const SpatialInd
 }
 
 }  // namespace
+
+double destinationCorridorWidthM(double distM, double maxCorridorWidthM) {
+  // Dense metro last-mile: keep corridors narrow to avoid million-edge PRD subgraphs.
+  if (distM < 15000.0) {
+    return std::min(maxCorridorWidthM, std::max(5000.0, distM * 0.5 + 4000.0));
+  }
+  if (distM < 50000.0) {
+    return std::min(maxCorridorWidthM, std::max(7000.0, distM * 0.18 + 5000.0));
+  }
+  if (distM < 100000.0) {
+    return std::min(maxCorridorWidthM, std::max(9000.0, distM * 0.12 + 6000.0));
+  }
+  if (distM > 400000.0) {
+    return std::min(maxCorridorWidthM, 22000.0);
+  }
+  return std::min(maxCorridorWidthM, distM * 0.20 + 8000.0);
+}
 
 bool extractGraphContextForMeetingIndexed(const GraphFileStore& store, const SpatialIndex& index,
                                           const VehicleInfo& focal,
@@ -651,7 +681,7 @@ bool collectDestinationBBoxEdgeIdsIndexed(const GraphFileStore& store, const Spa
   }
 
   const GeoBBox box = bboxFromVehicles(vehicles, paddingMeters);
-  collectEdgesInBboxIndexed(store, index, box, edgeIds);
+  index.collectEdgesInBBox(box, edgeIds);
   if (edgeIds.empty()) {
     return fail("no graph edges in destination bbox");
   }
@@ -819,7 +849,7 @@ bool collectDestinationCorridorBboxEdgeIdsIndexed(
     }
     const LatLon vehLl{vehicle.lat, vehicle.lon};
     const double dist = haversineMeters(vehLl, destLl);
-    const double width = std::min(maxCorridorWidthM, dist * 0.35 + 12000.0);
+    const double width = destinationCorridorWidthM(dist, maxCorridorWidthM);
     const GeoBBox box = bboxAroundSegment(vehLl, destLl, width);
     index.collectEdgesInBBox(box, edgeIds);
     const GeoBBox vehBox = bboxAroundSegment(vehLl, vehLl, 8000.0);

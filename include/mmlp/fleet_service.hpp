@@ -73,10 +73,20 @@ class FleetMeetingService {
                                      double paddingMeters, const GraphContext*& sub,
                                      std::string* error);
 
+  const char* regionSuffixForPoint(double lat, double lon) const;
+  bool ensureRegionalGraph(const std::string& suffix, std::string* error);
+
   std::string graphPath_;
   double paddingMeters_;
   GraphFileStore graphStore_;
   GraphContext ctx_;
+  struct RegionalGraph {
+    GraphFileStore store;
+    GraphContext ctx;
+    bool ready = false;
+    bool fullGraph = false;
+  };
+  std::unordered_map<std::string, RegionalGraph> regionalGraphs_;
   GeoBBox loadedBBox_{};
   bool graphReady_ = false;
   bool fullGraphLoaded_ = false;
