@@ -51,6 +51,8 @@ GraphPosition positionAtTime(const MultimodalGraph& graph, const GraphPosition& 
 
 LatLon positionLatLon(const MultimodalGraph& graph, const GraphPosition& pos);
 
+LatLon positionLatLonStore(const GraphFileStore& store, const GraphPosition& pos);
+
 struct RouteToGoal {
   double travelTimeSec = kInfTime;
   RoutePolyline polyline;
@@ -90,6 +92,15 @@ std::vector<double> computeRoutedDistFromGoalCsrDense(
     const LatLon* goalLatLon = nullptr, double maxRadiusM = 0.0,
     std::vector<int64_t>* parentNodeByRow = nullptr,
     std::vector<int64_t>* parentEdgeByRow = nullptr);
+
+std::vector<double> computeRoutedDistFromGoalCsrDense(
+    const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
+    VehicleType type, const PredictParam& param, double maxTime,
+    const std::unordered_set<int64_t>* targetNodes = nullptr,
+    const LatLon* goalLatLon = nullptr, double maxRadiusM = 0.0,
+    std::vector<int64_t>* parentNodeByRow = nullptr,
+    std::vector<int64_t>* parentEdgeByRow = nullptr,
+    int64_t* goalNodeIdOut = nullptr);
 
 RoutePolyline polylineFromGoalCsrParents(const GraphFileStore& store, const CsrGraph& csr,
                                          const std::vector<int64_t>& parentNodeByRow,

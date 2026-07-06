@@ -1366,6 +1366,127 @@ struct CachedLocalDestField {
 std::shared_mutex localDestFieldCacheMu;
 std::shared_ptr<CachedLocalDestField> localDestFieldCache;
 
+struct CachedMetroRegionalField {
+  uint64_t key = 0;
+  GraphPosition goalPos;
+  int64_t goalNodeId = 0;
+  std::vector<double> distByRow;
+  std::vector<int64_t> parentNodeByRow;
+  std::vector<int64_t> parentEdgeByRow;
+  double maxRadiusM = 0.0;
+};
+
+std::shared_mutex metroRegionalFieldCacheMu;
+std::shared_ptr<CachedMetroRegionalField> metroRegionalFieldCache;
+
+uint64_t metroRegionalFieldKey(const DestinationQuery& dest, double speedMs, double maxRadiusM) {
+  const int speedBucket = static_cast<int>(std::floor(speedMs * 3.6 / 10.0));
+  return destRouteCacheKey(dest, maxRadiusM) ^
+         (static_cast<uint64_t>(speedBucket) << 32);
+}
+
+double bucketMetroRadiusM(double spanM) {
+  double r = std::min(150000.0, std::max(80000.0, spanM + 25000.0));
+  return std::ceil(r / 10000.0) * 10000.0;
+}
+
+int64_t resolveDenseStartNode(const GraphFileStore& store, const CsrGraph& csr,
+                              const std::vector<double>& distByRow, const GraphPosition& start,
+                              double speedMs, VehicleType type, const PredictParam& param) {
+  if (!start.valid || distByRow.empty()) {
+    return 0;
+  }
+  auto nodeTime = [&](int64_t nodeId) -> double {
+    const int row = csr.nodeRow(store, nodeId);
+    if (row < 0 || static_cast<std::size_t>(row) >= distByRow.size()) {
+      return kInfTime;
+    }
+    return distByRow[static_cast<std::size_t>(row)];
+  };
+  if (start.edgeId == 0) {
+    return start.nodeId;
+  }
+  int64_t from = 0;
+  int64_t to = 0;
+  EdgeType edgeType = EdgeType::ROAD;
+  double length = 0.0;
+  double speedLimit = 0.0;
+  if (!store.edgeEndpoints(start.edgeId, from, to) ||
+      !store.readEdge(start.edgeId, edgeType, length, speedLimit)) {
+    return 0;
+  }
+  const double toFrom =
+      nodeTime(from) + travelTimeSeconds(start.alongMeters, speedMs, type, param);
+  const double toTo =
+      nodeTime(to) +
+      travelTimeSeconds(std::max(0.0, length - start.alongMeters), speedMs, type, param);
+  return (toFrom <= toTo) ? from : to;
+}
+
+std::shared_ptr<CachedMetroRegionalField> getOrBuildMetroRegionalField(
+    const GraphFileStore& store, const SpatialIndex& matchIndex, const DestinationQuery& dest,
+    double groupSpeedMs, double fieldHorizon, double maxRadiusM, const PredictParam& param,
+    const std::unordered_set<int64_t>* targetNodes, bool* cacheHitOut = nullptr) {
+  const uint64_t key = metroRegionalFieldKey(dest, groupSpeedMs, maxRadiusM);
+  {
+    std::shared_lock<std::shared_mutex> read(metroRegionalFieldCacheMu);
+    if (metroRegionalFieldCache && metroRegionalFieldCache->key == key &&
+        !metroRegionalFieldCache->distByRow.empty()) {
+      if (cacheHitOut != nullptr) {
+        *cacheHitOut = true;
+      }
+      return metroRegionalFieldCache;
+    }
+  }
+  if (cacheHitOut != nullptr) {
+    *cacheHitOut = false;
+  }
+
+  const auto tBuild0 = std::chrono::steady_clock::now();
+  VehicleInfo destProbe;
+  destProbe.id = "destination";
+  destProbe.lat = dest.lat;
+  destProbe.lon = dest.lon;
+  destProbe.type = dest.type;
+  destProbe.speed = 60.0;
+  destProbe.timestamp = dest.arriveByUnix;
+  const GraphPosition goalPos = matchVehicleToGraphIndexed(store, matchIndex, destProbe);
+  if (!goalPos.valid) {
+    return nullptr;
+  }
+
+  PredictParam routeParam = param;
+  routeParam.maxVisitedNodes = 0;
+  const CsrGraph& csr = store.csr();
+  const LatLon goalLl{dest.lat, dest.lon};
+
+  auto cached = std::make_shared<CachedMetroRegionalField>();
+  cached->key = key;
+  cached->goalPos = goalPos;
+  cached->maxRadiusM = maxRadiusM;
+  int64_t goalNodeId = 0;
+  cached->distByRow = computeRoutedDistFromGoalCsrDense(
+      store, csr, goalPos, groupSpeedMs, dest.type, routeParam, fieldHorizon, targetNodes, &goalLl,
+      maxRadiusM, &cached->parentNodeByRow, &cached->parentEdgeByRow, &goalNodeId);
+  cached->goalNodeId = goalNodeId;
+
+  std::unique_lock<std::shared_mutex> write(metroRegionalFieldCacheMu);
+  if (!metroRegionalFieldCache || metroRegionalFieldCache->key != key) {
+    metroRegionalFieldCache = cached;
+  }
+  const auto buildMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                          tBuild0)
+          .count();
+  if (buildMs >= 200) {
+    std::cerr << "[mmlp] metro_field build_ms=" << buildMs
+              << " targets=" << (targetNodes != nullptr ? targetNodes->size() : 0)
+              << " horizon_s=" << static_cast<int>(fieldHorizon) << "\n"
+              << std::flush;
+  }
+  return metroRegionalFieldCache;
+}
+
 void appendRoutePt(RoutePolyline& route, const LatLon& p) {
   if (route.points.empty() || haversineMeters(route.points.back(), p) > 1.0) {
     route.points.push_back(p);
@@ -2084,18 +2205,6 @@ std::unordered_map<std::string, RoutePolyline> computeRegionalRoutesByVehicleId(
     return routes;
   }
 
-  VehicleInfo destProbe;
-  destProbe.id = "destination";
-  destProbe.lat = dest.lat;
-  destProbe.lon = dest.lon;
-  destProbe.type = dest.type;
-  destProbe.speed = 60.0;
-  destProbe.timestamp = dest.arriveByUnix;
-  const GraphPosition goalPos = matchVehicleToGraphIndexed(store, matchIndex, destProbe);
-  if (!goalPos.valid) {
-    return routes;
-  }
-
   struct EnrichJob {
     std::string vehicleId;
     const VehicleInfo* vehicle = nullptr;
@@ -2134,36 +2243,70 @@ std::unordered_map<std::string, RoutePolyline> computeRegionalRoutesByVehicleId(
   routeParam.maxVisitedNodes = 0;
   double groupSpeedMs = jobs.front().speedMs;
   double groupMaxHorizon = 0.0;
-  double maxRadiusM = 25000.0;
-  const LatLon goalLl{dest.lat, dest.lon};
-  std::unordered_set<int64_t> targetNodes;
-  targetNodes.reserve(jobs.size() * 2);
+  double spanM = 0.0;
   for (const auto& job : jobs) {
     groupSpeedMs = std::min(groupSpeedMs, job.speedMs);
     groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
-    maxRadiusM = std::max(maxRadiusM, std::min(job.distM + 12000.0, 150000.0));
-    const GraphPosition startPos = matchVehicleToGraphIndexed(store, matchIndex, *job.vehicle);
-    addRoutingTargetNodesIndexed(store, startPos, targetNodes);
+    spanM = std::max(spanM, job.distM);
   }
 
-  const CsrGraph& csr = store.csr();
-  const RoutedTimeField field = computeRoutedTimeFieldFromGoalCsr(
-      store, csr, goalPos, groupSpeedMs, dest.type, routeParam, groupMaxHorizon, nullptr,
-      &targetNodes, &goalLl, maxRadiusM);
+  std::unordered_set<int64_t> targetNodes;
+  targetNodes.reserve(jobs.size() * 2);
+  std::vector<GraphPosition> startPositions(jobs.size());
+  parallelFor(jobs.size(), [&](std::size_t j) {
+    startPositions[j] = matchVehicleToGraphIndexed(store, matchIndex, *jobs[j].vehicle);
+  });
+  for (std::size_t j = 0; j < jobs.size(); ++j) {
+    if (startPositions[j].valid) {
+      addRoutingTargetNodesIndexed(store, startPositions[j], targetNodes);
+    }
+  }
 
+  const double maxRadiusM = bucketMetroRadiusM(spanM);
+  const auto tField0 = std::chrono::steady_clock::now();
+  bool fieldCacheHit = false;
+  const std::shared_ptr<CachedMetroRegionalField> metroCached = getOrBuildMetroRegionalField(
+      store, matchIndex, dest, groupSpeedMs, groupMaxHorizon, maxRadiusM, param, &targetNodes,
+      &fieldCacheHit);
+  const auto tField1 = std::chrono::steady_clock::now();
+  if (!metroCached || metroCached->distByRow.empty() || metroCached->goalNodeId == 0) {
+    return routes;
+  }
+  const GraphPosition& cachedGoalPos = metroCached->goalPos;
+  const CsrGraph& csr = store.csr();
+  const int64_t goalNodeId = metroCached->goalNodeId;
+
+  const auto tRoute0 = std::chrono::steady_clock::now();
   std::vector<std::optional<RoutePolyline>> rows(jobs.size());
   parallelFor(jobs.size(), [&](std::size_t j) {
     const EnrichJob& job = jobs[j];
-    const GraphPosition startPos = matchVehicleToGraphIndexed(store, matchIndex, *job.vehicle);
-    if (!startPos.valid) {
+    if (!startPositions[j].valid) {
       return;
     }
-    const RouteToGoal path = routeFromRoutedFieldCsr(store, csr, field, startPos, goalPos,
-                                                     job.speedMs, job.vehicle->type, routeParam);
-    if (path.polyline.points.size() >= 2) {
-      rows[j] = path.polyline;
+    const int64_t startNode = resolveDenseStartNode(store, csr, metroCached->distByRow,
+                                                    startPositions[j], job.speedMs,
+                                                    job.vehicle->type, routeParam);
+    if (startNode == 0) {
+      return;
+    }
+    RoutePolyline route = polylineFromGoalCsrParents(store, csr, metroCached->parentNodeByRow,
+                                                   metroCached->parentEdgeByRow, startNode,
+                                                   goalNodeId);
+    if (startPositions[j].edgeId != 0) {
+      const LatLon startPt = positionLatLonStore(store, startPositions[j]);
+      if (route.points.empty() || haversineMeters(route.points.front(), startPt) > 1.0) {
+        route.points.insert(route.points.begin(), startPt);
+      }
+    }
+    const LatLon endLoc = positionLatLonStore(store, cachedGoalPos);
+    if (route.points.empty() || haversineMeters(route.points.back(), endLoc) > 1.0) {
+      route.points.push_back(endLoc);
+    }
+    if (route.points.size() >= 2) {
+      rows[j] = std::move(route);
     }
   });
+  const auto tRoute1 = std::chrono::steady_clock::now();
 
   routes.reserve(jobs.size());
   for (std::size_t j = 0; j < jobs.size(); ++j) {
@@ -2173,6 +2316,12 @@ std::unordered_map<std::string, RoutePolyline> computeRegionalRoutesByVehicleId(
       routes.emplace(jobs[j].vehicleId, std::move(route));
     }
   }
+  std::cerr << "[mmlp] regional_routes jobs=" << jobs.size() << " field_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(tField1 - tField0).count()
+            << " route_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(tRoute1 - tRoute0).count()
+            << " cache_hit=" << (fieldCacheHit ? 1 : 0) << " routes=" << routes.size() << "\n"
+            << std::flush;
   return routes;
 }
 
@@ -2200,48 +2349,46 @@ void enrichArrivalRoutesRegional(const GraphFileStore& store, const SpatialIndex
   }
 }
 
-void enrichArrivalRoutesChOverlay(const GraphFileStore& snapStore, const SpatialIndex& matchIndex,
-                                  const GraphFileStore& chStore,
-                                  const std::vector<VehicleInfo>& vehicles,
-                                  const std::vector<VehicleHistory>& histories,
-                                  const DestinationQuery& dest, const PredictParam& param,
-                                  std::vector<VehicleArrivalResult>& batch) {
-  if (batch.empty() || !chStore.hasCh() || !chStore.hasHwyCsr()) {
-    return;
-  }
-
-  std::unordered_map<std::string, const VehicleInfo*> vehicleById;
-  vehicleById.reserve(vehicles.size());
-  for (const auto& vehicle : vehicles) {
-    vehicleById[vehicle.id] = &vehicle;
+std::unordered_map<std::string, RoutePolyline> computeChOverlayRoutesByVehicleId(
+    const GraphFileStore& snapStore, const SpatialIndex& matchIndex,
+    const GraphFileStore& chStore, const std::vector<VehicleInfo>& vehicles,
+    const std::vector<VehicleHistory>& histories, const DestinationQuery& dest,
+    const PredictParam& param, double minDistM = 180000.0) {
+  std::unordered_map<std::string, RoutePolyline> routes;
+  if (vehicles.empty() || !chStore.hasCh() || !chStore.hasHwyCsr()) {
+    return routes;
   }
 
   struct OverlayJob {
-    std::size_t batchIdx = 0;
+    std::string vehicleId;
     const VehicleInfo* vehicle = nullptr;
     double maxHorizon = 0.0;
     double distM = 0.0;
   };
   std::vector<OverlayJob> jobs;
-  jobs.reserve(batch.size());
-  constexpr double kMetroDistM = 180000.0;
-  for (std::size_t i = 0; i < batch.size(); ++i) {
-    if (batch[i].route.points.size() >= 2) {
+  jobs.reserve(vehicles.size());
+  for (const auto& vehicle : vehicles) {
+    if (vehicle.type != dest.type) {
       continue;
     }
-    const auto it = vehicleById.find(batch[i].vehicleId);
-    if (it == vehicleById.end()) {
+    const double distM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+    if (distM <= minDistM) {
       continue;
     }
-    const double distM =
-        haversineMeters({it->second->lat, it->second->lon}, {dest.lat, dest.lon});
-    if (distM <= kMetroDistM) {
+    const VehicleHistory* hist = findHistory(histories, vehicle.id);
+    const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
+    if (!mayReachWithSpeed(vehicle, dest, speedMs)) {
       continue;
     }
-    jobs.push_back({i, it->second, batch[i].travelDurationSec + 60.0, distM});
+    const double maxHorizon =
+        std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
+    if (maxHorizon < 1.0) {
+      continue;
+    }
+    jobs.push_back({vehicle.id, &vehicle, maxHorizon + 60.0, distM});
   }
   if (jobs.empty()) {
-    return;
+    return routes;
   }
 
   const CsrGraph& hwyCsr = chStore.hwyCsr();
@@ -2257,9 +2404,11 @@ void enrichArrivalRoutesChOverlay(const GraphFileStore& snapStore, const Spatial
                                    dest.type, 8);
   }
   if (goalNodes.empty()) {
-    return;
+    return routes;
   }
 
+  const auto tOverlay0 = std::chrono::steady_clock::now();
+  std::vector<std::optional<RoutePolyline>> rows(jobs.size());
   parallelFor(jobs.size(), [&](std::size_t j) {
     const OverlayJob& job = jobs[j];
     const VehicleInfo& vehicle = *job.vehicle;
@@ -2294,28 +2443,80 @@ void enrichArrivalRoutesChOverlay(const GraphFileStore& snapStore, const Spatial
       if (auto chRow = predictVehicleToDestinationCh(snapStore, matchIndex, chStore, vehicle, hist,
                                                      dest, param)) {
         if (chRow->route.points.size() >= 2) {
-          VehicleArrivalResult& row = batch[job.batchIdx];
-          row.route = chRow->route;
-          simplifyRoutePolyline(row.route, 120);
-          row.routeDistanceM = polylineLengthMeters(row.route);
+          rows[j] = chRow->route;
         }
       }
       return;
     }
-    auto appendPt = [](RoutePolyline& route, const LatLon& p) {
-      if (route.points.empty() || haversineMeters(route.points.back(), p) > 1.0) {
-        route.points.push_back(p);
-      }
-    };
-    VehicleArrivalResult& row = batch[job.batchIdx];
-    appendPt(row.route, {vehicle.lat, vehicle.lon});
-    for (const LatLon& pt : best.points) {
-      appendPt(row.route, pt);
+    RoutePolyline route;
+    appendRoutePt(route, {vehicle.lat, vehicle.lon});
+    appendPolylinePoints(route, best);
+    appendRoutePt(route, {dest.lat, dest.lon});
+    if (route.points.size() >= 2) {
+      rows[j] = std::move(route);
     }
-    appendPt(row.route, {dest.lat, dest.lon});
-    simplifyRoutePolyline(row.route, 120);
-    row.routeDistanceM = polylineLengthMeters(row.route);
   });
+
+  routes.reserve(jobs.size());
+  for (std::size_t j = 0; j < jobs.size(); ++j) {
+    if (rows[j]) {
+      RoutePolyline route = std::move(*rows[j]);
+      simplifyRoutePolyline(route, 120);
+      routes.emplace(jobs[j].vehicleId, std::move(route));
+    }
+  }
+  std::cerr << "[mmlp] ch_overlay jobs=" << jobs.size() << " overlay_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - tOverlay0)
+                   .count()
+            << " routes=" << routes.size() << "\n"
+            << std::flush;
+  return routes;
+}
+
+void enrichArrivalRoutesChOverlay(const GraphFileStore& snapStore, const SpatialIndex& matchIndex,
+                                  const GraphFileStore& chStore,
+                                  const std::vector<VehicleInfo>& vehicles,
+                                  const std::vector<VehicleHistory>& histories,
+                                  const DestinationQuery& dest, const PredictParam& param,
+                                  std::vector<VehicleArrivalResult>& batch) {
+  if (batch.empty() || !chStore.hasCh() || !chStore.hasHwyCsr()) {
+    return;
+  }
+  std::vector<VehicleInfo> needOverlay;
+  needOverlay.reserve(batch.size());
+  std::unordered_set<std::string> haveRoute;
+  for (const auto& row : batch) {
+    if (row.route.points.size() >= 2) {
+      haveRoute.insert(row.vehicleId);
+    }
+  }
+  for (const auto& vehicle : vehicles) {
+    if (haveRoute.count(vehicle.id) > 0) {
+      continue;
+    }
+    const double distM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+    if (distM > 180000.0) {
+      needOverlay.push_back(vehicle);
+    }
+  }
+  if (needOverlay.empty()) {
+    return;
+  }
+  const std::unordered_map<std::string, RoutePolyline> routes =
+      computeChOverlayRoutesByVehicleId(snapStore, matchIndex, chStore, needOverlay, histories,
+                                        dest, param);
+  for (auto& row : batch) {
+    if (row.route.points.size() >= 2) {
+      continue;
+    }
+    const auto it = routes.find(row.vehicleId);
+    if (it == routes.end() || it->second.points.size() < 2) {
+      continue;
+    }
+    row.route = it->second;
+    row.routeDistanceM = polylineLengthMeters(row.route);
+  }
 }
 
 void appendDestinationCsrBatchWithFallback(
@@ -2331,6 +2532,7 @@ void appendDestinationCsrBatchWithFallback(
 
   std::vector<VehicleArrivalResult> batch;
   if (chRef.hasHwyCsr() && chRef.hasCh()) {
+    const auto tBatch0 = std::chrono::steady_clock::now();
     ThreadPool& pool = ThreadPool::instance();
     std::future<std::vector<VehicleArrivalResult>> etaFuture = pool.submit([&]() {
       return predictVehiclesToDestinationHwyCsrBatch(store, matchIndex, chRef, vehicles, histories,
@@ -2338,6 +2540,10 @@ void appendDestinationCsrBatchWithFallback(
                                                      nationalSnapStore);
     });
     std::future<std::unordered_map<std::string, RoutePolyline>> routeFuture;
+    std::future<std::unordered_map<std::string, RoutePolyline>> overlayFuture = pool.submit([&]() {
+      return computeChOverlayRoutesByVehicleId(store, matchIndex, chRef, vehicles, histories, dest,
+                                               param);
+    });
     if (store.hasCsr()) {
       routeFuture = pool.submit([&]() {
         return computeRegionalRoutesByVehicleId(store, matchIndex, vehicles, histories, dest,
@@ -2355,10 +2561,24 @@ void appendDestinationCsrBatchWithFallback(
         }
       }
     }
-    if (!batch.empty()) {
-      enrichArrivalRoutesChOverlay(store, matchIndex, chRef, vehicles, histories, dest, param,
-                                   batch);
+    if (overlayFuture.valid()) {
+      const std::unordered_map<std::string, RoutePolyline> overlayRoutes = overlayFuture.get();
+      for (auto& row : batch) {
+        if (row.route.points.size() >= 2) {
+          continue;
+        }
+        const auto it = overlayRoutes.find(row.vehicleId);
+        if (it != overlayRoutes.end() && it->second.points.size() >= 2) {
+          row.route = it->second;
+          row.routeDistanceM = polylineLengthMeters(row.route);
+        }
+      }
     }
+    const auto tBatch1 = std::chrono::steady_clock::now();
+    std::cerr << "[mmlp] dest_batch total_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(tBatch1 - tBatch0).count()
+              << " reachable=" << batch.size() << "\n"
+              << std::flush;
   }
   if (batch.size() < vehicles.size()) {
     std::unordered_set<std::string> have;

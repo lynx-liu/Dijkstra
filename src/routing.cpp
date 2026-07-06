@@ -594,8 +594,6 @@ RouteToGoal routeFromRoutedField(const MultimodalGraph& graph, const RoutedTimeF
   return result;
 }
 
-namespace {
-
 LatLon positionLatLonStore(const GraphFileStore& store, const GraphPosition& pos) {
   if (!pos.valid) {
     return {};
@@ -622,8 +620,6 @@ LatLon positionLatLonStore(const GraphFileStore& store, const GraphPosition& pos
   const double t = std::max(0.0, std::min(1.0, pos.alongMeters / length));
   return {flat + t * (tlat - flat), flon + t * (tlon - flon)};
 }
-
-}  // namespace
 
 RoutedTimeField computeRoutedTimeFieldFromGoalCsr(
     const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
@@ -773,6 +769,125 @@ std::vector<double> computeRoutedDistFromGoalCsrDense(
   };
 
   relax(goalNodeId, 0.0, 0, 0);
+
+  while (!pq.empty()) {
+    if (visited >= visitCap) {
+      break;
+    }
+    if (targetNodes != nullptr && pendingTargets.empty()) {
+      break;
+    }
+    const auto [t, u] = pq.top();
+    pq.pop();
+    const int uRow = csr.nodeRow(store, u);
+    if (uRow < 0 || t > dist[static_cast<std::size_t>(uRow)] + 1e-6) {
+      continue;
+    }
+    if (pendingTargets.count(u) > 0) {
+      pendingTargets.erase(u);
+    }
+
+    csr.forEachNeighbor(store, u, nullptr, [&](const CsrArc& adj) {
+      if (!edgeAllowedForVehicle(adj.type, type)) {
+        return;
+      }
+      if (goalLatLon != nullptr && maxRadiusM > 0.0) {
+        double lat = 0.0;
+        double lon = 0.0;
+        if (!store.nodeLatLon(adj.toNodeId, lat, lon)) {
+          return;
+        }
+        if (haversineMeters(*goalLatLon, {lat, lon}) > maxRadiusM) {
+          return;
+        }
+      }
+      const double eff = csrArcEffectiveSpeedMs(adj.speedLimit, type, speedMs);
+      const double w = travelTimeSeconds(adj.length, eff, type, param);
+      relax(adj.toNodeId, t + w, u, adj.edgeId);
+    });
+  }
+
+  return dist;
+}
+
+std::vector<double> computeRoutedDistFromGoalCsrDense(
+    const GraphFileStore& store, const CsrGraph& csr, const GraphPosition& goal, double speedMs,
+    VehicleType type, const PredictParam& param, double maxTime,
+    const std::unordered_set<int64_t>* targetNodes, const LatLon* goalLatLon,
+    double maxRadiusM, std::vector<int64_t>* parentNodeByRow,
+    std::vector<int64_t>* parentEdgeByRow, int64_t* goalNodeIdOut) {
+  if (!goal.valid) {
+    return {};
+  }
+  if (goal.edgeId == 0) {
+    if (goalNodeIdOut != nullptr) {
+      *goalNodeIdOut = goal.nodeId;
+    }
+    return computeRoutedDistFromGoalCsrDense(store, csr, goal.nodeId, speedMs, type, param, maxTime,
+                                             targetNodes, goalLatLon, maxRadiusM, parentNodeByRow,
+                                             parentEdgeByRow);
+  }
+
+  int64_t from = 0;
+  int64_t to = 0;
+  if (!store.edgeEndpoints(goal.edgeId, from, to)) {
+    return {};
+  }
+  if (goalNodeIdOut != nullptr) {
+    *goalNodeIdOut = from;
+  }
+
+  const std::size_t n = csr.nodeCount();
+  std::vector<double> dist(n, kInfTime);
+  if (maxTime <= 0.0 || !csr.isOpen() || n == 0) {
+    return dist;
+  }
+  if (parentNodeByRow != nullptr) {
+    parentNodeByRow->assign(n, 0);
+  }
+  if (parentEdgeByRow != nullptr) {
+    parentEdgeByRow->assign(n, 0);
+  }
+
+  using QueueItem = std::tuple<double, int64_t>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
+
+  std::unordered_set<int64_t> pendingTargets;
+  if (targetNodes != nullptr) {
+    pendingTargets = *targetNodes;
+  }
+
+  const std::size_t visitCap =
+      param.maxVisitedNodes > 0 ? param.maxVisitedNodes : std::numeric_limits<std::size_t>::max();
+  std::size_t visited = 0;
+
+  auto relax = [&](int64_t nodeId, double t, int64_t parentNode, int64_t parentEdge) {
+    if (t > maxTime + 1e-9) {
+      return;
+    }
+    const int row = csr.nodeRow(store, nodeId);
+    if (row < 0) {
+      return;
+    }
+    if (t >= dist[static_cast<std::size_t>(row)] - 1e-9) {
+      return;
+    }
+    const bool firstReach = dist[static_cast<std::size_t>(row)] >= kInfTime / 2.0;
+    dist[static_cast<std::size_t>(row)] = t;
+    if (parentNodeByRow != nullptr && parentNode != 0) {
+      (*parentNodeByRow)[static_cast<std::size_t>(row)] = parentNode;
+    }
+    if (parentEdgeByRow != nullptr && parentEdge != 0) {
+      (*parentEdgeByRow)[static_cast<std::size_t>(row)] = parentEdge;
+    }
+    if (firstReach) {
+      ++visited;
+    }
+    pq.push({t, nodeId});
+  };
+
+  relax(from, 0.0, 0, 0);
+  relax(to, 0.0, 0, 0);
 
   while (!pq.empty()) {
     if (visited >= visitCap) {

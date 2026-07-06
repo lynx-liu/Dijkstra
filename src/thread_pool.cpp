@@ -73,10 +73,20 @@ void parallelFor(std::size_t count, const std::function<void(std::size_t)>& fn) 
     return;
   }
 
-  std::vector<std::future<void>> futures;
-  futures.reserve(nWorkers);
+  // Run the first chunk on the calling thread so a small pool is not starved
+  // when nested parallelFor / futures are already using all workers.
   const std::size_t chunk = (count + nWorkers - 1) / nWorkers;
-  for (std::size_t w = 0; w < nWorkers; ++w) {
+  const std::size_t firstEnd = std::min(count, chunk);
+  for (std::size_t i = 0; i < firstEnd; ++i) {
+    fn(i);
+  }
+  if (firstEnd >= count) {
+    return;
+  }
+
+  std::vector<std::future<void>> futures;
+  futures.reserve(nWorkers - 1);
+  for (std::size_t w = 1; w < nWorkers; ++w) {
     const std::size_t begin = w * chunk;
     const std::size_t end = std::min(count, begin + chunk);
     if (begin >= end) {
