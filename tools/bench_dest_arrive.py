@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Benchmark POST /api/destinations/arrive and print timing + reachable count."""
-from __future__ import annotations
 
 import argparse
 import json
@@ -12,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 
-def load_payload(path: Path | None) -> dict:
+def load_payload(path):
     if path and path.is_file():
         return json.loads(path.read_text(encoding="utf-8"))
     transcript = Path(
@@ -33,7 +32,7 @@ def load_payload(path: Path | None) -> dict:
     raise SystemExit("payload not found; pass --payload FILE")
 
 
-def post(url: str, body: dict, timeout: float) -> tuple[float, dict]:
+def post(url, body, timeout):
     req = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False).encode(),

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Extract a regional subset from china.mmlp.bin and build index sidecars."""
 
-from __future__ import annotations
-
 import argparse
 import struct
 import subprocess
@@ -14,7 +12,7 @@ NODE_RECORD = 28
 EDGE_RECORD = 44
 
 
-def parse_bbox(text: str) -> tuple[float, float, float, float]:
+def parse_bbox(text):
     parts = [float(x.strip()) for x in text.split(",")]
     if len(parts) != 4:
         raise ValueError("bbox: minLon,minLat,maxLon,maxLat")
