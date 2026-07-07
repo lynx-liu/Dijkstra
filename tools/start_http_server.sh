@@ -28,14 +28,20 @@ index_ready() {
 }
 
 regional_ready() {
-  local graph_dir graph_base prd
+  local graph_dir graph_base prd gd nx xj
   graph_dir="$(dirname "${GRAPH}")"
   graph_base="$(basename "${GRAPH}" .bin)"
   if [[ "${graph_base}" == *.mmlp ]]; then
     graph_base="${graph_base%.mmlp}"
   fi
   prd="${graph_dir}/${graph_base}_prd.mmlp.bin"
-  [[ -f "${prd}" && -f "${prd%.bin}.sidx" && -f "${prd%.bin}.hwy.csr" && -f "${prd%.bin}.hwy.ch" ]]
+  gd="${graph_dir}/${graph_base}_gd.mmlp.bin"
+  nx="${graph_dir}/${graph_base}_nx.mmlp.bin"
+  xj="${graph_dir}/${graph_base}_xj.mmlp.bin"
+  [[ -f "${prd}" && -f "${prd%.bin}.sidx" && -f "${prd%.bin}.hwy.csr" && -f "${prd%.bin}.hwy.ch" ]] &&
+    [[ -f "${gd}" && -f "${gd%.bin}.sidx" && -f "${gd%.bin}.csr" ]] &&
+    [[ -f "${nx}" && -f "${nx%.bin}.sidx" && -f "${nx%.bin}.csr" ]] &&
+    [[ -f "${xj}" && -f "${xj%.bin}.sidx" && -f "${xj%.bin}.csr" ]]
 }
 
 if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
@@ -53,12 +59,12 @@ if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
 fi
 
 if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
-  echo "Regional PRD overlay missing; building (first time may take several minutes)..."
-  bash "${ROOT}/tools/build_region_graphs.sh" "${GRAPH}"
+  echo "Regional graphs missing (prd/gd/nx/xj); building (first time may take 10-60 minutes)..."
+  REGIONS="${REGIONS:-prd,gd,nx,xj}" bash "${ROOT}/tools/build_region_graphs.sh" "${GRAPH}"
 fi
 
 if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
-  echo "ERROR: PRD regional graph or hwy overlay still missing after build." >&2
+  echo "ERROR: regional graphs still missing after build (need prd+hwy, gd, nx, xj)." >&2
   echo "Run: bash tools/bootstrap_service.sh" >&2
   exit 1
 fi

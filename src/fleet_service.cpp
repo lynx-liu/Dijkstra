@@ -91,8 +91,9 @@ struct RegionBBox {
 
 constexpr RegionBBox kRegionBoxes[] = {
     {"prd", 112.0, 22.0, 114.8, 24.2},
+    {"gd", 109.65, 20.15, 117.25, 25.55},
     {"sc", 108.0, 20.0, 118.5, 26.5},
-    {"nx", 104.0, 35.0, 108.5, 40.5},
+    {"nx", 106.0, 38.0, 112.0, 42.0},
     {"xj", 73.0, 34.0, 96.5, 49.5},
 };
 
@@ -126,7 +127,7 @@ bool regionalGraphFileExists(const std::string& nationalPath, const std::string&
   return probe.good();
 }
 
-// Prefer the tightest regional graph that exists (prd -> sc -> nx -> xj).
+// Prefer the tightest regional graph that exists (prd -> gd -> sc -> nx -> xj).
 std::string resolveRegionalSuffix(const std::string& nationalPath, double lat, double lon) {
   const char* preferred = regionSuffixForPoint(lat, lon);
   if (preferred == nullptr) {
@@ -135,6 +136,18 @@ std::string resolveRegionalSuffix(const std::string& nationalPath, double lat, d
   if (std::strcmp(preferred, "prd") == 0) {
     if (regionalGraphFileExists(nationalPath, "prd")) {
       return "prd";
+    }
+    if (regionalGraphFileExists(nationalPath, "gd")) {
+      return "gd";
+    }
+    if (regionalGraphFileExists(nationalPath, "sc")) {
+      return "sc";
+    }
+    return {};
+  }
+  if (std::strcmp(preferred, "gd") == 0) {
+    if (regionalGraphFileExists(nationalPath, "gd")) {
+      return "gd";
     }
     if (regionalGraphFileExists(nationalPath, "sc")) {
       return "sc";
@@ -155,8 +168,12 @@ bool vehicleInDestRegion(const std::string& destSuffix, double lat, double lon) 
   if (destSuffix == vehicleRegion) {
     return true;
   }
-  // Routing on the wider sc graph should include prd-local vehicles.
-  if (destSuffix == "sc" && std::strcmp(vehicleRegion, "prd") == 0) {
+  if (destSuffix == "gd" && std::strcmp(vehicleRegion, "prd") == 0) {
+    return true;
+  }
+  // Routing on the wider sc graph should include prd/gd-local vehicles.
+  if (destSuffix == "sc" &&
+      (std::strcmp(vehicleRegion, "prd") == 0 || std::strcmp(vehicleRegion, "gd") == 0)) {
     return true;
   }
   return false;
@@ -222,8 +239,8 @@ bool FleetMeetingService::preloadIndexOnly(std::string* error) {
   fullGraphLoaded_ = false;
   loadedBBox_ = {73.0, 15.0, 135.0, 54.0};
   std::cerr << "[mmlp] index-only mode ready (mmap on-demand subgraph)\n" << std::flush;
-  // Preload compact regional graphs used by destination arrive (prd/xj).
-  for (const char* suffix : {"prd", "xj"}) {
+  // Preload compact regional graphs used by destination arrive (prd/gd/nx/xj; sc loads on demand).
+  for (const char* suffix : {"prd", "gd", "xj", "nx"}) {
     if (!regionalGraphFileExists(graphPath_, suffix)) {
       continue;
     }

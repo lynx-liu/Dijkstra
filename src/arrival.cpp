@@ -2177,6 +2177,15 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
     }
   }
 
+  std::vector<VehicleJob> hwyJobs;
+  hwyJobs.reserve(metroJobs.size() + remoteJobs.size());
+  for (auto& job : metroJobs) {
+    hwyJobs.push_back(std::move(job));
+  }
+  for (auto& job : remoteJobs) {
+    hwyJobs.push_back(std::move(job));
+  }
+
   GraphPosition goalPos;
   goalPos.valid = true;
   goalPos.nodeId = goalNodes.front();
@@ -2242,22 +2251,22 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
     return row;
   };
 
-  if (!metroJobs.empty()) {
+  if (!hwyJobs.empty()) {
     std::unordered_set<int64_t> targetNodes;
-    targetNodes.reserve(metroJobs.size() * 4);
-    double metroSpanM = 0.0;
-    double groupSpeedMs = metroJobs.front().speedMs;
+    targetNodes.reserve(hwyJobs.size() * 4);
+    double spanM = 0.0;
+    double groupSpeedMs = hwyJobs.front().speedMs;
     double groupMaxHorizon = 0.0;
-    for (const auto& job : metroJobs) {
-      metroSpanM = std::max(
-          metroSpanM, haversineMeters({job.vehicle->lat, job.vehicle->lon}, {dest.lat, dest.lon}));
+    for (const auto& job : hwyJobs) {
+      spanM = std::max(
+          spanM, haversineMeters({job.vehicle->lat, job.vehicle->lon}, {dest.lat, dest.lon}));
       groupSpeedMs = std::min(groupSpeedMs, job.speedMs);
       groupMaxHorizon = std::max(groupMaxHorizon, job.maxHorizon);
       for (int64_t portal : job.portals) {
         targetNodes.insert(portal);
       }
     }
-    const double maxRadiusM = metroSpanM + 35000.0;
+    const double maxRadiusM = spanM + 35000.0;
     const uint64_t hwyKey = destRouteCacheKey(dest, 0.0) ^ static_cast<uint64_t>(goalPos.nodeId);
     std::shared_ptr<CachedHwyDistField> hwyCached;
     {
@@ -2293,35 +2302,9 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
       return distByRow[static_cast<std::size_t>(row)];
     };
 
-    for (const auto& job : metroJobs) {
+    for (const auto& job : hwyJobs) {
       if (auto row = buildRowFromPortals(job, nodeTime)) {
         results.push_back(std::move(*row));
-      }
-    }
-
-    if (!remoteJobs.empty()) {
-      std::vector<std::optional<VehicleArrivalResult>> remoteRows(remoteJobs.size());
-      parallelFor(remoteJobs.size(), [&](std::size_t i) {
-        const VehicleJob& job = remoteJobs[i];
-        const double distM =
-            haversineMeters({job.vehicle->lat, job.vehicle->lon}, {dest.lat, dest.lon});
-        std::unordered_set<int64_t> targets(job.portals.begin(), job.portals.end());
-        const std::vector<double> remoteDistByRow = computeRoutedDistFromGoalCsrDense(
-            chStore, hwyCsr, goalPos.nodeId, job.speedMs, dest.type, routeParam, job.maxHorizon,
-            &targets, &goalLl, distM + 35000.0);
-        auto remoteNodeTime = [&](int64_t nodeId) -> double {
-          const int r = hwyCsr.nodeRow(chStore, nodeId);
-          if (r < 0) {
-            return kInfTime;
-          }
-          return remoteDistByRow[static_cast<std::size_t>(r)];
-        };
-        remoteRows[i] = buildRowFromPortals(job, remoteNodeTime);
-      });
-      for (auto& row : remoteRows) {
-        if (row) {
-          results.push_back(std::move(*row));
-        }
       }
     }
   }

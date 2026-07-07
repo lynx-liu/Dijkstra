@@ -6,7 +6,6 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -54,17 +53,16 @@ struct CsrArcRec {
 #pragma pack(pop)
 static_assert(sizeof(CsrArcRec) == 28, "CsrArcRec layout");
 
-int nodeRowOf(const std::vector<NodeRow>& nodes, int64_t id) {
-  auto it = std::lower_bound(nodes.begin(), nodes.end(), id,
-                             [](const NodeRow& r, int64_t k) { return r.id < k; });
-  if (it == nodes.end() || it->id != id) {
+int nodeRowOf(const std::vector<int64_t>& nodeIds, int64_t id) {
+  auto it = std::lower_bound(nodeIds.begin(), nodeIds.end(), id);
+  if (it == nodeIds.end() || *it != id) {
     return -1;
   }
-  return static_cast<int>(it - nodes.begin());
+  return static_cast<int>(it - nodeIds.begin());
 }
 
-bool buildCsrFile(const std::string& csrPath, std::ifstream& in, const std::vector<NodeRow>& nodes,
-                  uint64_t nodeCount, uint64_t edgeCount) {
+bool buildCsrFile(const std::string& csrPath, int binFd, const std::vector<int64_t>& nodeIds,
+                  uint64_t nodeCount, uint64_t edgeCount, uint64_t edgeStart) {
   const uint64_t arcCount = edgeCount * 2;
   const std::size_t kHeader = 28;
   const std::size_t rowBytes = (static_cast<std::size_t>(nodeCount) + 1) * sizeof(uint64_t);
@@ -79,26 +77,26 @@ bool buildCsrFile(const std::string& csrPath, std::ifstream& in, const std::vect
     ::close(fd);
     return false;
   }
-  void* map =
-      ::mmap(nullptr, totalSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  ::close(fd);
-  if (map == MAP_FAILED) {
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+  (void)::posix_fallocate(fd, 0, static_cast<off_t>(totalSize));
+#endif
+
+  char header[kHeader];
+  std::memcpy(header, kCsrMagic, 8);
+  const uint32_t csrVer = 1;
+  std::memcpy(header + 8, &csrVer, 4);
+  std::memcpy(header + 12, &nodeCount, 8);
+  std::memcpy(header + 20, &arcCount, 8);
+  if (::pwrite(fd, header, kHeader, 0) != static_cast<ssize_t>(kHeader)) {
+    ::close(fd);
     return false;
   }
 
-  char* base = static_cast<char*>(map);
-  std::memcpy(base, kCsrMagic, 8);
-  const uint32_t csrVer = 1;
-  std::memcpy(base + 8, &csrVer, 4);
-  std::memcpy(base + 12, &nodeCount, 8);
-  std::memcpy(base + 20, &arcCount, 8);
-
-  auto* rowPtr = reinterpret_cast<uint64_t*>(base + kHeader);
-  auto* arcs = reinterpret_cast<CsrArcRec*>(base + kHeader + rowBytes);
-
   std::vector<uint32_t> degree(static_cast<std::size_t>(nodeCount), 0);
-  const auto edgeStart = 28 + nodeCount * kNodeRecord;
-  in.seekg(static_cast<std::streamoff>(edgeStart));
+  if (::lseek(binFd, static_cast<off_t>(edgeStart), SEEK_SET) < 0) {
+    ::close(fd);
+    return false;
+  }
 
   std::cerr << "[build_aux] csr pass1 degree\n";
   for (uint64_t i = 0; i < edgeCount; ++i) {
@@ -108,16 +106,14 @@ bool buildCsrFile(const std::string& csrPath, std::ifstream& in, const std::vect
     int32_t type = 0;
     double length = 0.0;
     double speed = 0.0;
-    if (!in.read(reinterpret_cast<char*>(&id), 8) ||
-        !in.read(reinterpret_cast<char*>(&fr), 8) || !in.read(reinterpret_cast<char*>(&to), 8) ||
-        !in.read(reinterpret_cast<char*>(&type), 4) ||
-        !in.read(reinterpret_cast<char*>(&length), 8) ||
-        !in.read(reinterpret_cast<char*>(&speed), 8)) {
-      ::munmap(map, totalSize);
+    if (::read(binFd, &id, 8) != 8 || ::read(binFd, &fr, 8) != 8 || ::read(binFd, &to, 8) != 8 ||
+        ::read(binFd, &type, 4) != 4 || ::read(binFd, &length, 8) != 8 ||
+        ::read(binFd, &speed, 8) != 8) {
+      ::close(fd);
       return false;
     }
-    const int frRow = nodeRowOf(nodes, fr);
-    const int toRow = nodeRowOf(nodes, to);
+    const int frRow = nodeRowOf(nodeIds, fr);
+    const int toRow = nodeRowOf(nodeIds, to);
     if (frRow >= 0) {
       ++degree[static_cast<std::size_t>(frRow)];
     }
@@ -129,17 +125,37 @@ bool buildCsrFile(const std::string& csrPath, std::ifstream& in, const std::vect
     }
   }
 
+  std::vector<uint64_t> rowPtr(static_cast<std::size_t>(nodeCount) + 1);
   rowPtr[0] = 0;
   for (uint64_t i = 0; i < nodeCount; ++i) {
     rowPtr[i + 1] = rowPtr[i] + degree[static_cast<std::size_t>(i)];
   }
+  if (rowPtr[nodeCount] != arcCount) {
+    std::cerr << "[build_aux] csr degree mismatch: sum=" << rowPtr[nodeCount]
+              << " expected=" << arcCount << "\n";
+    ::close(fd);
+    return false;
+  }
+  if (::pwrite(fd, rowPtr.data(), rowBytes, static_cast<off_t>(kHeader)) !=
+      static_cast<ssize_t>(rowBytes)) {
+    ::close(fd);
+    return false;
+  }
+  degree.clear();
+  degree.shrink_to_fit();
 
   std::vector<uint64_t> next(static_cast<std::size_t>(nodeCount));
   for (uint64_t i = 0; i < nodeCount; ++i) {
     next[static_cast<std::size_t>(i)] = rowPtr[i];
   }
+  rowPtr.clear();
+  rowPtr.shrink_to_fit();
 
-  in.seekg(static_cast<std::streamoff>(edgeStart));
+  std::vector<CsrArcRec> arcs(static_cast<std::size_t>(arcCount));
+  if (::lseek(binFd, static_cast<off_t>(edgeStart), SEEK_SET) < 0) {
+    ::close(fd);
+    return false;
+  }
   std::cerr << "[build_aux] csr pass2 fill\n";
   for (uint64_t i = 0; i < edgeCount; ++i) {
     int64_t id = 0;
@@ -148,37 +164,61 @@ bool buildCsrFile(const std::string& csrPath, std::ifstream& in, const std::vect
     int32_t type = 0;
     double length = 0.0;
     double speed = 0.0;
-    if (!in.read(reinterpret_cast<char*>(&id), 8) ||
-        !in.read(reinterpret_cast<char*>(&fr), 8) || !in.read(reinterpret_cast<char*>(&to), 8) ||
-        !in.read(reinterpret_cast<char*>(&type), 4) ||
-        !in.read(reinterpret_cast<char*>(&length), 8) ||
-        !in.read(reinterpret_cast<char*>(&speed), 8)) {
-      ::munmap(map, totalSize);
+    if (::read(binFd, &id, 8) != 8 || ::read(binFd, &fr, 8) != 8 || ::read(binFd, &to, 8) != 8 ||
+        ::read(binFd, &type, 4) != 4 || ::read(binFd, &length, 8) != 8 ||
+        ::read(binFd, &speed, 8) != 8) {
+      ::close(fd);
       return false;
     }
-    const int frRow = nodeRowOf(nodes, fr);
-    const int toRow = nodeRowOf(nodes, to);
+    const int frRow = nodeRowOf(nodeIds, fr);
+    const int toRow = nodeRowOf(nodeIds, to);
     CsrArcRec outArc;
     outArc.edgeId = id;
     outArc.edgeType = type;
     outArc.length = static_cast<float>(length);
     outArc.speedLimit = static_cast<float>(speed);
     if (frRow >= 0) {
-      const std::size_t slot = static_cast<std::size_t>(next[static_cast<std::size_t>(frRow)]++);
+      const uint64_t slot = next[static_cast<std::size_t>(frRow)]++;
+      if (slot >= arcCount) {
+        std::cerr << "[build_aux] csr slot overflow frRow=" << frRow << " slot=" << slot << "\n";
+        ::close(fd);
+        return false;
+      }
       outArc.toNodeId = to;
-      arcs[slot] = outArc;
+      arcs[static_cast<std::size_t>(slot)] = outArc;
     }
     if (toRow >= 0) {
-      const std::size_t slot = static_cast<std::size_t>(next[static_cast<std::size_t>(toRow)]++);
+      const uint64_t slot = next[static_cast<std::size_t>(toRow)]++;
+      if (slot >= arcCount) {
+        std::cerr << "[build_aux] csr slot overflow toRow=" << toRow << " slot=" << slot << "\n";
+        ::close(fd);
+        return false;
+      }
       outArc.toNodeId = fr;
-      arcs[slot] = outArc;
+      arcs[static_cast<std::size_t>(slot)] = outArc;
     }
     if (i > 0 && i % 5000000 == 0) {
       std::cerr << "[build_aux] csr fill " << (100 * i / edgeCount) << "%\n";
     }
   }
+  next.clear();
+  next.shrink_to_fit();
 
-  ::munmap(map, totalSize);
+  const off_t arcBase = static_cast<off_t>(kHeader + rowBytes);
+  std::cerr << "[build_aux] csr pass3 write arcs (" << (arcBytes / 1000000) << " MB)\n";
+  const std::size_t kChunk = 16 * 1024 * 1024;
+  for (std::size_t off = 0; off < arcBytes; off += kChunk) {
+    const std::size_t n = std::min(kChunk, arcBytes - off);
+    if (::pwrite(fd, reinterpret_cast<const char*>(arcs.data()) + off, n,
+                 arcBase + static_cast<off_t>(off)) != static_cast<ssize_t>(n)) {
+      ::close(fd);
+      return false;
+    }
+  }
+  arcs.clear();
+  arcs.shrink_to_fit();
+
+  ::close(fd);
   return true;
 }
 
@@ -451,10 +491,27 @@ int main(int argc, char** argv) {
 
   if (csrOnly) {
     std::cerr << "[build_aux] csr-only writing " << csrPath << "\n";
-    if (!buildCsrFile(csrPath, in, nodes, nodeCount, edgeCount)) {
+    std::vector<int64_t> nodeIds;
+    nodeIds.reserve(static_cast<std::size_t>(nodeCount));
+    for (const auto& n : nodes) {
+      nodeIds.push_back(n.id);
+    }
+    nodes.clear();
+    nodes.shrink_to_fit();
+    std::sort(nodeIds.begin(), nodeIds.end());
+
+    const int binFd = ::open(binPath.c_str(), O_RDONLY);
+    if (binFd < 0) {
+      std::cerr << "cannot open " << binPath << " for csr\n";
+      return 1;
+    }
+    const uint64_t edgeStart = 28 + nodeCount * kNodeRecord;
+    if (!buildCsrFile(csrPath, binFd, nodeIds, nodeCount, edgeCount, edgeStart)) {
+      ::close(binFd);
       std::cerr << "csr build failed\n";
       return 1;
     }
+    ::close(binFd);
     std::cerr << "[build_aux] csr-only done\n";
     return 0;
   }
