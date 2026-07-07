@@ -215,16 +215,20 @@ bool FleetMeetingService::preloadIndexOnly(std::string* error) {
               << std::chrono::duration_cast<std::chrono::milliseconds>(tCh1 - tCh0).count() << "\n"
               << std::flush;
   }
+  graphStore_.warmMappedRoutingFilesAsync();
   ctx_ = std::move(fresh);
   graphReady_ = true;
   indexOnlyLoaded_ = true;
   fullGraphLoaded_ = false;
   loadedBBox_ = {73.0, 15.0, 135.0, 54.0};
   std::cerr << "[mmlp] index-only mode ready (mmap on-demand subgraph)\n" << std::flush;
-  // Warm-mmap the tightest regional graph for destination routing (best-effort).
-  if (regionalGraphFileExists(graphPath_, "prd")) {
+  // Preload compact regional graphs used by destination arrive (prd/xj).
+  for (const char* suffix : {"prd", "xj"}) {
+    if (!regionalGraphFileExists(graphPath_, suffix)) {
+      continue;
+    }
     std::string warmErr;
-    ensureRegionalGraph("prd", &warmErr);
+    ensureRegionalGraph(suffix, &warmErr);
   }
   return true;
 }
@@ -592,6 +596,7 @@ bool FleetMeetingService::ensureRegionalGraph(const std::string& suffix, std::st
   if (regional.store.hasCh()) {
     regional.store.ch().warmReverseDown();
   }
+  regional.store.warmMappedRoutingFilesAsync();
   regional.ready = true;
   std::cerr << "[mmlp] regional graph ready suffix=" << suffix << " path=" << path << "\n"
             << std::flush;

@@ -226,6 +226,7 @@
     let pickMarker = null;
     let pendingDest = null;
     let destSubmitting = false;
+    let destAbortController = null;
     let searchedPlace = null;
 
     const destDialog = document.getElementById('destDialog');
@@ -336,9 +337,20 @@
         destError.textContent = '请选择到达时间';
         return;
       }
+      if (destAbortController) {
+        destAbortController.abort();
+      }
+      destAbortController = new AbortController();
+      const { signal } = destAbortController;
       destSubmitting = true;
       destConfirm.disabled = true;
-      destError.textContent = '计算中…';
+      const nVeh = vehicles.length;
+      destError.textContent =
+        nVeh >= 20
+          ? `计算中…（${nVeh} 辆车，约需 5–15 秒，请勿重复点击）`
+          : '计算中…';
+      const timeoutMs = Math.min(300000, 15000 + vehicles.length * 2000);
+      const timeoutId = setTimeout(() => destAbortController.abort(), timeoutMs);
       try {
         const payload = {
           lat: pendingDest.lat,
@@ -351,6 +363,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
+          signal,
         });
         const result = await res.json();
         if (!res.ok || result.error) {
@@ -372,10 +385,18 @@
         clearPickMarker();
         render(state);
       } catch (e) {
-        destError.textContent = String(e.message || e);
+        if (e.name === 'AbortError') {
+          destError.textContent = '计算超时或已取消，请稍后重试';
+        } else {
+          destError.textContent = String(e.message || e);
+        }
         destConfirm.disabled = false;
       } finally {
+        clearTimeout(timeoutId);
         destSubmitting = false;
+        if (destAbortController && destAbortController.signal === signal) {
+          destAbortController = null;
+        }
       }
     }
 

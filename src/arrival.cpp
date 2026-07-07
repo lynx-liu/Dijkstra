@@ -30,6 +30,13 @@ namespace mmlp {
 
 namespace {
 
+template <typename F>
+auto runTopLevelAsync(F&& fn) -> std::future<decltype(fn())> {
+  // Top-level batch work must not use ThreadPool::submit — nested parallelFor inside
+  // would exhaust workers and deadlock (e.g. Guangzhou 98-vehicle batches).
+  return std::async(std::launch::async, std::forward<F>(fn));
+}
+
 const VehicleHistory* findHistory(const std::vector<VehicleHistory>& histories,
                                  const std::string& id) {
   for (const auto& h : histories) {
@@ -47,6 +54,12 @@ double polylineLengthMeters(const RoutePolyline& route) {
   }
   return sum;
 }
+
+bool routePolylineQualityOk(const RoutePolyline& route, double maxSegM = 12000.0);
+std::optional<RoutePolyline> stitchChOverlayRoutePolyline(
+    const GraphFileStore& snapStore, const SpatialIndex& matchIndex, const VehicleInfo& vehicle,
+    const DestinationQuery& dest, double speedMs, double maxHorizon, const PredictParam& param,
+    const RoutePolyline& chPath);
 
 bool mayReachWithSpeed(const VehicleInfo& vehicle, const DestinationQuery& dest, double speedMs) {
   if (vehicle.type != dest.type) {
@@ -1180,10 +1193,22 @@ std::optional<VehicleArrivalResult> predictVehicleToDestinationCh(
       row.reachable = true;
       row.travelDurationSec = travel;
       row.etaUnix = eta;
+      if (auto stitched = stitchChOverlayRoutePolyline(snapStore, snapIndex, vehicle, dest, speedMs,
+                                                     maxHorizon, param, path.polyline)) {
+        if (routePolylineQualityOk(*stitched)) {
+          row.route = std::move(*stitched);
+          row.routeDistanceM = polylineLengthMeters(row.route);
+          simplifyRoutePolyline(row.route, 120);
+          return row;
+        }
+      }
       row.routeDistanceM = polylineLengthMeters(path.polyline);
       row.route = path.polyline;
       simplifyRoutePolyline(row.route, 120);
-      return row;
+      if (routePolylineQualityOk(row.route)) {
+        return row;
+      }
+      return std::nullopt;
     }
   }
   if (std::getenv("MMLP_DEBUG_CH")) {
@@ -1499,6 +1524,33 @@ void appendPolylinePoints(RoutePolyline& route, const RoutePolyline& src) {
   }
 }
 
+double maxPolylineSegmentMeters(const RoutePolyline& route) {
+  double maxD = 0.0;
+  for (std::size_t i = 1; i < route.points.size(); ++i) {
+    maxD = std::max(maxD, haversineMeters(route.points[i - 1], route.points[i]));
+  }
+  return maxD;
+}
+
+bool routePolylineQualityOk(const RoutePolyline& route, double maxSegM) {
+  if (route.points.size() < 2) {
+    return false;
+  }
+  const double maxSeg = maxPolylineSegmentMeters(route);
+  if (maxSeg <= maxSegM) {
+    return true;
+  }
+  // Reject regional shortcut artifacts (e.g. vehicle -> node -> dest with a 173km jump).
+  if (maxSeg > 60000.0) {
+    return false;
+  }
+  if (route.points.size() <= 3 && maxSeg > 25000.0) {
+    return false;
+  }
+  // Sparse CH highway backbone may have moderate gaps when the polyline has shape.
+  return route.points.size() >= 4 && maxSeg <= 50000.0;
+}
+
 GraphPosition matchLatLonIndexed(const GraphFileStore& store, const SpatialIndex& matchIndex,
                                  double lat, double lon, VehicleType type, int64_t timestamp) {
   VehicleInfo probe;
@@ -1633,6 +1685,87 @@ std::shared_ptr<CachedLocalDestField> getOrBuildLocalDestField(
   std::unique_lock<std::shared_mutex> write(localDestFieldCacheMu);
   localDestFieldCache = cached;
   return cached;
+}
+
+std::optional<RoutePolyline> stitchChOverlayRoutePolyline(
+    const GraphFileStore& snapStore, const SpatialIndex& matchIndex, const VehicleInfo& vehicle,
+    const DestinationQuery& dest, double speedMs, double maxHorizon, const PredictParam& param,
+    const RoutePolyline& chPath) {
+  if (chPath.points.size() < 2) {
+    return std::nullopt;
+  }
+  const LatLon vehLl{vehicle.lat, vehicle.lon};
+  const LatLon destLl{dest.lat, dest.lon};
+  PredictParam routeParam = param;
+  routeParam.maxVisitedNodes = 0;
+
+  RoutePolyline route;
+  const LatLon& firstChPt = chPath.points.front();
+  const LatLon& lastChPt = chPath.points.back();
+
+  bool hasAccess = false;
+  if (snapStore.hasCsr()) {
+    const GraphPosition startPos = matchVehicleToGraphIndexed(snapStore, matchIndex, vehicle);
+    const GraphPosition portalPos =
+        matchLatLonIndexed(snapStore, matchIndex, firstChPt.lat, firstChPt.lon, vehicle.type,
+                           vehicle.timestamp);
+    const double accessGap = haversineMeters(vehLl, firstChPt);
+    if (accessGap <= 1500.0) {
+      appendRoutePt(route, vehLl);
+      hasAccess = true;
+    } else if (startPos.valid && portalPos.valid) {
+      const double accessRadius = std::min(35000.0, accessGap + 10000.0);
+      if (auto access = routeLocalSegmentIndexed(snapStore, matchIndex, startPos, portalPos, speedMs,
+                                                 vehicle.type, routeParam, maxHorizon,
+                                                 accessRadius)) {
+        appendPolylinePoints(route, *access);
+        hasAccess = true;
+      }
+    }
+  }
+  if (!hasAccess) {
+    if (haversineMeters(vehLl, firstChPt) > 60000.0) {
+      return std::nullopt;
+    }
+    appendRoutePt(route, vehLl);
+  }
+  appendPolylinePoints(route, chPath);
+
+  bool hasTail = false;
+  const double tailGap = haversineMeters(route.points.back(), destLl);
+  if (tailGap <= 1500.0) {
+    appendRoutePt(route, destLl);
+    hasTail = true;
+  } else if (snapStore.hasCsr()) {
+    const auto destLocal =
+        getOrBuildLocalDestField(snapStore, matchIndex, dest, speedMs, maxHorizon, param);
+    if (destLocal && destLocal->goalPos.valid) {
+      const GraphPosition goalPortalPos =
+          matchLatLonIndexed(snapStore, matchIndex, lastChPt.lat, lastChPt.lon, dest.type,
+                             dest.arriveByUnix);
+      if (goalPortalPos.valid) {
+        if (auto egress = routeLocalSegmentIndexed(snapStore, matchIndex, goalPortalPos,
+                                                   destLocal->goalPos, speedMs, dest.type,
+                                                   routeParam, maxHorizon, 35000.0,
+                                                   &destLocal->field, &destLocal->goalPos)) {
+          appendPolylinePoints(route, *egress);
+          hasTail = true;
+        }
+      }
+    }
+  }
+  if (!hasTail) {
+    if (tailGap > 12000.0) {
+      return std::nullopt;
+    }
+    appendRoutePt(route, destLl);
+  }
+
+  if (route.points.size() < 2) {
+    return std::nullopt;
+  }
+  simplifyRoutePolyline(route, 120);
+  return route;
 }
 
 void stitchHybridMetroRoute(const GraphFileStore& snapStore, const SpatialIndex& matchIndex,
@@ -2214,7 +2347,7 @@ std::unordered_map<std::string, RoutePolyline> computeRegionalRoutesByVehicleId(
   };
   std::vector<EnrichJob> jobs;
   jobs.reserve(vehicles.size());
-  constexpr double kMetroDistM = 180000.0;
+  constexpr double kMetroDistM = 150000.0;
   for (const auto& vehicle : vehicles) {
     if (vehicle.type != dest.type) {
       continue;
@@ -2428,31 +2561,68 @@ std::unordered_map<std::string, RoutePolyline> computeChOverlayRoutesByVehicleId
     }
     RoutePolyline best;
     double bestTravel = kInfTime;
+    const LatLon destLl{dest.lat, dest.lon};
+    const LatLon vehLl{vehicle.lat, vehicle.lon};
     for (int64_t fromNode : fromNodes) {
+      double flat = 0.0;
+      double flon = 0.0;
+      if (!chStore.nodeLatLon(fromNode, flat, flon)) {
+        continue;
+      }
+      if (haversineMeters({flat, flon}, vehLl) > 60000.0) {
+        continue;
+      }
       for (int64_t toNode : goalNodes) {
+        double tlat = 0.0;
+        double tlon = 0.0;
+        if (!chStore.nodeLatLon(toNode, tlat, tlon)) {
+          continue;
+        }
+        if (haversineMeters({tlat, tlon}, destLl) > 50000.0) {
+          continue;
+        }
         const RouteToGoal path =
             ch.query(chStore, hwyCsr, fromNode, toNode, vehicle.type, routeParam, job.maxHorizon);
-        if (path.polyline.points.size() >= 2 && path.travelTimeSec < bestTravel) {
-          bestTravel = path.travelTimeSec;
-          best = path.polyline;
+        if (path.polyline.points.size() < 2 || path.travelTimeSec >= bestTravel ||
+            path.travelTimeSec >= kInfTime / 2.0 || path.travelTimeSec > job.maxHorizon + 1e-6) {
+          continue;
         }
+        if (haversineMeters(path.polyline.points.back(), destLl) > 80000.0) {
+          continue;
+        }
+        bestTravel = path.travelTimeSec;
+        best = path.polyline;
       }
     }
     if (best.points.size() < 2) {
       const VehicleHistory* hist = findHistory(histories, vehicle.id);
       if (auto chRow = predictVehicleToDestinationCh(snapStore, matchIndex, chStore, vehicle, hist,
                                                      dest, param)) {
-        if (chRow->route.points.size() >= 2) {
+        if (routePolylineQualityOk(chRow->route)) {
           rows[j] = chRow->route;
         }
       }
       return;
     }
+    const VehicleHistory* hist = findHistory(histories, vehicle.id);
+    const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
+    if (auto stitched = stitchChOverlayRoutePolyline(snapStore, matchIndex, vehicle, dest, speedMs,
+                                                     job.maxHorizon, param, best)) {
+      if (routePolylineQualityOk(*stitched)) {
+        rows[j] = std::move(*stitched);
+        return;
+      }
+    }
     RoutePolyline route;
-    appendRoutePt(route, {vehicle.lat, vehicle.lon});
+    if (haversineMeters(vehLl, best.points.front()) > 1500.0) {
+      appendRoutePt(route, vehLl);
+    }
     appendPolylinePoints(route, best);
-    appendRoutePt(route, {dest.lat, dest.lon});
-    if (route.points.size() >= 2) {
+    const double tailGap = haversineMeters(route.points.back(), destLl);
+    if (tailGap <= 12000.0) {
+      appendRoutePt(route, destLl);
+    }
+    if (routePolylineQualityOk(route)) {
       rows[j] = std::move(route);
     }
   });
@@ -2533,21 +2703,29 @@ void appendDestinationCsrBatchWithFallback(
   std::vector<VehicleArrivalResult> batch;
   if (chRef.hasHwyCsr() && chRef.hasCh()) {
     const auto tBatch0 = std::chrono::steady_clock::now();
-    ThreadPool& pool = ThreadPool::instance();
-    std::future<std::vector<VehicleArrivalResult>> etaFuture = pool.submit([&]() {
+    std::future<std::vector<VehicleArrivalResult>> etaFuture = runTopLevelAsync([&]() {
       return predictVehiclesToDestinationHwyCsrBatch(store, matchIndex, chRef, vehicles, histories,
                                                      dest, param, nationalSnapIndex,
                                                      nationalSnapStore);
     });
     std::future<std::unordered_map<std::string, RoutePolyline>> routeFuture;
-    std::future<std::unordered_map<std::string, RoutePolyline>> overlayFuture = pool.submit([&]() {
-      return computeChOverlayRoutesByVehicleId(store, matchIndex, chRef, vehicles, histories, dest,
+    bool needChOverlay = false;
+    for (const auto& vehicle : vehicles) {
+      if (haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon}) > 180000.0) {
+        needChOverlay = true;
+        break;
+      }
+    }
+    std::future<std::unordered_map<std::string, RoutePolyline>> overlayFuture;
+    if (needChOverlay) {
+      overlayFuture = runTopLevelAsync([&]() {
+        return computeChOverlayRoutesByVehicleId(store, matchIndex, chRef, vehicles, histories, dest,
                                                param);
-    });
+      });
+    }
     if (store.hasCsr()) {
-      routeFuture = pool.submit([&]() {
-        return computeRegionalRoutesByVehicleId(store, matchIndex, vehicles, histories, dest,
-                                                param);
+      routeFuture = runTopLevelAsync([&]() {
+        return computeRegionalRoutesByVehicleId(store, matchIndex, vehicles, histories, dest, param);
       });
     }
     batch = etaFuture.get();
@@ -2555,7 +2733,7 @@ void appendDestinationCsrBatchWithFallback(
       const std::unordered_map<std::string, RoutePolyline> routes = routeFuture.get();
       for (auto& row : batch) {
         const auto it = routes.find(row.vehicleId);
-        if (it != routes.end() && it->second.points.size() >= 2) {
+        if (it != routes.end() && routePolylineQualityOk(it->second)) {
           row.route = it->second;
           row.routeDistanceM = polylineLengthMeters(row.route);
         }
@@ -2564,11 +2742,49 @@ void appendDestinationCsrBatchWithFallback(
     if (overlayFuture.valid()) {
       const std::unordered_map<std::string, RoutePolyline> overlayRoutes = overlayFuture.get();
       for (auto& row : batch) {
-        if (row.route.points.size() >= 2) {
+        if (routePolylineQualityOk(row.route)) {
           continue;
         }
         const auto it = overlayRoutes.find(row.vehicleId);
-        if (it != overlayRoutes.end() && it->second.points.size() >= 2) {
+        if (it != overlayRoutes.end() && routePolylineQualityOk(it->second)) {
+          row.route = it->second;
+          row.routeDistanceM = polylineLengthMeters(row.route);
+        }
+      }
+    }
+    constexpr double kLongHaulDistM = 150000.0;
+    std::unordered_map<std::string, const VehicleInfo*> vehicleById;
+    vehicleById.reserve(vehicles.size());
+    for (const auto& vehicle : vehicles) {
+      vehicleById.emplace(vehicle.id, &vehicle);
+    }
+    std::vector<VehicleInfo> needRouteFix;
+    needRouteFix.reserve(batch.size());
+    for (auto& row : batch) {
+      if (routePolylineQualityOk(row.route)) {
+        continue;
+      }
+      const auto vit = vehicleById.find(row.vehicleId);
+      if (vit == vehicleById.end()) {
+        continue;
+      }
+      const VehicleInfo& vehicle = *vit->second;
+      const double distM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+      if (distM > kLongHaulDistM) {
+        row.route.points.clear();
+        needRouteFix.push_back(vehicle);
+      }
+    }
+    if (!needRouteFix.empty()) {
+      const std::unordered_map<std::string, RoutePolyline> fixRoutes =
+          computeChOverlayRoutesByVehicleId(store, matchIndex, chRef, needRouteFix, histories, dest,
+                                            param, kLongHaulDistM);
+      for (auto& row : batch) {
+        if (routePolylineQualityOk(row.route)) {
+          continue;
+        }
+        const auto it = fixRoutes.find(row.vehicleId);
+        if (it != fixRoutes.end() && routePolylineQualityOk(it->second)) {
           row.route = it->second;
           row.routeDistanceM = polylineLengthMeters(row.route);
         }
@@ -3052,9 +3268,8 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     if (clusters.size() > 1) {
       std::vector<std::future<DestinationArrivalSummary>> futures;
       futures.reserve(clusters.size());
-      ThreadPool& pool = ThreadPool::instance();
       for (const auto& cluster : clusters) {
-        futures.push_back(pool.submit([&, cluster]() {
+        futures.push_back(runTopLevelAsync([&, cluster]() {
           return predictVehiclesToDestinationIndexed(cluster, histories, store, matchIndex, dest,
                                                    maxCorridorWidthM, param, chOverlayStore,
                                                    nationalSnapStore, nationalSnapIndex);
@@ -3104,9 +3319,8 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
       } else {
         std::vector<std::future<std::vector<VehicleArrivalResult>>> futures;
         futures.reserve(groups.size());
-        ThreadPool& pool = ThreadPool::instance();
         for (const auto& group : groups) {
-          futures.push_back(pool.submit([&, group]() {
+          futures.push_back(runTopLevelAsync([&, group]() {
             std::vector<VehicleArrivalResult> part;
             appendDestinationCsrBatchWithFallback(part, store, matchIndex, chRef, group, histories,
                                                 dest, localCorridorWidthM, param);

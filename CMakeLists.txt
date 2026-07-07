@@ -28,6 +28,7 @@ add_library(mmlp
   src/rtile_index.cpp
   src/spatial_index.cpp
   src/thread_pool.cpp
+  src/mmap_warm.cpp
 )
 target_include_directories(mmlp PUBLIC include)
 target_link_libraries(mmlp PUBLIC Threads::Threads)

@@ -1,6 +1,7 @@
 #include "mmlp/graph_store.hpp"
 
 #include "mmlp/geo.hpp"
+#include "mmlp/mmap_warm.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -205,6 +206,26 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
 
   binPath_ = binPath;
   return true;
+}
+
+void GraphFileStore::warmMappedRoutingFilesAsync() const {
+  auto warmFile = [](const CsrGraph& csr) {
+    if (!csr.isOpen()) {
+      return;
+    }
+    const void* data = csr.mappedData();
+    const std::size_t size = csr.mappedSize();
+    if (data == nullptr || size == 0) {
+      return;
+    }
+    if (size >= 8 * 1024 * 1024) {
+      warmMmapPagesParallelAsync(data, size);
+    } else {
+      warmMmapPagesAsync(data, size);
+    }
+  };
+  warmFile(csr_);
+  warmFile(hwyCsr_);
 }
 
 int GraphFileStore::nodeRowIndex(int64_t nodeId) const {

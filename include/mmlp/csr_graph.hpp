@@ -32,6 +32,9 @@ class CsrGraph {
   bool open(const std::string& csrPath, std::string* error = nullptr);
   bool isOpen() const { return data_ != nullptr; }
 
+  const void* mappedData() const { return data_; }
+  std::size_t mappedSize() const { return size_; }
+
   std::size_t nodeCount() const { return nodeCount_; }
   std::size_t arcCount() const { return arcCount_; }
 

@@ -3,6 +3,7 @@
 #include "mmlp/graph_store.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -61,7 +62,21 @@ bool CsrGraph::open(const std::string& csrPath, std::string* error) {
     ::close(fd);
     return fail("cannot stat: " + csrPath);
   }
-  void* ptr = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+  int flags = MAP_SHARED;
+#if defined(MAP_POPULATE)
+  std::size_t populateMaxMb = 256;
+  if (const char* env = std::getenv("MMLP_MMAP_POPULATE_MAX_MB")) {
+    const int v = std::atoi(env);
+    if (v > 0) {
+      populateMaxMb = static_cast<std::size_t>(v);
+    }
+  }
+  const std::size_t populateMaxBytes = populateMaxMb * 1024 * 1024;
+  if (st.st_size > 0 && static_cast<std::size_t>(st.st_size) <= populateMaxBytes) {
+    flags |= MAP_POPULATE;
+  }
+#endif
+  void* ptr = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, flags, fd, 0);
   ::close(fd);
   if (ptr == MAP_FAILED) {
     return fail("mmap failed: " + csrPath);

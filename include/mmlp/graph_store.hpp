@@ -46,6 +46,9 @@ class GraphFileStore {
   bool hasCh() const { return ch_.isOpen(); }
   const ChGraph& ch() const { return ch_; }
 
+  // Prefault CSR mmap into page cache (async, uses thread pool).
+  void warmMappedRoutingFilesAsync() const;
+
   // Row in nidx / CSR tables for a node id (-1 if missing).
   int nodeRowIndex(int64_t nodeId) const;
 

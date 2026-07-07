@@ -11,7 +11,7 @@ BINARY="${ROOT}/build/mmlp_service"
 LOAD_MODE="${MMLP_LOAD_MODE:-index}"
 AUTO_BUILD_INDEX="${AUTO_BUILD_INDEX:-1}"
 RESTART="${RESTART:-1}"
-MMLP_WORKERS="${MMLP_WORKERS:-12}"
+MMLP_WORKERS="${MMLP_WORKERS:-$(( $(nproc) > 2 ? $(nproc) - 2 : $(nproc) ))}"
 
 if [[ ! -x "${BINARY}" ]]; then
   echo "ERROR: binaries not built. Run: bash tools/bootstrap_service.sh" >&2

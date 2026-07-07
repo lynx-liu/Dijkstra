@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <thread>
 
 namespace mmlp {
 
@@ -11,7 +12,11 @@ ThreadPool& ThreadPool::instance() {
 }
 
 ThreadPool::ThreadPool() {
-  workers_ = 12;
+  const unsigned hw = std::thread::hardware_concurrency();
+  workers_ = hw > 2 ? static_cast<std::size_t>(hw - 1) : std::max(1u, hw);
+  if (workers_ > 18) {
+    workers_ = 18;
+  }
   if (const char* env = std::getenv("MMLP_WORKERS")) {
     const int n = std::atoi(env);
     if (n > 0) {
