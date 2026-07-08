@@ -5,6 +5,7 @@
 
 #include "mmlp/ch_graph.hpp"
 #include "mmlp/csr_graph.hpp"
+#include "mmlp/full_ch_graph.hpp"
 
 #include <cstdint>
 #include <string>
@@ -45,6 +46,8 @@ class GraphFileStore {
   const CsrGraph& hwyCsr() const { return hwyCsr_; }
   bool hasCh() const { return ch_.isOpen(); }
   const ChGraph& ch() const { return ch_; }
+  bool hasFullCh() const { return fullCh_.isOpen(); }
+  const FullChGraph& fullCh() const { return fullCh_; }
 
   // Prefault CSR mmap into page cache (async, uses thread pool).
   void warmMappedRoutingFilesAsync() const;
@@ -93,6 +96,7 @@ class GraphFileStore {
   CsrGraph csr_;
   CsrGraph hwyCsr_;
   ChGraph ch_;
+  FullChGraph fullCh_;
   const IdOffset* nodeIndex_ = nullptr;
   std::size_t nodeCount_ = 0;
   const IdOffset* edgeIndex_ = nullptr;

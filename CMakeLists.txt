@@ -30,6 +30,7 @@ add_library(mmlp
   src/routing.cpp
   src/csr_graph.cpp
   src/ch_graph.cpp
+  src/full_ch_graph.cpp
   src/rtile_index.cpp
   src/spatial_index.cpp
   src/thread_pool.cpp
@@ -66,8 +67,11 @@ target_link_libraries(mmlp_build_aux PRIVATE mmlp)
 
 add_executable(mmlp_build_hwy_csr apps/mmlp_build_hwy_csr.cpp)
 add_executable(mmlp_build_hwy_ch apps/mmlp_build_hwy_ch.cpp)
+add_executable(mmlp_build_full_ch apps/mmlp_build_full_ch.cpp)
 add_executable(ch_query_test apps/ch_query_test.cpp)
 target_link_libraries(ch_query_test PRIVATE mmlp)
+add_executable(full_ch_query_test apps/full_ch_query_test.cpp)
+target_link_libraries(full_ch_query_test PRIVATE mmlp)
 add_executable(mmlp_build_rtiles apps/mmlp_build_rtiles.cpp)
 
 add_executable(test_graph_io tests/test_graph_io.cpp)

@@ -204,6 +204,18 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
     }
   }
 
+  const std::string fullChPath = base + ".full.ch";
+  if (stat(fullChPath.c_str(), &st) == 0 && st.st_size > 0) {
+    std::string fullChErr;
+    if (!fullCh_.open(fullChPath, &fullChErr)) {
+      std::cerr << "[mmlp] full ch mmap skipped: " << fullChErr << "\n" << std::flush;
+    } else {
+      std::cerr << "[mmlp] full ch mmap ok nodes=" << fullCh_.nodeCount()
+                << " arcs=" << fullCh_.arcCount() << " path=" << fullChPath << "\n"
+                << std::flush;
+    }
+  }
+
   binPath_ = binPath;
   return true;
 }
@@ -226,6 +238,13 @@ void GraphFileStore::warmMappedRoutingFilesAsync() const {
   };
   warmFile(csr_);
   warmFile(hwyCsr_);
+  if (fullCh_.isOpen() && fullCh_.mappedData() != nullptr && fullCh_.mappedSize() > 0) {
+    if (fullCh_.mappedSize() >= 8 * 1024 * 1024) {
+      warmMmapPagesParallelAsync(fullCh_.mappedData(), fullCh_.mappedSize());
+    } else {
+      warmMmapPagesAsync(fullCh_.mappedData(), fullCh_.mappedSize());
+    }
+  }
 }
 
 int GraphFileStore::nodeRowIndex(int64_t nodeId) const {

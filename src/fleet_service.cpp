@@ -239,8 +239,9 @@ bool FleetMeetingService::preloadIndexOnly(std::string* error) {
   fullGraphLoaded_ = false;
   loadedBBox_ = {73.0, 15.0, 135.0, 54.0};
   std::cerr << "[mmlp] index-only mode ready (mmap on-demand subgraph)\n" << std::flush;
-  // Preload compact regional graphs used by destination arrive (prd/gd/nx/xj; sc loads on demand).
-  for (const char* suffix : {"prd", "gd", "xj", "nx"}) {
+  // Preload all regional graphs used by destination arrive (first on-demand
+  // load of the big sc graph costs >1 min, so pay it at startup instead).
+  for (const char* suffix : {"prd", "gd", "xj", "nx", "sc"}) {
     if (!regionalGraphFileExists(graphPath_, suffix)) {
       continue;
     }
@@ -703,12 +704,15 @@ DestinationArrivalSummary FleetMeetingService::vehiclesReachDestinationBy(
     const std::string destRegion = resolveRegionalSuffix(graphPath_, destLat, destLon);
     if (!destRegion.empty() && ensureRegionalGraph(destRegion, error)) {
       RegionalGraph& regional = regionalGraphs_.at(destRegion);
+      // National store/index: remote-vehicle full-CH pass + long-haul fallbacks.
       return predictVehiclesToDestinationIndexed(vehicles, histories, regional.store,
-                                                 regional.ctx.index, q, padM, p, nullptr);
+                                                 regional.ctx.index, q, padM, p, nullptr,
+                                                 &graphStore_, &ctx_.index);
     }
 
     return predictVehiclesToDestinationIndexed(vehicles, histories, graphStore_, ctx_.index, q,
-                                               padM, p, graphStore_.hasCh() ? &graphStore_ : nullptr);
+                                               padM, p, graphStore_.hasCh() ? &graphStore_ : nullptr,
+                                               &graphStore_, &ctx_.index);
   }
 
   return predictVehiclesToDestination(vehicles, histories, ctx_, ctx_.index, q, p);
