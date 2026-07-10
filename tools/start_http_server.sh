@@ -28,20 +28,9 @@ index_ready() {
 }
 
 regional_ready() {
-  local graph_dir graph_base prd gd nx xj
-  graph_dir="$(dirname "${GRAPH}")"
-  graph_base="$(basename "${GRAPH}" .bin)"
-  if [[ "${graph_base}" == *.mmlp ]]; then
-    graph_base="${graph_base%.mmlp}"
-  fi
-  prd="${graph_dir}/${graph_base}_prd.mmlp.bin"
-  gd="${graph_dir}/${graph_base}_gd.mmlp.bin"
-  nx="${graph_dir}/${graph_base}_nx.mmlp.bin"
-  xj="${graph_dir}/${graph_base}_xj.mmlp.bin"
-  [[ -f "${prd}" && -f "${prd%.bin}.sidx" && -f "${prd%.bin}.hwy.csr" && -f "${prd%.bin}.hwy.ch" ]] &&
-    [[ -f "${gd}" && -f "${gd%.bin}.sidx" && -f "${gd%.bin}.csr" ]] &&
-    [[ -f "${nx}" && -f "${nx%.bin}.sidx" && -f "${nx%.bin}.csr" ]] &&
-    [[ -f "${xj}" && -f "${xj%.bin}.sidx" && -f "${xj%.bin}.csr" ]]
+  # shellcheck source=/dev/null
+  source "${ROOT}/tools/china_regions_util.sh"
+  china_regions_all_ready "${GRAPH}"
 }
 
 if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
@@ -58,15 +47,25 @@ if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
   exit 1
 fi
 
-if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
-  echo "Regional graphs missing (prd/gd/nx/xj); building (first time may take 10-60 minutes)..."
-  REGIONS="${REGIONS:-prd,gd,nx,xj}" bash "${ROOT}/tools/build_region_graphs.sh" "${GRAPH}"
+# National dense Full CH is the preferred cross-province path; provincial
+# sidecars are optional fallback when china.mmlp.full.ch is absent.
+if [[ "${LOAD_MODE}" == "index" ]] && [[ ! -f "${BASE}.full.ch" ]] && ! regional_ready; then
+  echo "Provincial graphs/full.ch missing; building all regions (first install may take hours)..."
+  # shellcheck source=/dev/null
+  source "${ROOT}/tools/china_regions_util.sh"
+  ensure_all_china_regions "${GRAPH}"
 fi
 
-if [[ "${LOAD_MODE}" == "index" ]] && ! regional_ready; then
-  echo "ERROR: regional graphs still missing after build (need prd+hwy, gd, nx, xj)." >&2
-  echo "Run: bash tools/bootstrap_service.sh" >&2
+if [[ "${LOAD_MODE}" == "index" ]] && [[ ! -f "${BASE}.full.ch" ]] && ! regional_ready; then
+  echo "ERROR: not all provincial full.ch sidecars are ready (and no national full.ch)." >&2
+  # shellcheck source=/dev/null
+  source "${ROOT}/tools/china_regions_util.sh"
+  china_regions_print_missing "${GRAPH}" >&2
+  echo "Run: bash tools/bootstrap_service.sh  OR  bash tools/build_national_full_ch.sh" >&2
   exit 1
+fi
+if [[ -f "${BASE}.full.ch" ]]; then
+  echo "National Full CH: ${BASE}.full.ch ($(du -h "${BASE}.full.ch" | cut -f1))"
 fi
 
 echo "=== MMLP HTTP service ==="
@@ -84,6 +83,7 @@ if [[ "${LOAD_MODE}" == "full" ]]; then
 else
   echo "Startup: spatial index only (usually under 1 minute)"
 fi
+echo "Provincial CH: all regions preloaded at startup (set MMLP_PRELOAD_REGIONS=off to lazy-load)"
 echo "Listen: http://${HOST}:${PORT}"
 echo "  GET  /health /map"
 echo "  POST /api/vehicle /api/meetings/lead /api/destinations/arrive"

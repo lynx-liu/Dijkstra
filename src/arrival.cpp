@@ -2,6 +2,7 @@
 
 #include "mmlp/ch_graph.hpp"
 #include "mmlp/geo.hpp"
+#include "mmlp/region_registry.hpp"
 #include "mmlp/matching.hpp"
 #include "mmlp/meeting.hpp"
 #include "mmlp/motion.hpp"
@@ -56,6 +57,7 @@ double polylineLengthMeters(const RoutePolyline& route) {
 }
 
 bool routePolylineQualityOk(const RoutePolyline& route, double maxSegM = 12000.0);
+bool routePolylineDisplayOk(const RoutePolyline& route, double haulDistM);
 std::optional<RoutePolyline> stitchChOverlayRoutePolyline(
     const GraphFileStore& snapStore, const SpatialIndex& matchIndex, const VehicleInfo& vehicle,
     const DestinationQuery& dest, double speedMs, double maxHorizon, const PredictParam& param,
@@ -1193,9 +1195,10 @@ std::optional<VehicleArrivalResult> predictVehicleToDestinationCh(
       row.reachable = true;
       row.travelDurationSec = travel;
       row.etaUnix = eta;
+      const double haulM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
       if (auto stitched = stitchChOverlayRoutePolyline(snapStore, snapIndex, vehicle, dest, speedMs,
                                                      maxHorizon, param, path.polyline)) {
-        if (routePolylineQualityOk(*stitched)) {
+        if (routePolylineQualityOk(*stitched) || routePolylineDisplayOk(*stitched, haulM)) {
           row.route = std::move(*stitched);
           row.routeDistanceM = polylineLengthMeters(row.route);
           simplifyRoutePolyline(row.route, 120);
@@ -1205,7 +1208,11 @@ std::optional<VehicleArrivalResult> predictVehicleToDestinationCh(
       row.routeDistanceM = polylineLengthMeters(path.polyline);
       row.route = path.polyline;
       simplifyRoutePolyline(row.route, 120);
-      if (routePolylineQualityOk(row.route)) {
+      if (routePolylineQualityOk(row.route) || routePolylineDisplayOk(row.route, haulM)) {
+        return row;
+      }
+      // Last resort for corridor bridges: only accept drawable road shape.
+      if (routePolylineDisplayOk(row.route, haulM) && haulM >= 80000.0) {
         return row;
       }
       return std::nullopt;
@@ -1549,6 +1556,22 @@ bool routePolylineQualityOk(const RoutePolyline& route, double maxSegM) {
   }
   // Sparse CH highway backbone may have moderate gaps when the polyline has shape.
   return route.points.size() >= 4 && maxSeg <= 50000.0;
+}
+
+bool routePolylineDisplayOk(const RoutePolyline& route, double haulDistM) {
+  if (route.points.size() < 2) {
+    return false;
+  }
+  if (routePolylineQualityOk(route)) {
+    return true;
+  }
+  if (haulDistM < 150000.0) {
+    return false;
+  }
+  const double maxSeg = maxPolylineSegmentMeters(route);
+  // National highway CH is a sparse backbone: allow moderate steps, but reject
+  // multi-hundred-km chords that look like geodesic lines on the map.
+  return route.points.size() >= 8 && maxSeg <= 50000.0;
 }
 
 GraphPosition matchLatLonIndexed(const GraphFileStore& store, const SpatialIndex& matchIndex,
@@ -2118,6 +2141,29 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
     }
   });
 
+  // Drop portals that are not near the vehicle — a far portal makes ETA look
+  // reachable via a huge "walk" and reconstructs as a straight line on the map.
+  constexpr double kMaxPortalFromVehicleM = 80000.0;
+  auto filterNearVehiclePortals = [&](VehicleJob& job) {
+    std::vector<int64_t> kept;
+    kept.reserve(job.portals.size());
+    for (int64_t portal : job.portals) {
+      double plat = 0.0;
+      double plon = 0.0;
+      if (!chStore.nodeLatLon(portal, plat, plon)) {
+        continue;
+      }
+      if (haversineMeters({job.vehicle->lat, job.vehicle->lon}, {plat, plon}) <=
+          kMaxPortalFromVehicleM) {
+        kept.push_back(portal);
+      }
+    }
+    job.portals = std::move(kept);
+  };
+  for (auto& job : jobs) {
+    filterNearVehiclePortals(job);
+  }
+
   std::vector<std::size_t> needToward;
   needToward.reserve(jobs.size());
   for (std::size_t i = 0; i < jobs.size(); ++i) {
@@ -2126,37 +2172,60 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
     }
   }
   if (!needToward.empty()) {
-    std::vector<LatLon> vehicleLl;
-    std::vector<double> towardGeo;
-    vehicleLl.reserve(needToward.size());
-    towardGeo.reserve(needToward.size());
-    for (std::size_t i : needToward) {
-      vehicleLl.push_back({jobs[i].vehicle->lat, jobs[i].vehicle->lon});
-      const double distToGoal =
-          haversineMeters({jobs[i].vehicle->lat, jobs[i].vehicle->lon}, {dest.lat, dest.lon});
-      towardGeo.push_back(distToGoal > 180000.0 ? distToGoal * 0.25 + 15000.0
-                                                  : std::min(80000.0, distToGoal * 0.25 + 15000.0));
-    }
-    const std::vector<std::vector<int64_t>> towardPortals =
-        collectOverlayChNodesTowardBatch(chStore, ch, hwyCsr, vehicleLl, goalNodes, towardGeo, 8);
-    for (std::size_t j = 0; j < needToward.size(); ++j) {
+    // Prefer geometric nearest highway nodes near the vehicle (not a walk from
+    // the destination, which can leave remote fleets with goal-side portals).
+    parallelFor(needToward.size(), [&](std::size_t j) {
       const std::size_t i = needToward[j];
-      for (int64_t node : towardPortals[j]) {
-        jobs[i].portals.push_back(node);
+      const VehicleInfo& vehicle = *jobs[i].vehicle;
+      jobs[i].portals = findNearestHwyOverlayNodes(snapStore, chStore, hwyCsr, ch, matchIndex,
+                                                   vehicle.lat, vehicle.lon, 50000.0, 8);
+      if (jobs[i].portals.empty()) {
+        jobs[i].portals = findNearestHwyOverlayNodes(snapStore, chStore, hwyCsr, ch, matchIndex,
+                                                     vehicle.lat, vehicle.lon, 120000.0, 8);
       }
       if (jobs[i].portals.empty()) {
         const double distToGoal =
-            haversineMeters({jobs[i].vehicle->lat, jobs[i].vehicle->lon}, {dest.lat, dest.lon});
-        jobs[i].portals = collectOverlayChNodesToward(
-            chStore, ch, hwyCsr, jobs[i].vehicle->lat, jobs[i].vehicle->lon, goalNodes,
-            distToGoal + 35000.0, 8);
+            haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+        const double geoMax =
+            distToGoal > 180000.0 ? std::min(120000.0, distToGoal * 0.08 + 25000.0)
+                                  : std::min(80000.0, distToGoal * 0.25 + 15000.0);
+        jobs[i].portals = collectOverlayChNodesToward(chStore, ch, hwyCsr, vehicle.lat, vehicle.lon,
+                                                      goalNodes, geoMax, 8);
+        filterNearVehiclePortals(jobs[i]);
       }
       if (jobs[i].portals.empty()) {
         jobs[i].portals = collectOverlayChNodes(snapStore, chStore, ch, hwyCsr, matchIndex,
-                                                jobs[i].vehicle->lat, jobs[i].vehicle->lon,
-                                                jobs[i].vehicle->type, 50000.0, 8);
+                                                vehicle.lat, vehicle.lon, vehicle.type, 50000.0, 8);
+        filterNearVehiclePortals(jobs[i]);
+      }
+      if (!jobs[i].portals.empty()) {
+        storeVehiclePortals(vehicle, jobs[i].portals);
+      }
+    });
+  }
+
+  {
+    std::size_t withPortal = 0;
+    double maxPortalGap = 0.0;
+    for (const auto& job : jobs) {
+      if (job.portals.empty()) {
+        continue;
+      }
+      ++withPortal;
+      for (int64_t portal : job.portals) {
+        double plat = 0.0;
+        double plon = 0.0;
+        if (chStore.nodeLatLon(portal, plat, plon)) {
+          maxPortalGap = std::max(
+              maxPortalGap,
+              haversineMeters({job.vehicle->lat, job.vehicle->lon}, {plat, plon}));
+        }
       }
     }
+    std::cerr << "[mmlp] hwy_portals jobs=" << jobs.size() << " with_portal=" << withPortal
+              << " need_seed=" << needToward.size() << " max_portal_gap_m=" << maxPortalGap
+              << " goal_nodes=" << goalNodes.size() << "\n"
+              << std::flush;
   }
 
   constexpr double kMetroDistM = 180000.0;
@@ -2251,6 +2320,49 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
     return row;
   };
 
+  // Reconstruct highway polyline from the shared reverse Dijkstra parent tree
+  // (O(path length), not a second CH query per vehicle).
+  auto attachHwyParentRoute = [&](VehicleArrivalResult& row, const VehicleJob& job,
+                                  int64_t portalNode, const CachedHwyDistField& field) {
+    if (portalNode == 0 || field.parentNodeByRow.empty()) {
+      return;
+    }
+    double plat = 0.0;
+    double plon = 0.0;
+    if (!chStore.nodeLatLon(portalNode, plat, plon)) {
+      return;
+    }
+    const LatLon vehLl{job.vehicle->lat, job.vehicle->lon};
+    // Guard: portal must sit near the vehicle or the map line becomes a fake chord.
+    if (haversineMeters(vehLl, {plat, plon}) > 80000.0) {
+      return;
+    }
+    RoutePolyline hwyPath =
+        polylineFromGoalCsrParents(chStore, hwyCsr, field.parentNodeByRow, field.parentEdgeByRow,
+                                   portalNode, field.goalNodeId);
+    if (hwyPath.points.size() < 2) {
+      // Parent tree incomplete for this portal: fall back to one CH query.
+      const RouteToGoal path =
+          ch.query(chStore, hwyCsr, portalNode, field.goalNodeId, job.vehicle->type, routeParam,
+                   job.maxHorizon + 60.0);
+      if (path.polyline.points.size() < 2 || path.travelTimeSec >= kInfTime / 2.0) {
+        return;
+      }
+      hwyPath = path.polyline;
+    }
+    const LatLon destLl{dest.lat, dest.lon};
+    RoutePolyline route;
+    appendRoutePt(route, vehLl);
+    appendPolylinePoints(route, hwyPath);
+    appendRoutePt(route, destLl);
+    simplifyRoutePolyline(route, 120);
+    // Reject near-straight artifacts (vehicle -> dest with almost no shape).
+    if (route.points.size() >= 4 && maxPolylineSegmentMeters(route) <= 250000.0) {
+      row.route = std::move(route);
+      row.routeDistanceM = polylineLengthMeters(row.route);
+    }
+  };
+
   if (!hwyJobs.empty()) {
     std::unordered_set<int64_t> targetNodes;
     targetNodes.reserve(hwyJobs.size() * 4);
@@ -2266,6 +2378,117 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
         targetNodes.insert(portal);
       }
     }
+
+    // Cross-country: reverse Dijkstra from the destination often fails to reach
+    // remote portals (sparse hwy CSR / early target pruning). Use one CH query
+    // per vehicle instead — parallel and returns a real highway polyline.
+    constexpr double kLongHaulSpanM = 250000.0;
+    if (spanM > kLongHaulSpanM) {
+      // Cap seed fan-out: 2 portals × 2 goals keeps 98-vehicle fleets in ~1–3s.
+      std::vector<int64_t> longGoals = goalNodes;
+      if (longGoals.size() > 2) {
+        longGoals.resize(2);
+      }
+      std::vector<std::optional<VehicleArrivalResult>> rows(hwyJobs.size());
+      parallelFor(hwyJobs.size(), [&](std::size_t i) {
+        const VehicleJob& job = hwyJobs[i];
+        const LatLon vehLl{job.vehicle->lat, job.vehicle->lon};
+        const LatLon destLl{dest.lat, dest.lon};
+        std::vector<int64_t> portals = job.portals;
+        if (portals.size() > 2) {
+          // Keep the two portals closest to the vehicle.
+          std::sort(portals.begin(), portals.end(), [&](int64_t a, int64_t b) {
+            double alat = 0.0, alon = 0.0, blat = 0.0, blon = 0.0;
+            const double da =
+                chStore.nodeLatLon(a, alat, alon) ? haversineMeters(vehLl, {alat, alon}) : 1e100;
+            const double db =
+                chStore.nodeLatLon(b, blat, blon) ? haversineMeters(vehLl, {blat, blon}) : 1e100;
+            return da < db;
+          });
+          portals.resize(2);
+        }
+        double bestTravel = kInfTime;
+        RoutePolyline bestRoute;
+        int tried = 0;
+        int foundPath = 0;
+        int rejectedShape = 0;
+        for (int64_t portal : portals) {
+          double plat = 0.0;
+          double plon = 0.0;
+          if (!chStore.nodeLatLon(portal, plat, plon)) {
+            continue;
+          }
+          const double walkM = haversineMeters(vehLl, {plat, plon});
+          if (walkM > 80000.0) {
+            continue;
+          }
+          for (int64_t goalNode : longGoals) {
+            ++tried;
+            const RouteToGoal path =
+                ch.query(chStore, hwyCsr, portal, goalNode, job.vehicle->type, routeParam,
+                         job.maxHorizon + 60.0);
+            if (path.polyline.points.size() < 2 || path.travelTimeSec >= kInfTime / 2.0) {
+              continue;
+            }
+            ++foundPath;
+            const double travel =
+                path.travelTimeSec +
+                travelTimeSeconds(walkM, job.speedMs, job.vehicle->type, routeParam);
+            if (travel >= bestTravel || travel > job.maxHorizon + 1e-6) {
+              continue;
+            }
+            RoutePolyline route;
+            appendRoutePt(route, vehLl);
+            appendPolylinePoints(route, path.polyline);
+            appendRoutePt(route, destLl);
+            simplifyRoutePolyline(route, 120);
+            if (route.points.size() < 4 || maxPolylineSegmentMeters(route) > 250000.0) {
+              ++rejectedShape;
+              continue;
+            }
+            bestTravel = travel;
+            bestRoute = std::move(route);
+          }
+        }
+        if (i < 2) {
+          std::cerr << "[mmlp] long_haul_ch veh=" << job.vehicle->id << " portals=";
+          for (int64_t portal : portals) {
+            std::cerr << portal << ",";
+          }
+          std::cerr << " goals=";
+          for (int64_t g : longGoals) {
+            std::cerr << g << ",";
+          }
+          std::cerr << " tried=" << tried << " found=" << foundPath
+                    << " reject_shape=" << rejectedShape << " best=" << bestTravel << "\n"
+                    << std::flush;
+        }
+        if (bestTravel >= kInfTime / 2.0) {
+          return;
+        }
+        const double eta = static_cast<double>(job.vehicle->timestamp) + bestTravel;
+        if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
+          return;
+        }
+        VehicleArrivalResult row;
+        row.vehicleId = job.vehicle->id;
+        row.reachable = true;
+        row.travelDurationSec = bestTravel;
+        row.etaUnix = eta;
+        row.route = std::move(bestRoute);
+        row.routeDistanceM = polylineLengthMeters(row.route);
+        rows[i] = std::move(row);
+      });
+      results.reserve(results.size() + hwyJobs.size());
+      for (auto& row : rows) {
+        if (row) {
+          results.push_back(std::move(*row));
+        }
+      }
+      return results;
+    }
+
+    // Metro / regional: shared reverse Dijkstra field + parent reconstruction.
     const double maxRadiusM = spanM + 35000.0;
     const uint64_t hwyKey = destRouteCacheKey(dest, 0.0) ^ static_cast<uint64_t>(goalPos.nodeId);
     std::shared_ptr<CachedHwyDistField> hwyCached;
@@ -2273,20 +2496,21 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
       std::shared_lock<std::shared_mutex> read(hwyDistFieldCacheMu);
       if (hwyDistFieldCache && hwyDistFieldCache->key == hwyKey &&
           hwyDistFieldCache->goalNodeId == goalPos.nodeId &&
-          hwyDistFieldCache->distByRow.size() == hwyCsr.nodeCount()) {
+          hwyDistFieldCache->distByRow.size() == hwyCsr.nodeCount() &&
+          !hwyDistFieldCache->parentNodeByRow.empty()) {
         hwyCached = hwyDistFieldCache;
       }
     }
     if (!hwyCached) {
-      std::vector<double> distByRow = computeRoutedDistFromGoalCsrDense(
-          chStore, hwyCsr, goalPos.nodeId, groupSpeedMs, dest.type, routeParam, groupMaxHorizon,
-          &targetNodes, &goalLl, maxRadiusM);
       auto cached = std::make_shared<CachedHwyDistField>();
       cached->key = hwyKey;
       cached->goalNodeId = goalPos.nodeId;
-      cached->distByRow = std::move(distByRow);
+      cached->distByRow = computeRoutedDistFromGoalCsrDense(
+          chStore, hwyCsr, goalPos.nodeId, groupSpeedMs, dest.type, routeParam, groupMaxHorizon,
+          &targetNodes, &goalLl, maxRadiusM, &cached->parentNodeByRow, &cached->parentEdgeByRow);
       std::unique_lock<std::shared_mutex> write(hwyDistFieldCacheMu);
-      if (hwyDistFieldCache && hwyDistFieldCache->key == hwyKey) {
+      if (hwyDistFieldCache && hwyDistFieldCache->key == hwyKey &&
+          !hwyDistFieldCache->parentNodeByRow.empty()) {
         hwyCached = hwyDistFieldCache;
       } else {
         hwyDistFieldCache = cached;
@@ -2302,8 +2526,35 @@ std::vector<VehicleArrivalResult> predictVehiclesToDestinationHwyCsrBatch(
       return distByRow[static_cast<std::size_t>(row)];
     };
 
-    for (const auto& job : hwyJobs) {
-      if (auto row = buildRowFromPortals(job, nodeTime)) {
+    {
+      std::size_t finitePortal = 0;
+      std::size_t totalPortal = 0;
+      for (const auto& job : hwyJobs) {
+        for (int64_t portal : job.portals) {
+          ++totalPortal;
+          if (nodeTime(portal) < kInfTime / 2.0) {
+            ++finitePortal;
+          }
+        }
+      }
+      std::cerr << "[mmlp] hwy_field goal=" << goalPos.nodeId << " span_m=" << spanM
+                << " radius_m=" << maxRadiusM << " targets=" << targetNodes.size()
+                << " finite_portals=" << finitePortal << "/" << totalPortal << "\n"
+                << std::flush;
+    }
+
+    // Parent-tree reconstruction is cheap; do all vehicles in parallel.
+    std::vector<std::optional<VehicleArrivalResult>> rows(hwyJobs.size());
+    parallelFor(hwyJobs.size(), [&](std::size_t i) {
+      int64_t bestPortal = 0;
+      if (auto row = buildRowFromPortals(hwyJobs[i], nodeTime, &bestPortal)) {
+        attachHwyParentRoute(*row, hwyJobs[i], bestPortal, *hwyCached);
+        rows[i] = std::move(*row);
+      }
+    });
+    results.reserve(results.size() + hwyJobs.size());
+    for (auto& row : rows) {
+      if (row) {
         results.push_back(std::move(*row));
       }
     }
@@ -2753,6 +3004,9 @@ void appendDestinationCsrBatchWithFallback(
       }
       const VehicleInfo& vehicle = *vit->second;
       const double distM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+      if (routePolylineDisplayOk(row.route, distM)) {
+        continue;
+      }
       if (distM > kLongHaulDistM) {
         row.route.points.clear();
         needRouteFix.push_back(vehicle);
@@ -3085,9 +3339,57 @@ std::vector<VehicleInfo> appendGeodesicArrivalRows(std::vector<VehicleArrivalRes
     row.travelDurationSec = travel;
     row.etaUnix = eta;
     row.routeDistanceM = roadM;
+    // No polyline: geodesic is ETA-only; callers that need a map line must
+    // attach a real highway/regional route elsewhere.
     out.push_back(std::move(row));
   }
   return rest;
+}
+
+// Cross-province: one shared hwy reverse-Dijkstra field; ETA + real highway
+// polylines reconstructed from parent pointers (no per-vehicle CH query).
+void appendRemoteHwyArrivalBatch(
+    std::vector<VehicleArrivalResult>& out, const GraphFileStore& snapStore,
+    const SpatialIndex& snapIndex, const GraphFileStore& chRef,
+    const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
+    const DestinationQuery& dest, const PredictParam& param,
+    const SpatialIndex* nationalSnapIndex, const GraphFileStore* nationalSnapStore) {
+  if (vehicles.empty() || !chRef.hasCh() || !chRef.hasHwyCsr()) {
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<VehicleArrivalResult> batch = predictVehiclesToDestinationHwyCsrBatch(
+      snapStore, snapIndex, chRef, vehicles, histories, dest, param, nationalSnapIndex,
+      nationalSnapStore);
+  std::unordered_set<std::string> have;
+  have.reserve(batch.size());
+  std::size_t withRoute = 0;
+  for (auto& row : batch) {
+    have.insert(row.vehicleId);
+    if (row.route.points.size() >= 2) {
+      ++withRoute;
+    }
+    out.push_back(std::move(row));
+  }
+  // Vehicles with no hwy portal / disconnected component: ETA-only geodesic.
+  std::vector<VehicleInfo> leftover;
+  leftover.reserve(vehicles.size());
+  for (const auto& vehicle : vehicles) {
+    if (have.count(vehicle.id) == 0) {
+      leftover.push_back(vehicle);
+    }
+  }
+  if (!leftover.empty()) {
+    appendGeodesicArrivalRows(out, leftover, histories, dest, param, 0.0);
+  }
+  std::cerr << "[mmlp] remote_hwy_batch vehicles=" << vehicles.size()
+            << " reachable=" << batch.size() << " with_route=" << withRoute
+            << " geodesic=" << leftover.size() << " ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count()
+            << "\n"
+            << std::flush;
 }
 
 // Full-graph CH fast path: one bidirectional query per vehicle, fully parallel,
@@ -3164,6 +3466,9 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     if (!goalPos.valid || haversineMeters(goalLl, {dest.lat, dest.lon}) > 100000.0) {
       // Destination is far off-road (open sea, deep mountains): no road route
       // exists, straight-line ETA is the honest answer for everyone.
+      if (param.requireRoutePolyline) {
+        return vehicles;
+      }
       return appendGeodesicArrivalRows(out, vehicles, histories, dest, param, 0.0);
     }
     return vehicles;
@@ -3228,14 +3533,21 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     // Profile speed (<=80km/h capped by limits) is >= truck speed in practice, so
     // profile time <= vehicle time; pad anyway for the rare faster vehicle.
     const double maxProfileSec = maxHorizon * 1.6 + 1800.0;
-    const FullChGraph::PathResult path = ch.route(fromSeeds.seeds, goalSeeds.seeds, maxProfileSec);
+    const std::size_t settleCap =
+        param.maxVisitedNodes > 0 ? param.maxVisitedNodes : static_cast<std::size_t>(400000);
+    const FullChGraph::PathResult path = ch.route(fromSeeds.seeds, goalSeeds.seeds, maxProfileSec,
+                                                  settleCap, param.maxRouteWallMs);
     if (path.capped) {
+      if (param.maxRouteWallMs > 0.0) {
+        // Interactive corridor hop: hard miss, no slow fallback / geodesic chord.
+        return;
+      }
       slots[i].needFallback = true;  // search truncated: reachability unknown
       slots[i].reason = 'c';
       return;
     }
     if (!path.found) {
-      if (nearestSeeds) {
+      if (nearestSeeds && param.maxRouteWallMs <= 0.0) {
         // Nearest-node seeding is approximate (seed may sit in a disconnected
         // fragment): "no path" is not authoritative, let the fallback decide.
         slots[i].needFallback = true;
@@ -3244,6 +3556,7 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
       }
       // Full-graph CH covers every road node: no path within the padded cap
       // means the destination is not reachable inside the horizon.
+      // Corridor hops (maxRouteWallMs>0) also hard-miss here.
       return;
     }
 
@@ -3276,11 +3589,12 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
       return;
     }
 
-    // Polyline is capped at 120 points: sample arcs before hitting the node
-    // table (per-arc nodeLatLon on long paths = tens of thousands of random
-    // page faults into the multi-GB .bin, which thrashes the page cache).
-    constexpr std::size_t kMaxPolyPts = 116;
-    const std::size_t stride = std::max<std::size_t>(1, path.arcs.size() / kMaxPolyPts);
+    // Polyline: sample by road distance. Adaptive step keeps maxSeg drawable
+    // on multi-thousand-km hauls (fixed 8km + 400-pt cap used to jump to end
+    // and leave 200–700km visual chords).
+    constexpr std::size_t kMaxPolyPts = 800;
+    const double sampleEveryM =
+        std::max(8000.0, distM / static_cast<double>(std::max<std::size_t>(kMaxPolyPts / 2, 40)));
     RoutePolyline route;
     route.points.reserve(std::min(path.arcs.size(), kMaxPolyPts) + 6);
     appendRoutePt(route, {vehicle.lat, vehicle.lon});
@@ -3290,18 +3604,30 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     if (!path.arcs.empty() && store.nodeLatLon(path.arcs.front().fromNodeId, plat, plon)) {
       appendRoutePt(route, {plat, plon});
     }
-    for (std::size_t k = 0; k < path.arcs.size(); k += stride) {
-      if (store.nodeLatLon(path.arcs[k].toNodeId, plat, plon)) {
-        appendRoutePt(route, {plat, plon});
+    double sinceSampleM = 0.0;
+    double stepM = sampleEveryM;
+    for (std::size_t k = 0; k < path.arcs.size(); ++k) {
+      sinceSampleM += static_cast<double>(path.arcs[k].lengthM);
+      const bool last = (k + 1 == path.arcs.size());
+      if (sinceSampleM >= stepM || last) {
+        if (store.nodeLatLon(path.arcs[k].toNodeId, plat, plon)) {
+          appendRoutePt(route, {plat, plon});
+        }
+        sinceSampleM = 0.0;
+        // If we are filling the budget, sparsify remaining samples instead of
+        // jumping to the destination (that creates geodesic-looking chords).
+        if (route.points.size() >= (kMaxPolyPts * 3) / 4 && !last) {
+          const double remainM = distM - polylineLengthMeters(route);
+          const std::size_t room = (kMaxPolyPts > route.points.size() + 4)
+                                       ? (kMaxPolyPts - route.points.size() - 4)
+                                       : 1;
+          stepM = std::max(stepM, remainM / static_cast<double>(room));
+        }
       }
-    }
-    if (stride > 1 && !path.arcs.empty() &&
-        store.nodeLatLon(path.arcs.back().toNodeId, plat, plon)) {
-      appendRoutePt(route, {plat, plon});
     }
     appendRoutePt(route, goalLl);
     appendRoutePt(route, {dest.lat, dest.lon});
-    simplifyRoutePolyline(route, 120);
+    simplifyRoutePolyline(route, kMaxPolyPts);
 
     VehicleArrivalResult row;
     row.vehicleId = vehicle.id;
@@ -3337,7 +3663,8 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     const std::vector<VehicleInfo>& vehicles, const std::vector<VehicleHistory>& histories,
     const GraphFileStore& store, const SpatialIndex& matchIndex, const DestinationQuery& dest,
     double maxCorridorWidthM, const PredictParam& param, const GraphFileStore* chOverlayStore,
-    const GraphFileStore* nationalSnapStore, const SpatialIndex* nationalSnapIndex) {
+    const GraphFileStore* nationalSnapStore, const SpatialIndex* nationalSnapIndex,
+    const char* destRegionSuffix) {
   // Prefer explicit overlay (e.g. PRD hwy on national snap store) over store's own hwy CSR.
   const GraphFileStore& chRef =
       (chOverlayStore != nullptr && chOverlayStore->hasCh() && chOverlayStore->hasHwyCsr())
@@ -3382,50 +3709,98 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     return summary;
   }
 
-  // Full-graph CH fast path: pre-built hierarchy answers any destination in
-  // milliseconds per vehicle; only off-graph vehicles fall through.
-  if (dest.type == VehicleType::TRUCK &&
-      (store.hasFullCh() ||
-       (nationalSnapStore != nullptr && nationalSnapStore->hasFullCh()))) {
-    const auto tFullCh0 = std::chrono::steady_clock::now();
-    std::vector<VehicleInfo> leftover = routable;
-    if (store.hasFullCh()) {
-      leftover.clear();
-      leftover = appendDestinationFullChBatch(summary.vehicles, summary.locationId, store,
-                                              matchIndex, routable, histories, dest, param);
+  // Fast path: in-region vehicles use regional full.ch; cross-province vehicles use
+  // national highway CH (with route polylines). Geodesic is last-resort ETA only.
+  std::vector<VehicleInfo> localRoutable;
+  std::vector<VehicleInfo> remoteRoutable;
+  const bool splitByRegion = destRegionSuffix != nullptr && destRegionSuffix[0] != '\0';
+  if (splitByRegion) {
+    localRoutable.reserve(routable.size());
+    remoteRoutable.reserve(routable.size());
+    for (const auto& vehicle : routable) {
+      if (pointInRegionSuffix(destRegionSuffix, vehicle.lat, vehicle.lon)) {
+        localRoutable.push_back(vehicle);
+      } else {
+        remoteRoutable.push_back(vehicle);
+      }
     }
-    // Remote vehicles (outside the regional graph) ride the national
-    // highway-level CH with nearest-node seeding.
-    if (!leftover.empty() && nationalSnapStore != nullptr && nationalSnapIndex != nullptr &&
-        nationalSnapStore->hasFullCh()) {
+  } else {
+    localRoutable = routable;
+  }
+
+  const bool hasFastLocalCh = store.hasFullCh();
+  const bool hasNationalHwy = chRef.hasCh() && chRef.hasHwyCsr();
+  const bool canFastPath =
+      dest.type == VehicleType::TRUCK &&
+      ((hasFastLocalCh && !localRoutable.empty()) ||
+       (hasNationalHwy && !remoteRoutable.empty()) ||
+       (nationalSnapStore != nullptr && nationalSnapStore->hasFullCh()));
+  if (canFastPath) {
+    const auto tFast0 = std::chrono::steady_clock::now();
+    std::vector<VehicleInfo> leftover;
+
+    if (hasFastLocalCh && !localRoutable.empty()) {
+      leftover = appendDestinationFullChBatch(summary.vehicles, summary.locationId, store,
+                                            matchIndex, localRoutable, histories, dest, param);
+      if (!leftover.empty() && param.maxRouteWallMs <= 0.0 && !param.requireRoutePolyline) {
+        leftover =
+            appendGeodesicArrivalRows(summary.vehicles, leftover, histories, dest, param, 0.0);
+      }
+    }
+
+    if (!remoteRoutable.empty()) {
+      // Prefer national dense Full CH (one-shot A→B) over sparse hwy CH.
+      if (nationalSnapStore != nullptr && nationalSnapIndex != nullptr &&
+          nationalSnapStore->hasFullCh()) {
+        leftover = appendDestinationFullChBatch(summary.vehicles, summary.locationId,
+                                                *nationalSnapStore, *nationalSnapIndex,
+                                                remoteRoutable, histories, dest, param,
+                                                /*nearestSeeds=*/false);
+        if (!leftover.empty() && hasNationalHwy) {
+          const GraphFileStore& remoteSnap = *nationalSnapStore;
+          const SpatialIndex& remoteIdx = *nationalSnapIndex;
+          appendRemoteHwyArrivalBatch(summary.vehicles, remoteSnap, remoteIdx, chRef, leftover,
+                                      histories, dest, param, nationalSnapIndex,
+                                      nationalSnapStore);
+        } else if (!leftover.empty() && !param.requireRoutePolyline) {
+          leftover = appendGeodesicArrivalRows(summary.vehicles, leftover, histories, dest, param,
+                                               0.0);
+        }
+      } else if (hasNationalHwy) {
+        const GraphFileStore& remoteSnap =
+            (nationalSnapStore != nullptr) ? *nationalSnapStore : store;
+        const SpatialIndex& remoteIdx =
+            (nationalSnapIndex != nullptr) ? *nationalSnapIndex : matchIndex;
+        appendRemoteHwyArrivalBatch(summary.vehicles, remoteSnap, remoteIdx, chRef,
+                                    remoteRoutable, histories, dest, param, nationalSnapIndex,
+                                    nationalSnapStore);
+      } else {
+        appendGeodesicArrivalRows(summary.vehicles, remoteRoutable, histories, dest, param, 0.0);
+      }
+    }
+
+    // Legacy path when no regional suffix: try national full.ch on leftovers.
+    if (!splitByRegion && !leftover.empty() && nationalSnapStore != nullptr &&
+        nationalSnapIndex != nullptr && nationalSnapStore->hasFullCh()) {
       leftover = appendDestinationFullChBatch(summary.vehicles, summary.locationId,
                                               *nationalSnapStore, *nationalSnapIndex, leftover,
                                               histories, dest, param, /*nearestSeeds=*/true);
+      if (!leftover.empty()) {
+        leftover =
+            appendGeodesicArrivalRows(summary.vehicles, leftover, histories, dest, param, 0.0);
+      }
     }
-    // Far leftovers (outside this regional graph, highway CH disconnected):
-    // straight-line ETA at vehicle speed incl. truck rests. Same coarseness as
-    // the old hwy fallback rows (walk offset + no polyline) at zero cost.
-    if (!leftover.empty()) {
-      leftover = appendGeodesicArrivalRows(summary.vehicles, leftover, histories, dest, param,
-                                           150000.0);
-    }
-    const auto tFullCh1 = std::chrono::steady_clock::now();
-    std::cerr << "[mmlp] destination indexed(full_ch) vehicles=" << vehicles.size()
+
+    const auto tFast1 = std::chrono::steady_clock::now();
+    std::cerr << "[mmlp] destination indexed(fast) vehicles=" << vehicles.size()
               << " pruned=" << pruned << " routable=" << routable.size()
-              << " leftover=" << leftover.size() << " full_ch_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(tFullCh1 - tFullCh0).count()
+              << " local=" << localRoutable.size() << " remote=" << remoteRoutable.size()
+              << " leftover=" << leftover.size() << " fast_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(tFast1 - tFast0).count()
               << " reachable=" << summary.vehicles.size() << "\n"
               << std::flush;
-    if (leftover.empty()) {
-      sortDestinationArrivals(summary.vehicles, dest.sortBy);
-      return summary;
-    }
-    routable = std::move(leftover);
-    maxSpanM = 0.0;
-    for (const auto& vehicle : routable) {
-      maxSpanM = std::max(
-          maxSpanM, haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon}));
-    }
+    sortDestinationArrivals(summary.vehicles, dest.sortBy);
+    return summary;
   }
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -3627,7 +4002,8 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
         futures.push_back(runTopLevelAsync([&, cluster]() {
           return predictVehiclesToDestinationIndexed(cluster, histories, store, matchIndex, dest,
                                                    maxCorridorWidthM, param, chOverlayStore,
-                                                   nationalSnapStore, nationalSnapIndex);
+                                                   nationalSnapStore, nationalSnapIndex,
+                                                   destRegionSuffix);
         }));
       }
       for (auto& future : futures) {

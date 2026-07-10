@@ -36,7 +36,7 @@ if [[ ! -d build ]]; then
   "${CMAKE}" -S . -B build
 fi
 "${CMAKE}" --build build --target mmlp_service mmlp_build_aux mmlp_build_hwy_csr mmlp_build_hwy_ch \
-  -j"${BUILD_JOBS}"
+  mmlp_build_full_ch -j"${BUILD_JOBS}"
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
@@ -54,8 +54,10 @@ fi
 echo "[4/7] Ensure nationwide index sidecars..."
 bash tools/ensure_graph_index.sh "${GRAPH}"
 
-echo "[5/7] Ensure regional graphs (prd + gd + nx + xj, skip if already built)..."
-REGIONS="${REGIONS:-prd,gd,nx,xj}" bash tools/build_region_graphs.sh "${GRAPH}"
+echo "[5/7] Ensure all provincial graphs + offline full.ch (35 regions)..."
+# shellcheck source=/dev/null
+source tools/china_regions_util.sh
+ensure_all_china_regions "${GRAPH}"
 
 echo "[6/7] Fetch map page vendor (Leaflet + MapLibre + glyphs, offline)..."
 bash tools/fetch_web_vendor.sh
@@ -84,40 +86,25 @@ if [[ "${graph_base}" == *.mmlp ]]; then
   graph_base="${graph_base%.mmlp}"
 fi
 PRD_BIN="${graph_dir}/${graph_base}_prd.mmlp.bin"
-GD_BIN="${graph_dir}/${graph_base}_gd.mmlp.bin"
-NX_BIN="${graph_dir}/${graph_base}_nx.mmlp.bin"
-XJ_BIN="${graph_dir}/${graph_base}_xj.mmlp.bin"
 if [[ ! -f "${PRD_BIN}" || ! -f "${PRD_BIN%.bin}.hwy.ch" ]]; then
   echo "ERROR: PRD regional graph or hwy overlay missing." >&2
   echo "  expected: ${PRD_BIN}" >&2
   echo "  expected: ${PRD_BIN%.bin}.hwy.ch" >&2
-  echo "Re-run with: SKIP_EXISTING=0 REGIONS=prd,gd,nx,xj bash tools/build_region_graphs.sh" >&2
+  echo "Re-run with: SKIP_EXISTING=0 REGIONS=prd bash tools/build_region_graphs.sh" >&2
   exit 1
 fi
-if [[ ! -f "${GD_BIN}" || ! -f "${GD_BIN%.bin}.csr" ]]; then
-  echo "ERROR: GD regional graph missing (needed for Guangdong province)." >&2
-  echo "  expected: ${GD_BIN}" >&2
-  echo "Re-run with: SKIP_EXISTING=0 REGIONS=gd bash tools/build_region_graphs.sh" >&2
+if ! china_regions_all_ready "${GRAPH}"; then
+  echo "ERROR: not all provincial full.ch sidecars are ready." >&2
+  china_regions_print_missing "${GRAPH}" >&2
   exit 1
 fi
-if [[ ! -f "${NX_BIN}" || ! -f "${NX_BIN%.bin}.csr" ]]; then
-  echo "ERROR: NX regional graph missing (needed for Ningxia/Inner Mongolia)." >&2
-  echo "  expected: ${NX_BIN}" >&2
-  echo "Re-run with: SKIP_EXISTING=0 REGIONS=nx bash tools/build_region_graphs.sh" >&2
-  exit 1
-fi
-if [[ ! -f "${XJ_BIN}" || ! -f "${XJ_BIN%.bin}.sidx" ]]; then
-  echo "ERROR: XJ regional graph missing (needed for Xinjiang)." >&2
-  echo "  expected: ${XJ_BIN}" >&2
-  echo "Re-run with: SKIP_EXISTING=0 REGIONS=xj bash tools/build_region_graphs.sh" >&2
-  exit 1
-fi
+read -r _ready _b _c _total <<<"$(china_regions_counts "${GRAPH}")"
 
 echo ""
 echo "Bootstrap complete."
-echo "  binaries: build/mmlp_service build/mmlp_build_aux build/mmlp_build_hwy_csr build/mmlp_build_hwy_ch"
+echo "  binaries: build/mmlp_service build/mmlp_build_aux mmlp_build_hwy_csr mmlp_build_hwy_ch mmlp_build_full_ch"
 echo "  graph:    ${GRAPH}"
-echo "  regional: ${PRD_BIN} (+ hwy), ${GD_BIN}, ${NX_BIN}, ${XJ_BIN}"
+echo "  regional: ${_total} provinces with offline full.ch (incl. ${PRD_BIN} + hwy)"
 echo ""
 echo "Start HTTP service:"
 echo "  bash tools/start_http_server.sh"

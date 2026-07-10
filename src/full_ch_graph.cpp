@@ -130,12 +130,16 @@ int FullChGraph::nodeIndex(int64_t nodeId) const {
 
 FullChGraph::PathResult FullChGraph::route(const std::vector<Seed>& from,
                                            const std::vector<Seed>& to, double maxSec,
-                                           std::size_t settleCap) const {
+                                           std::size_t settleCap, double maxWallMs) const {
   PathResult result;
   if (!isOpen() || from.empty() || to.empty() || maxSec <= 0.0) {
     return result;
   }
   const auto tEnter = std::chrono::steady_clock::now();
+  const bool useWall = maxWallMs > 0.0;
+  const auto wallDeadline =
+      tEnter + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                   std::chrono::duration<double, std::milli>(maxWallMs));
 
   const auto* arcTable = static_cast<const FullChArcRec*>(arcs_);
 
@@ -226,6 +230,15 @@ FullChGraph::PathResult FullChGraph::route(const std::vector<Seed>& from,
   };
 
   while (!qf.empty() || !qb.empty()) {
+    if (useWall && (settled & 63u) == 0u &&
+        std::chrono::steady_clock::now() >= wallDeadline) {
+      if (meet == kNoChild) {
+        result.capped = true;
+        result.settledNodes = settled;
+        return result;
+      }
+      break;
+    }
     const bool fDone = qf.empty() || qf.top().first >= best;
     const bool bDone = qb.empty() || qb.top().first >= best;
     if (fDone && bDone) {

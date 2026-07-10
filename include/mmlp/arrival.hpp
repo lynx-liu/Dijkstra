@@ -33,7 +33,8 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
     double maxCorridorWidthM, const PredictParam& param = PredictParam{},
     const GraphFileStore* chOverlayStore = nullptr,
     const GraphFileStore* nationalSnapStore = nullptr,
-    const SpatialIndex* nationalSnapIndex = nullptr);
+    const SpatialIndex* nationalSnapIndex = nullptr,
+    const char* destRegionSuffix = nullptr);
 
 void sortDestinationArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy);
 

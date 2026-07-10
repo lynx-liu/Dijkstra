@@ -250,7 +250,7 @@
         const ms = parseVehicleTimeMs(v);
         if (!Number.isNaN(ms)) maxMs = Math.max(maxMs, ms);
       }
-      const d = new Date(maxMs + 24 * 3600 * 1000);
+      const d = new Date(maxMs + 7 * 24 * 3600 * 1000);
       const pad = n => String(n).padStart(2, '0');
       return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
@@ -346,9 +346,7 @@
       destConfirm.disabled = true;
       const nVeh = vehicles.length;
       destError.textContent =
-        nVeh >= 20
-          ? `计算中…（${nVeh} 辆车，约需 5–15 秒，请勿重复点击）`
-          : '计算中…';
+        nVeh >= 20 ? `计算中…（${nVeh} 辆）` : '计算中…';
       const timeoutMs = Math.min(300000, 15000 + vehicles.length * 2000);
       const timeoutId = setTimeout(() => destAbortController.abort(), timeoutMs);
       try {
@@ -624,6 +622,49 @@
       return route.filter(p => Array.isArray(p) && p.length >= 2).map(p => [p[0], p[1]]);
     }
 
+    // Split at >50km jumps — anything larger is a visual chord at map scale.
+    // Also drop near-straight stubs and segments whose densest hop is a chord.
+    function routeSegments(route, maxGapM = 50000) {
+      const pts = latLngs(route);
+      if (pts.length < 2) return [];
+      const segs = [];
+      let cur = [pts[0]];
+      const R = 6371000;
+      const hav = (a, b) => {
+        const toRad = d => d * Math.PI / 180;
+        const dLat = toRad(b[0] - a[0]);
+        const dLon = toRad(b[1] - a[1]);
+        const x = Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+        return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+      };
+      for (let i = 1; i < pts.length; i++) {
+        if (hav(pts[i - 1], pts[i]) > maxGapM) {
+          if (cur.length >= 2) segs.push(cur);
+          cur = [pts[i]];
+        } else {
+          cur.push(pts[i]);
+        }
+      }
+      if (cur.length >= 2) segs.push(cur);
+      return segs.filter(seg => {
+        if (seg.length < 2) return false;
+        let path = 0;
+        let maxStep = 0;
+        for (let i = 1; i < seg.length; i++) {
+          const d = hav(seg[i - 1], seg[i]);
+          path += d;
+          if (d > maxStep) maxStep = d;
+        }
+        const chord = hav(seg[0], seg[seg.length - 1]);
+        if (maxStep > maxGapM) return false;
+        // Reject geodesic stubs: few vertices and almost perfectly straight.
+        if (seg.length <= 4 && path > 1000 && chord / path > 0.97) return false;
+        if (path > 100000 && (path / (seg.length - 1)) > 40000 && chord / path > 0.9) return false;
+        return path >= 50;
+      });
+    }
+
     function fmtKm(m) {
       if (m == null || Number.isNaN(m)) return '-';
       return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
@@ -831,16 +872,17 @@
           const dim = highlightIdx >= 0 && highlightIdx !== idx;
           const opacity = dim ? 0.25 : 0.88;
           const weight = dim ? 2 : 5;
-          const pts = latLngs(row.route);
-          if (pts.length >= 2) {
-            L.polyline(pts, {
+          const segs = routeSegments(row.route);
+          // Never fall back to raw points — they may contain long chords.
+          segs.forEach(seg => {
+            L.polyline(seg, {
               color: pal.focal,
               weight,
               opacity,
               dashArray: dim ? '4 6' : null,
             }).addTo(layers);
-            pts.forEach(p => bounds.push(p));
-          }
+            seg.forEach(p => bounds.push(p));
+          });
         });
       }
 

@@ -27,6 +27,7 @@ add_library(mmlp
   src/motion.cpp
   src/predict.cpp
   src/region_loader.cpp
+  src/region_registry.cpp
   src/routing.cpp
   src/csr_graph.cpp
   src/ch_graph.cpp

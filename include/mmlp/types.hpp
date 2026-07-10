@@ -57,6 +57,12 @@ struct PredictParam {
   double meetDistance = 300.0;  // meters
   double maxTime = 172800.0;    // seconds (2 days)
   std::size_t maxVisitedNodes = 400000;  // 0 = unlimited Dijkstra expansion
+  // Soft wall-clock for FullChGraph::route (0 = disabled). Used by interactive
+  // corridor hops so a single miss cannot burn seconds.
+  double maxRouteWallMs = 0.0;
+  // When true, Full CH leftovers are NOT replaced by empty-route geodesic ETA
+  // rows (corridor first-legs need real polylines or an honest miss).
+  bool requireRoutePolyline = false;
 
   double truckCycle = 4.0 * 3600.0;
   double truckRest = 30.0 * 60.0;

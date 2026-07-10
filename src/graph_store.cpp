@@ -220,6 +220,33 @@ bool GraphFileStore::open(const std::string& binPath, std::string* error) {
   return true;
 }
 
+void GraphFileStore::warmMappedRoutingFiles() const {
+  auto warmFile = [](const CsrGraph& csr) {
+    if (!csr.isOpen()) {
+      return;
+    }
+    const void* data = csr.mappedData();
+    const std::size_t size = csr.mappedSize();
+    if (data == nullptr || size == 0) {
+      return;
+    }
+    if (size >= 8 * 1024 * 1024) {
+      warmMmapPagesParallel(data, size);
+    } else {
+      warmMmapPages(data, size);
+    }
+  };
+  warmFile(csr_);
+  warmFile(hwyCsr_);
+  if (fullCh_.isOpen() && fullCh_.mappedData() != nullptr && fullCh_.mappedSize() > 0) {
+    if (fullCh_.mappedSize() >= 8 * 1024 * 1024) {
+      warmMmapPagesParallel(fullCh_.mappedData(), fullCh_.mappedSize());
+    } else {
+      warmMmapPages(fullCh_.mappedData(), fullCh_.mappedSize());
+    }
+  }
+}
+
 void GraphFileStore::warmMappedRoutingFilesAsync() const {
   auto warmFile = [](const CsrGraph& csr) {
     if (!csr.isOpen()) {

@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -86,7 +88,8 @@ class FleetMeetingService {
     bool ready = false;
     bool fullGraph = false;
   };
-  std::unordered_map<std::string, RegionalGraph> regionalGraphs_;
+  std::unordered_map<std::string, std::unique_ptr<RegionalGraph>> regionalGraphs_;
+  mutable std::mutex regionalMutex_;
   GeoBBox loadedBBox_{};
   bool graphReady_ = false;
   bool fullGraphLoaded_ = false;

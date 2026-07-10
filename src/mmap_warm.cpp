@@ -4,18 +4,24 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
+
 namespace mmlp {
 
 void warmMmapPages(const void* data, std::size_t size) {
   if (data == nullptr || size == 0) {
     return;
   }
+  // Hint the kernel, then touch every page so the first interactive query is hot.
+  ::madvise(const_cast<void*>(data), size, MADV_WILLNEED);
   const char* bytes = static_cast<const char*>(data);
-  constexpr std::size_t kStride = 256 * 1024;
+  constexpr std::size_t kStride = 4096;
+  volatile char sink = 0;
   for (std::size_t off = 0; off < size; off += kStride) {
-    (void)bytes[off];
+    sink = static_cast<char>(sink + bytes[off]);
   }
-  (void)bytes[size - 1];
+  sink = static_cast<char>(sink + bytes[size - 1]);
+  (void)sink;
 }
 
 void warmMmapPagesAsync(const void* data, std::size_t size) {
@@ -50,13 +56,16 @@ void warmMmapPagesParallel(const void* data, std::size_t size) {
     }
     const std::size_t end = std::min(size, begin + chunk);
     threads.emplace_back([bytes, begin, end]() {
+      ::madvise(const_cast<char*>(bytes + begin), end - begin, MADV_WILLNEED);
       constexpr std::size_t kStride = 4096;
+      volatile char sink = 0;
       for (std::size_t off = begin; off < end; off += kStride) {
-        (void)bytes[off];
+        sink = static_cast<char>(sink + bytes[off]);
       }
       if (end > begin) {
-        (void)bytes[end - 1];
+        sink = static_cast<char>(sink + bytes[end - 1]);
       }
+      (void)sink;
     });
   }
   for (auto& thread : threads) {

@@ -1,0 +1,29 @@
+---
+description: Cross-province routing must be accurate and interactive (<1s)
+alwaysApply: true
+---
+
+# Cross-province routing goals
+
+## Hard requirements
+
+1. **Accurate**: Draw real road polylines end-to-end. Never accept geodesic chords, 2-point stubs, axis-aligned fake densify, or "metrics pass / map fails" shortcuts.
+2. **Interactive latency**: Destination click / fleet route response must stay **under 1 second** (same bar as earlier healthy same-province Full CH runs). Memory, build time, and cold startup may be large; query latency may not.
+
+## Preferred architecture
+
+- Prefer **one national dense Full CH query** (`china.mmlp.full.ch`) for cross-province A→B instead of provincial stitch + sparse hwy bridge.
+- Provincial Full CH may remain for same-province / preload, but must not be the cross-province correctness path.
+- Preload / page-cache warm national Full CH at startup so the first interactive query is hot.
+
+## Forbidden regressions
+
+- Raising UI gap thresholds to hide holes
+- Treating empty-route geodesic ETA as success
+- Multi-candidate hwy grids / long stitch chains that blow past 1s
+- Claiming success from segment-count / end@dest metrics without drawable maxSeg / visual road shape checks
+
+## Acceptance
+
+- Map shows continuous real roads to the clicked destination
+- Server path for a typical click finishes in **<1s** when graphs are warm

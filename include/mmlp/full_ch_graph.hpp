@@ -58,8 +58,9 @@ class FullChGraph {
   // Multi-source/multi-target bidirectional CH search + full unpack.
   // settleCap bounds worst-case latency (isolated islands would otherwise scan
   // the whole up-graph); reachable queries settle far fewer nodes than the cap.
+  // maxWallMs (0 = off) aborts the search early for interactive corridor hops.
   PathResult route(const std::vector<Seed>& from, const std::vector<Seed>& to, double maxSec,
-                   std::size_t settleCap = 400000) const;
+                   std::size_t settleCap = 400000, double maxWallMs = 0.0) const;
 
  private:
   void* data_ = nullptr;
