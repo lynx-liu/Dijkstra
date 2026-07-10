@@ -439,7 +439,7 @@
         render(state);
         statusEl.textContent =
           `截止 ${(result.destination && result.destination.arriveBy) || arriveBy} · ` +
-          `可按时 ${nOn} · 超时有轨迹 ${nLate}（改时间后需再点计算）`;
+          `可按时 ${nOn} · 超时可达 ${nLate}（改时间后需再点计算）`;
       } catch (e) {
         if (e.name === 'AbortError') {
           destError.textContent = '计算超时或已取消，请稍后重试';
@@ -583,7 +583,10 @@
     function renderStatus(state) {
       const nV = (state.vehicles || []).length;
       const nM = (state.meetings || []).filter(m => m.found).length;
-      const nA = (state.arrivals || []).length;
+      const arrivals = state.arrivals || [];
+      // Strict: only reachable===true is on-time; false = late-with-route (still drawn).
+      const nOn = arrivals.filter(a => a.reachable === true).length;
+      const nLate = arrivals.filter(a => a.reachable === false).length;
       const focal = state.focal || '-';
       const extra = [tileLabel, tileHint].filter(Boolean).join(' · ');
       const updated = state.updatedAt
@@ -594,7 +597,9 @@
         const dest = state.destination || {};
         const by = dest.arriveBy || '-';
         const sortLabel = state.sortBy || 'duration';
-        summary = `车辆 ${nV} 辆 · 可按时到达 ${nA} 辆 · 截止 ${by} · 排序 ${sortLabel} · 更新 ${updated}`;
+        summary =
+          `车辆 ${nV} 辆 · 可按时 ${nOn} · 超时可达 ${nLate} · 截止 ${by} · ` +
+          `排序 ${sortLabel} · 更新 ${updated}`;
       } else {
         const modeLabel = state.mode === 'batch' ? '批量会合' : '单车';
         summary = `车辆 ${nV} 辆 · 会合 ${nM} 组 · 基准 ${focal} · ${modeLabel} · 更新 ${updated}`;
@@ -774,7 +779,7 @@
         late.forEach(row => {
           const v = vehicles.find(x => x.id === row.vehicleId) || { id: row.vehicleId };
           rows.push(`<div class="veh-row" style="border-color:#a855f7">
-            <b>${escapeHtml(v.id)}</b> 超时（有轨迹）<br>
+            <b>${escapeHtml(v.id)}</b> 超时可达<br>
             行程 ${row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-'}
             · 预计 ${row.eta || '-'} · 速度 ${v.speed ?? '-'} km/h
           </div>`);
@@ -889,7 +894,7 @@
         const nLate = arrivalPanel ? arrivalPanel.late.length : 0;
         destMk.bindPopup(
           `<b>目的地</b><br>须在 ${dest.arriveBy || '-'} 前到达<br>` +
-          `可按时 ${nOn} · 超时有轨迹 ${nLate}`
+          `可按时 ${nOn} · 超时可达 ${nLate}`
         );
         destMk.addTo(layers);
         bounds.push([dest.lat, dest.lon]);
@@ -919,7 +924,7 @@
         if (rank >= 0) {
           popup += onTimeIds.has(v.id)
             ? `<br>到达排序 #${rank + 1}（可按时）`
-            : `<br>超时有轨迹（预计晚于截止）`;
+            : `<br>超时可达（预计晚于截止）`;
         }
         m.bindPopup(popup);
         m.addTo(layers);
