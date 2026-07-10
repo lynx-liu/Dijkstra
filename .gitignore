@@ -1,6 +1,7 @@
 build/
 *.o
 *.a
+logs/
 data/graph/
 data/graph/*.mmlp*
 Testing/Temporary/
