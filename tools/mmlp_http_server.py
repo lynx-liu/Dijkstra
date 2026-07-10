@@ -470,6 +470,9 @@ def make_handler(core: MmlpCore, web_root: str):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
+            # Avoid stale live.html / JS after reachability fixes.
+            if rel_path.endswith((".html", ".js", ".css")):
+                self.send_header("Cache-Control", "no-store, max-age=0")
             self.end_headers()
             self.wfile.write(data)
             return True

@@ -182,8 +182,11 @@
     <div class="dest-dialog" role="dialog" aria-labelledby="destDialogTitle">
       <h3 id="destDialogTitle">设置目的地</h3>
       <div class="coords" id="destCoords">-</div>
-      <label for="destArriveBy">到达时间</label>
-      <input type="datetime-local" id="destArriveBy" />
+      <label for="destArriveBy">到达截止时间（本地时间）</label>
+      <input type="datetime-local" id="destArriveBy" step="60" />
+      <p class="hint" style="margin:4px 0 8px;font-size:12px;color:#64748b">
+        按此时间判定「可按时 / 超时」；改时间后点「计算并更新」才会重算。
+      </p>
       <label for="destSortBy">排序方式</label>
       <select id="destSortBy">
         <option value="duration">行程时间（最快优先）</option>
@@ -244,21 +247,66 @@
       return Date.parse(s.endsWith('Z') ? s : s + 'Z');
     }
 
-    function defaultArriveLocalInput(vehicles) {
+    function haversineM(aLat, aLon, bLat, bLon) {
+      const R = 6371000;
+      const toR = d => d * Math.PI / 180;
+      const dLat = toR(bLat - aLat);
+      const dLon = toR(bLon - aLon);
+      const x = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toR(aLat)) * Math.cos(toR(bLat)) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+    }
+
+    /** Default deadline from fleet→dest distances so near cars can make it and far cars often cannot. */
+    function defaultArriveLocalInput(vehicles, destLat, destLon) {
       let maxMs = Date.now();
+      const dists = [];
       for (const v of vehicles) {
         const ms = parseVehicleTimeMs(v);
         if (!Number.isNaN(ms)) maxMs = Math.max(maxMs, ms);
+        if (v.lat != null && v.lon != null && destLat != null && destLon != null) {
+          dists.push(haversineM(v.lat, v.lon, destLat, destLon));
+        }
       }
-      const d = new Date(maxMs + 7 * 24 * 3600 * 1000);
+      dists.sort((a, b) => a - b);
+      // Use ~60th percentile: nearer majority fits; farthest quartile often late.
+      let targetM = dists.length ? dists[Math.min(dists.length - 1, Math.floor(dists.length * 0.6))] : 300000;
+      targetM = Math.max(targetM, dists.length ? dists[0] * 1.5 : 80000);
+      const roadM = targetM * 1.3;
+      const speedMs = 60 / 3.6;
+      let travelSec = roadM / speedMs;
+      // Truck rest cycles (4h drive / 30min rest), matching backend defaults.
+      travelSec += Math.floor(travelSec / (4 * 3600)) * 30 * 60;
+      travelSec *= 1.15;
+      const minSec = 12 * 3600;
+      const maxSec = 21 * 24 * 3600;
+      const horizonSec = Math.min(maxSec, Math.max(minSec, travelSec));
+      const d = new Date(maxMs + horizonSec * 1000);
       const pad = n => String(n).padStart(2, '0');
       return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
 
     function localInputToIsoUtc(localVal) {
-      const d = new Date(localVal);
+      // datetime-local is local wall time ("YYYY-MM-DDTHH:MM"). Parse components
+      // explicitly — do not rely on Date.parse(string) (browser-dependent).
+      const m = String(localVal || '').trim()
+        .match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+      if (!m) return '';
+      const d = new Date(
+        Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+        Number(m[4]), Number(m[5]), Number(m[6] || 0), 0
+      );
       if (Number.isNaN(d.getTime())) return '';
+      // Always emit seconds (…:SSZ); safest for the C++ ISO parser.
       return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
+
+    function isoUtcToLocalInput(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return '';
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
 
     function vehiclesPayload(vehicles) {
@@ -315,7 +363,11 @@
       }
       pendingDest = { lat, lon };
       destCoords.textContent = `纬度 ${lat.toFixed(5)} · 经度 ${lon.toFixed(5)}`;
-      destArriveBy.value = defaultArriveLocalInput(vehicles);
+      // Prefer last used deadline when re-picking, so tweaking time is obvious.
+      const prevBy = lastState && lastState.destination && lastState.destination.arriveBy;
+      destArriveBy.value = prevBy
+        ? (isoUtcToLocalInput(prevBy) || defaultArriveLocalInput(vehicles, lat, lon))
+        : defaultArriveLocalInput(vehicles, lat, lon);
       destSortBy.value = (lastState && lastState.sortBy) || 'duration';
       destError.textContent = '';
       destConfirm.disabled = false;
@@ -367,13 +419,16 @@
         if (!res.ok || result.error) {
           throw new Error(result.error || res.statusText);
         }
+        const arrivals = result.vehicles || [];
+        const nOn = arrivals.filter(a => a.reachable === true).length;
+        const nLate = arrivals.filter(a => a.reachable === false).length;
         const state = {
           mode: 'arrival',
           focal: '',
           vehicles,
           meetings: [],
           destination: result.destination || {},
-          arrivals: result.vehicles || [],
+          arrivals,
           sortBy: result.sortBy || destSortBy.value,
           updatedAt: new Date().toISOString(),
         };
@@ -382,6 +437,9 @@
         closeDestDialog();
         clearPickMarker();
         render(state);
+        statusEl.textContent =
+          `截止 ${(result.destination && result.destination.arriveBy) || arriveBy} · ` +
+          `可按时 ${nOn} · 超时有轨迹 ${nLate}（改时间后需再点计算）`;
       } catch (e) {
         if (e.name === 'AbortError') {
           destError.textContent = '计算超时或已取消，请稍后重试';
@@ -670,14 +728,21 @@
       return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
     }
 
-    /** Reachable first by shortest travel time; unreachable at the end. */
+    /** On-time first by travel time; late (have route but miss deadline) next; no-route last. */
     function orderArrivalPanel(vehicles, arrivals) {
       const byId = new Map(arrivals.map(a => [a.vehicleId, a]));
-      const reachable = arrivals
+      // Strict: only reachable===true counts as on-time (missing field ≠ on-time).
+      const onTime = arrivals
+        .filter(a => a.reachable === true)
         .slice()
         .sort((a, b) => (a.travelDurationSec ?? Infinity) - (b.travelDurationSec ?? Infinity));
+      const late = arrivals
+        .filter(a => a.reachable === false)
+        .slice()
+        .sort((a, b) => (a.travelDurationSec ?? Infinity) - (b.travelDurationSec ?? Infinity));
+      const withRoute = onTime.concat(late);
       const unreachable = vehicles.filter(v => !byId.has(v.id));
-      return { reachable, unreachable, byId };
+      return { reachable: onTime, late, withRoute, unreachable, byId };
     }
 
     function renderPanel(state) {
@@ -689,42 +754,62 @@
 
       if (state.mode === 'arrival') {
         document.getElementById('panelTitle').textContent = '目的地到达排序';
+        const arrivalPanel = orderArrivalPanel(vehicles, arrivals);
         document.getElementById('panelHint').textContent =
           `目的地 (${dest.lat != null ? dest.lat.toFixed(4) : '-'}, ${dest.lon != null ? dest.lon.toFixed(4) : '-'}) · ` +
-          `须在 ${dest.arriveBy || '-'} 前到达 · 排序：${state.sortBy || 'duration'} · 点击地图可重新设置目的地`;
+          `截止 ${dest.arriveBy || '-'} · 可按时 ${arrivalPanel.reachable.length} · ` +
+          `超时 ${arrivalPanel.late.length} · 排序：${state.sortBy || 'duration'} · 点击地图可重新设置目的地`;
         panel.style.display = 'block';
-        const { reachable, unreachable } = orderArrivalPanel(vehicles, arrivals);
+        const { reachable, late, unreachable } = arrivalPanel;
         const vList = document.getElementById('vehicleList');
         const rows = [];
         reachable.forEach((row, idx) => {
           const v = vehicles.find(x => x.id === row.vehicleId) || { id: row.vehicleId };
           rows.push(`<div class="veh-row" style="border-color:#ea580c">
-            <b>${escapeHtml(v.id)}</b> #${idx + 1} 可到达<br>
+            <b>${escapeHtml(v.id)}</b> #${idx + 1} 可按时到达<br>
             行程 ${row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-'}
             · 速度 ${v.speed ?? '-'} km/h
           </div>`);
         });
+        late.forEach(row => {
+          const v = vehicles.find(x => x.id === row.vehicleId) || { id: row.vehicleId };
+          rows.push(`<div class="veh-row" style="border-color:#a855f7">
+            <b>${escapeHtml(v.id)}</b> 超时（有轨迹）<br>
+            行程 ${row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-'}
+            · 预计 ${row.eta || '-'} · 速度 ${v.speed ?? '-'} km/h
+          </div>`);
+        });
         unreachable.forEach(v => {
           rows.push(`<div class="veh-row" style="border-color:#94a3b8">
-            <b>${escapeHtml(v.id)}</b> 无法按时到达<br>速度 ${v.speed ?? '-'} km/h
+            <b>${escapeHtml(v.id)}</b> 无路网路径<br>速度 ${v.speed ?? '-'} km/h
           </div>`);
         });
         vList.innerHTML = rows.join('');
         const mList = document.getElementById('meetingList');
-        if (reachable.length === 0) {
-          mList.innerHTML = '<div class="meta">无车辆能在截止时间前到达</div>';
+        if (reachable.length === 0 && late.length === 0) {
+          mList.innerHTML = '<div class="meta">无车辆算出路网路径</div>';
           return;
         }
-        mList.innerHTML = reachable.map((row, idx) => {
+        const listRows = [];
+        reachable.forEach((row, idx) => {
           const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
           const dur = row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-';
           const eta = row.eta || '-';
-          return `<div class="meet-item" data-idx="${idx}" style="border-color:${pal.focal}">
-            <div class="title">#${idx + 1} ${row.vehicleId}</div>
+          listRows.push(`<div class="meet-item" data-idx="${idx}" style="border-color:${pal.focal}">
+            <div class="title">#${idx + 1} ${escapeHtml(row.vehicleId)} · 可按时</div>
             <div class="meta">行程 ${dur} · 预计到达 ${eta}</div>
             <div class="meta">路网 ${fmtKm(row.routeDistanceM)}</div>
-          </div>`;
-        }).join('');
+          </div>`);
+        });
+        late.forEach((row, j) => {
+          const idx = reachable.length + j;
+          listRows.push(`<div class="meet-item" data-idx="${idx}" style="border-color:#a855f7">
+            <div class="title">${escapeHtml(row.vehicleId)} · 超时</div>
+            <div class="meta">行程 ${row.travelDurationSec != null ? row.travelDurationSec.toFixed(0) + ' 秒' : '-'} · 预计 ${row.eta || '-'}</div>
+            <div class="meta">路网 ${fmtKm(row.routeDistanceM)}（截止后到达）</div>
+          </div>`);
+        });
+        mList.innerHTML = listRows.join('');
         mList.querySelectorAll('.meet-item').forEach(el => {
           el.addEventListener('click', () => {
             highlightIdx = Number(el.dataset.idx);
@@ -789,19 +874,22 @@
       const arrivalPanel = state.mode === 'arrival'
         ? orderArrivalPanel(vehicles, arrivals)
         : null;
-      const sortedArrivals = arrivalPanel ? arrivalPanel.reachable : arrivals;
+      const sortedArrivals = arrivalPanel ? arrivalPanel.withRoute : arrivals;
       const arrivalRank = new Map(
         sortedArrivals.map((row, idx) => [row.vehicleId, idx])
       );
+      const onTimeIds = new Set((arrivalPanel ? arrivalPanel.reachable : []).map(r => r.vehicleId));
 
       if (state.mode === 'arrival' && dest.lat != null && dest.lon != null) {
         const destMk = L.marker([dest.lat, dest.lon], {
           icon: destinationIcon(),
           zIndexOffset: 200,
         });
+        const nOn = arrivalPanel ? arrivalPanel.reachable.length : arrivals.length;
+        const nLate = arrivalPanel ? arrivalPanel.late.length : 0;
         destMk.bindPopup(
           `<b>目的地</b><br>须在 ${dest.arriveBy || '-'} 前到达<br>` +
-          `可到达 ${arrivals.length} 辆车`
+          `可按时 ${nOn} · 超时有轨迹 ${nLate}`
         );
         destMk.addTo(layers);
         bounds.push([dest.lat, dest.lon]);
@@ -815,7 +903,11 @@
           : -1;
         let color = isFocal ? '#1e3a8a' : '#14532d';
         if (state.mode === 'arrival') {
-          color = rank >= 0 ? '#c2410c' : '#64748b';
+          if (rank >= 0) {
+            color = onTimeIds.has(v.id) ? '#c2410c' : '#7e22ce';
+          } else {
+            color = '#64748b';
+          }
         }
         const m = L.marker([v.lat, v.lon], {
           icon: vehicleIcon(v.id, color),
@@ -824,7 +916,11 @@
         let popup = `<b>${escapeHtml(v.id)}</b>`;
         if (isFocal) popup += ' (基准车)';
         popup += `<br>速度 ${v.speed ?? '-'} km/h`;
-        if (rank >= 0) popup += `<br>到达排序 #${rank + 1}`;
+        if (rank >= 0) {
+          popup += onTimeIds.has(v.id)
+            ? `<br>到达排序 #${rank + 1}（可按时）`
+            : `<br>超时有轨迹（预计晚于截止）`;
+        }
         m.bindPopup(popup);
         m.addTo(layers);
         bounds.push([v.lat, v.lon]);
@@ -868,18 +964,20 @@
 
       if (state.mode === 'arrival') {
         sortedArrivals.forEach((row, idx) => {
-          const pal = MEETING_PALETTE[idx % MEETING_PALETTE.length];
+          const onTime = row.reachable === true;
+          const pal = onTime
+            ? MEETING_PALETTE[idx % MEETING_PALETTE.length]
+            : { focal: '#9333ea' };
           const dim = highlightIdx >= 0 && highlightIdx !== idx;
-          const opacity = dim ? 0.25 : 0.88;
-          const weight = dim ? 2 : 5;
+          const opacity = dim ? 0.2 : (onTime ? 0.88 : 0.7);
+          const weight = dim ? 2 : (onTime ? 5 : 3.5);
           const segs = routeSegments(row.route);
-          // Never fall back to raw points — they may contain long chords.
           segs.forEach(seg => {
             L.polyline(seg, {
               color: pal.focal,
               weight,
               opacity,
-              dashArray: dim ? '4 6' : null,
+              dashArray: onTime ? (dim ? '4 6' : null) : '6 8',
             }).addTo(layers);
             seg.forEach(p => bounds.push(p));
           });

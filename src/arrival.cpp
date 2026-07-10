@@ -357,26 +357,21 @@ std::string graphLocationId(const GraphPosition& pos) {
 }
 
 void sortDestinationArrivals(std::vector<VehicleArrivalResult>& rows, ArrivalSortBy sortBy) {
-  switch (sortBy) {
-    case ArrivalSortBy::ETA:
-      std::sort(rows.begin(), rows.end(),
-                [](const VehicleArrivalResult& a, const VehicleArrivalResult& b) {
+  // On-time first, then late (still have routes); within each group apply sortBy.
+  std::sort(rows.begin(), rows.end(),
+            [sortBy](const VehicleArrivalResult& a, const VehicleArrivalResult& b) {
+              if (a.reachable != b.reachable) {
+                return a.reachable && !b.reachable;
+              }
+              switch (sortBy) {
+                case ArrivalSortBy::ETA:
                   return a.etaUnix < b.etaUnix;
-                });
-      break;
-    case ArrivalSortBy::DISTANCE:
-      std::sort(rows.begin(), rows.end(),
-                [](const VehicleArrivalResult& a, const VehicleArrivalResult& b) {
+                case ArrivalSortBy::DISTANCE:
                   return a.routeDistanceM < b.routeDistanceM;
-                });
-      break;
-    default:
-      std::sort(rows.begin(), rows.end(),
-                [](const VehicleArrivalResult& a, const VehicleArrivalResult& b) {
+                default:
                   return a.travelDurationSec < b.travelDurationSec;
-                });
-      break;
-  }
+              }
+            });
 }
 
 constexpr double kChMinDistM = 50000.0;
@@ -480,6 +475,74 @@ std::vector<int64_t> findNearestHwyOverlayNodes(const GraphFileStore& snapStore,
       double nlat = 0.0;
       double nlon = 0.0;
       if (!chStore.nodeLatLon(nodeId, nlat, nlon)) {
+        continue;
+      }
+      const double d = haversineMeters({lat, lon}, {nlat, nlon});
+      if (d <= radiusM) {
+        candidates.push_back({nodeId, d});
+      }
+    }
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.distM < b.distM; });
+  for (const auto& c : candidates) {
+    if (out.size() >= maxNodes) {
+      break;
+    }
+    if (std::find(out.begin(), out.end(), c.node) == out.end()) {
+      out.push_back(c.node);
+    }
+  }
+  return out;
+}
+
+// Nearest Full-CH road nodes via spatial index (any road edge, not only hwy overlay).
+// Used when edge snap fails (click >kMaxSnapDistanceMeters from a road) so we still
+// route to the nearest on-graph point instead of falling back to empty-route geodesic.
+std::vector<int64_t> findNearestFullChRoadNodes(const GraphFileStore& store, const FullChGraph& ch,
+                                                const SpatialIndex& index, double lat, double lon,
+                                                VehicleType type, double radiusM,
+                                                std::size_t maxNodes) {
+  std::vector<int64_t> out;
+  struct Candidate {
+    int64_t node = 0;
+    double distM = 0.0;
+  };
+  std::vector<Candidate> candidates;
+
+  const double dLat = radiusM / 111320.0;
+  const double cosLat = std::cos(lat * 3.141592653589793 / 180.0);
+  const double dLon = cosLat > 1e-6 ? radiusM / (111320.0 * cosLat) : radiusM / 111320.0;
+  GeoBBox box{lon - dLon, lat - dLat, lon + dLon, lat + dLat};
+  std::unordered_set<int64_t> edgeIds;
+  index.collectEdgesInBBox(box, edgeIds);
+
+  for (int64_t edgeId : edgeIds) {
+    EdgeType edgeType = EdgeType::ROAD;
+    double length = 0.0;
+    double speedLimit = 0.0;
+    if (!store.readEdge(edgeId, edgeType, length, speedLimit)) {
+      continue;
+    }
+    if (type == VehicleType::TRUCK && edgeType != EdgeType::ROAD) {
+      continue;
+    }
+    if (type == VehicleType::TRAIN && edgeType != EdgeType::RAIL) {
+      continue;
+    }
+    int64_t from = 0;
+    int64_t to = 0;
+    if (!store.edgeEndpoints(edgeId, from, to)) {
+      continue;
+    }
+    for (int64_t nodeId : {from, to}) {
+      if (nodeId == 0 || ch.nodeIndex(nodeId) < 0) {
+        continue;
+      }
+      double nlat = 0.0;
+      double nlon = 0.0;
+      if (!store.nodeLatLon(nodeId, nlat, nlon)) {
         continue;
       }
       const double d = haversineMeters({lat, lon}, {nlat, nlon});
@@ -3371,7 +3434,8 @@ void appendRemoteHwyArrivalBatch(
     }
     out.push_back(std::move(row));
   }
-  // Vehicles with no hwy portal / disconnected component: ETA-only geodesic.
+  // Vehicles with no hwy portal / disconnected component: ETA-only geodesic
+  // (skipped when the caller requires a drawable road polyline).
   std::vector<VehicleInfo> leftover;
   leftover.reserve(vehicles.size());
   for (const auto& vehicle : vehicles) {
@@ -3379,7 +3443,7 @@ void appendRemoteHwyArrivalBatch(
       leftover.push_back(vehicle);
     }
   }
-  if (!leftover.empty()) {
+  if (!leftover.empty() && !param.requireRoutePolyline) {
     appendGeodesicArrivalRows(out, leftover, histories, dest, param, 0.0);
   }
   std::cerr << "[mmlp] remote_hwy_batch vehicles=" << vehicles.size()
@@ -3452,17 +3516,60 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
       }
     }
   }
-  if (goalSeeds.seeds.empty() && hwySeeding) {
+  // Always try nearest-road / hwy portal seeds when edge snap failed — a single
+  // bad destination snap used to zero out every vehicle (all-or-nothing).
+  // Edge snap only searches ~8km; desert/mountain clicks often need a wider
+  // Full-CH nearest-node search so we still draw a real road polyline.
+  if (goalSeeds.seeds.empty()) {
     goalLl = {dest.lat, dest.lon};
-    std::vector<int64_t> goalNodes = snapHwyPortalSeeds(store, store, store.hwyCsr(), matchIndex,
-                                                        dest.lat, dest.lon, dest.type, 8);
-    if (goalNodes.empty()) {
-      goalNodes = findNearestHwyOverlayNodes(store, store, store.hwyCsr(), store.ch(), matchIndex,
-                                             dest.lat, dest.lon, 15000.0, 8);
+    std::vector<int64_t> goalNodes;
+    if (store.hasCh() && store.hasHwyCsr()) {
+      goalNodes = snapHwyPortalSeeds(store, store, store.hwyCsr(), matchIndex, dest.lat, dest.lon,
+                                     dest.type, 8);
+      if (goalNodes.empty()) {
+        goalNodes = findNearestHwyOverlayNodes(store, store, store.hwyCsr(), store.ch(), matchIndex,
+                                               dest.lat, dest.lon, 50000.0, 8);
+      }
     }
-    goalSeeds = seedsFromNodes(goalNodes, dest.lat, dest.lon);
+    if (goalNodes.empty()) {
+      for (const double radiusM : {25000.0, 50000.0, 100000.0}) {
+        goalNodes = findNearestFullChRoadNodes(store, ch, matchIndex, dest.lat, dest.lon, dest.type,
+                                               radiusM, 8);
+        if (!goalNodes.empty()) {
+          break;
+        }
+      }
+    }
+    if (goalNodes.empty() && goalPos.valid) {
+      // Last resort: use whatever node/edge endpoints the spatial snap found,
+      // even if the gap was large (better than returning zero routes).
+      goalSeeds = fullChSeedsForPosition(store, ch, goalPos, profileMs);
+      const double gapM = haversineMeters(positionLatLonStore(store, goalPos), {dest.lat, dest.lon});
+      for (FullChGraph::Seed& s : goalSeeds.seeds) {
+        s.costSec += gapM / profileMs;
+        goalSeeds.offsetMeters[s.nodeId] += gapM;
+      }
+      if (!goalSeeds.seeds.empty()) {
+        goalLl = positionLatLonStore(store, goalPos);
+      }
+    } else if (!goalNodes.empty()) {
+      goalSeeds = seedsFromNodes(goalNodes, dest.lat, dest.lon);
+      if (!goalSeeds.seeds.empty()) {
+        double nlat = 0.0;
+        double nlon = 0.0;
+        if (store.nodeLatLon(goalSeeds.seeds.front().nodeId, nlat, nlon)) {
+          goalLl = {nlat, nlon};
+        }
+        if (locationId.empty()) {
+          locationId = "node:" + std::to_string(goalSeeds.seeds.front().nodeId);
+        }
+      }
+    }
   }
   if (goalSeeds.seeds.empty()) {
+    std::cerr << "[mmlp] full_ch goal_seeds empty dest=" << dest.lat << "," << dest.lon
+              << " snap=" << (goalPos.valid ? "ok" : "miss") << "\n"
+              << std::flush;
     if (!goalPos.valid || haversineMeters(goalLl, {dest.lat, dest.lon}) > 100000.0) {
       // Destination is far off-road (open sea, deep mountains): no road route
       // exists, straight-line ETA is the honest answer for everyone.
@@ -3494,10 +3601,16 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     const VehicleHistory* hist = findHistory(histories, vehicle.id);
     const double speedMs =
         std::max(speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type)), 0.5);
-    const double maxHorizon =
+    const double deadlineHorizon =
         std::min(param.maxTime, static_cast<double>(dest.arriveByUnix - vehicle.timestamp));
-    if (maxHorizon < 1.0) {
-      return;  // cannot arrive in time: consumed, no row
+    // Search budget is independent of the user deadline: we still want a real
+    // road route for late vehicles (reachable=false). Cap at 30 days profile.
+    const double geoM = haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon});
+    const double searchHorizon =
+        std::max(deadlineHorizon > 1.0 ? deadlineHorizon : 0.0,
+                 std::min(30.0 * 86400.0, geoM / std::max(speedMs * 0.5, 5.0) + 86400.0));
+    if (searchHorizon < 1.0 && deadlineHorizon < 1.0) {
+      return;
     }
 
     const GraphPosition pos = matchVehicleToGraphIndexed(store, matchIndex, vehicle);
@@ -3532,7 +3645,7 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
 
     // Profile speed (<=80km/h capped by limits) is >= truck speed in practice, so
     // profile time <= vehicle time; pad anyway for the rare faster vehicle.
-    const double maxProfileSec = maxHorizon * 1.6 + 1800.0;
+    const double maxProfileSec = searchHorizon * 1.6 + 1800.0;
     const std::size_t settleCap =
         param.maxVisitedNodes > 0 ? param.maxVisitedNodes : static_cast<std::size_t>(400000);
     const FullChGraph::PathResult path = ch.route(fromSeeds.seeds, goalSeeds.seeds, maxProfileSec,
@@ -3581,13 +3694,13 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     if (vehicle.type == VehicleType::TRUCK && param.truckCycle > 0.0) {
       travel += std::floor(driveSec / param.truckCycle) * param.truckRest;
     }
-    if (travel > maxHorizon + 1e-6) {
-      return;
-    }
     const double eta = static_cast<double>(vehicle.timestamp) + travel;
-    if (eta > static_cast<double>(dest.arriveByUnix) + 1e-6) {
-      return;
-    }
+    // Always emit a real road polyline when CH found a path. Vehicles that miss
+    // the deadline are marked reachable=false so the map still shows the route
+    // instead of the old all-or-nothing empty result.
+    const bool onTime =
+        deadlineHorizon >= 1.0 && travel <= deadlineHorizon + 1e-6 &&
+        eta <= static_cast<double>(dest.arriveByUnix) + 1e-6;
 
     // Polyline: sample by road distance. Adaptive step keeps maxSeg drawable
     // on multi-thousand-km hauls (fixed 8km + 400-pt cap used to jump to end
@@ -3631,7 +3744,7 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
 
     VehicleArrivalResult row;
     row.vehicleId = vehicle.id;
-    row.reachable = true;
+    row.reachable = onTime;
     row.travelDurationSec = travel;
     row.etaUnix = eta;
     row.routeDistanceM = distM;
@@ -3691,12 +3804,12 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
   std::size_t pruned = 0;
   double maxSpanM = 0.0;
   for (const auto& vehicle : vehicles) {
-    const VehicleHistory* hist = findHistory(histories, vehicle.id);
-    const double speedMs = speedMsFromKmh(resolveSpeedKmh(vehicle, hist, nullptr, vehicle.type));
-    if (!mayReachWithSpeed(vehicle, dest, speedMs)) {
+    if (vehicle.type != dest.type) {
       ++pruned;
       continue;
     }
+    // Do not prune by deadline here: late vehicles still get a Full-CH route
+    // (reachable=false). Only drop wrong vehicle type.
     maxSpanM = std::max(
         maxSpanM, haversineMeters({vehicle.lat, vehicle.lon}, {dest.lat, dest.lon}));
     routable.push_back(vehicle);
@@ -3774,7 +3887,7 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
         appendRemoteHwyArrivalBatch(summary.vehicles, remoteSnap, remoteIdx, chRef,
                                     remoteRoutable, histories, dest, param, nationalSnapIndex,
                                     nationalSnapStore);
-      } else {
+      } else if (!param.requireRoutePolyline) {
         appendGeodesicArrivalRows(summary.vehicles, remoteRoutable, histories, dest, param, 0.0);
       }
     }
@@ -3785,10 +3898,18 @@ DestinationArrivalSummary predictVehiclesToDestinationIndexed(
       leftover = appendDestinationFullChBatch(summary.vehicles, summary.locationId,
                                               *nationalSnapStore, *nationalSnapIndex, leftover,
                                               histories, dest, param, /*nearestSeeds=*/true);
-      if (!leftover.empty()) {
+      if (!leftover.empty() && !param.requireRoutePolyline) {
         leftover =
             appendGeodesicArrivalRows(summary.vehicles, leftover, histories, dest, param, 0.0);
       }
+    }
+
+    // Never surface ETA-only empty polylines when the map must draw roads.
+    if (param.requireRoutePolyline) {
+      summary.vehicles.erase(
+          std::remove_if(summary.vehicles.begin(), summary.vehicles.end(),
+                         [](const VehicleArrivalResult& row) { return row.route.points.size() < 2; }),
+          summary.vehicles.end());
     }
 
     const auto tFast1 = std::chrono::steady_clock::now();

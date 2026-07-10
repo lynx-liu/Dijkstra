@@ -249,21 +249,31 @@ bool parseIso8601Utc(const std::string& text, int64_t& outUnix, std::string* err
     s.erase(s.begin());
   }
 
-  std::tm tm{};
-  std::istringstream ss(s);
-  if (s.size() >= 19 && s[10] == 'T') {
-    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-  } else if (s.size() >= 19 && s[10] == ' ') {
-    ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-  } else {
-    if (error) {
-      *error = "arriveBy format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD HH:MM:SS";
-    }
-    return false;
+  // Strip trailing Z / timezone — we treat the wall clock as UTC.
+  if (!s.empty() && (s.back() == 'Z' || s.back() == 'z')) {
+    s.pop_back();
   }
-  if (ss.fail()) {
+  // Drop fractional seconds if present.
+  const auto dot = s.find('.');
+  if (dot != std::string::npos) {
+    s.resize(dot);
+  }
+
+  std::tm tm{};
+  auto tryParse = [&](const char* fmt) -> bool {
+    std::istringstream iss(s);
+    iss >> std::get_time(&tm, fmt);
+    return !iss.fail();
+  };
+  bool ok = false;
+  if (s.size() >= 16 && s[10] == 'T') {
+    ok = tryParse("%Y-%m-%dT%H:%M:%S") || tryParse("%Y-%m-%dT%H:%M");
+  } else if (s.size() >= 16 && s[10] == ' ') {
+    ok = tryParse("%Y-%m-%d %H:%M:%S") || tryParse("%Y-%m-%d %H:%M");
+  }
+  if (!ok) {
     if (error) {
-      *error = "invalid arriveBy datetime: " + text;
+      *error = "arriveBy format: YYYY-MM-DDTHH:MM[:SS]Z or YYYY-MM-DD HH:MM[:SS]";
     }
     return false;
   }
@@ -657,7 +667,7 @@ std::string formatDestinationArrivalJson(const DestinationArrivalSummary& summar
     }
     const auto& row = summary.vehicles[i];
     const std::string eta = formatUtcFromUnix(row.etaUnix);
-    os << "{\"reachable\":true"
+    os << "{\"reachable\":" << (row.reachable ? "true" : "false")
        << ",\"vehicleId\":\"" << escapeJson(row.vehicleId) << "\""
        << ",\"eta\":\"" << eta << "\""
        << ",\"travelDurationSec\":" << std::setprecision(2) << row.travelDurationSec
