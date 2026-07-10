@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# One-shot bootstrap for HTTP service prerequisites.
-# - install python deps
-# - build binaries (service + graph/overlay builders)
+# One-shot bootstrap for HTTP service prerequisites (same outcome as a warm local host):
+# - install python deps + C++ toolchain
+# - build binaries
 # - ensure nationwide graph + index sidecars
-# - ensure regional graphs (PRD hwy overlay for destination arrive)
+# - build nationwide Full CH (china.mmlp.full.ch) if missing — no manual copy
+# - provincial Full CH only if FORCE_PROVINCIAL_CH=1 (not required when national exists)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,7 +37,7 @@ if [[ ! -d build ]]; then
   "${CMAKE}" -S . -B build
 fi
 "${CMAKE}" --build build --target mmlp_service mmlp_build_aux mmlp_build_hwy_csr mmlp_build_hwy_ch \
-  mmlp_build_full_ch -j"${BUILD_JOBS}"
+  mmlp_build_full_ch full_ch_query_test -j"${BUILD_JOBS}"
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
@@ -54,10 +55,31 @@ fi
 echo "[4/7] Ensure nationwide index sidecars..."
 bash tools/ensure_graph_index.sh "${GRAPH}"
 
-echo "[5/7] Ensure all provincial graphs + offline full.ch (35 regions)..."
 # shellcheck source=/dev/null
 source tools/china_regions_util.sh
-ensure_all_china_regions "${GRAPH}"
+graph_dir="$(dirname "${GRAPH}")"
+graph_base="$(basename "${GRAPH}" .bin)"
+if [[ "${graph_base}" == *.mmlp ]]; then
+  graph_base="${graph_base%.mmlp}"
+fi
+# china.mmlp.bin -> china.mmlp.full.ch
+NATIONAL_FULL_CH="${GRAPH%.bin}.full.ch"
+
+echo "[5/7] Nationwide Full CH (required for same experience as local)..."
+# Build on this host if missing — same as a first-time local machine, no copy step.
+bash tools/build_national_full_ch.sh "${GRAPH}"
+if [[ ! -f "${NATIONAL_FULL_CH}" ]]; then
+  echo "ERROR: national Full CH missing after build: ${NATIONAL_FULL_CH}" >&2
+  exit 1
+fi
+echo "[5/7] National Full CH ready: $(du -h "${NATIONAL_FULL_CH}" | cut -f1)"
+
+if [[ "${FORCE_PROVINCIAL_CH:-0}" == "1" ]]; then
+  echo "[5b/7] FORCE_PROVINCIAL_CH=1 — also building all provincial full.ch..."
+  ensure_all_china_regions "${GRAPH}"
+else
+  echo "[5b/7] Skip provincial Full CH (national path is enough; set FORCE_PROVINCIAL_CH=1 to force)."
+fi
 
 echo "[6/7] Fetch map page vendor (Leaflet + MapLibre + glyphs, offline)..."
 bash tools/fetch_web_vendor.sh
@@ -79,40 +101,24 @@ if [[ ! -f "${GRAPH}" ]]; then
   echo "ERROR: graph not found after bootstrap: ${GRAPH}" >&2
   exit 1
 fi
-
-graph_dir="$(dirname "${GRAPH}")"
-graph_base="$(basename "${GRAPH}" .bin)"
-if [[ "${graph_base}" == *.mmlp ]]; then
-  graph_base="${graph_base%.mmlp}"
-fi
-PRD_BIN="${graph_dir}/${graph_base}_prd.mmlp.bin"
-if [[ ! -f "${PRD_BIN}" || ! -f "${PRD_BIN%.bin}.hwy.ch" ]]; then
-  echo "ERROR: PRD regional graph or hwy overlay missing." >&2
-  echo "  expected: ${PRD_BIN}" >&2
-  echo "  expected: ${PRD_BIN%.bin}.hwy.ch" >&2
-  echo "Re-run with: SKIP_EXISTING=0 REGIONS=prd bash tools/build_region_graphs.sh" >&2
+if [[ ! -f "${NATIONAL_FULL_CH}" ]]; then
+  echo "ERROR: national Full CH required: ${NATIONAL_FULL_CH}" >&2
   exit 1
 fi
-if ! china_regions_all_ready "${GRAPH}"; then
-  echo "ERROR: not all provincial full.ch sidecars are ready." >&2
-  china_regions_print_missing "${GRAPH}" >&2
-  exit 1
-fi
-read -r _ready _b _c _total <<<"$(china_regions_counts "${GRAPH}")"
 
 echo ""
 echo "Bootstrap complete."
-echo "  binaries: build/mmlp_service build/mmlp_build_aux mmlp_build_hwy_csr mmlp_build_hwy_ch mmlp_build_full_ch"
+echo "  binaries: build/mmlp_service (+ aux / full_ch builders)"
 echo "  graph:    ${GRAPH}"
-echo "  regional: ${_total} provinces with offline full.ch (incl. ${PRD_BIN} + hwy)"
+echo "  national: ${NATIONAL_FULL_CH}"
 echo ""
 echo "Start HTTP service:"
-echo "  bash tools/start_http_server.sh"
+echo "  MMLP_PRELOAD_REGIONS=off bash tools/start_http_server.sh"
 echo ""
 echo "Benchmark destination arrive (98-car Guangzhou case):"
 echo "  python3 tools/bench_dest_arrive.py --label verify --runs 3"
 echo ""
 
 if [[ "${START_AFTER_BOOTSTRAP:-0}" == "1" ]]; then
-  exec bash tools/start_http_server.sh
+  exec env MMLP_PRELOAD_REGIONS=off bash tools/start_http_server.sh
 fi

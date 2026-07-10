@@ -47,21 +47,19 @@ if [[ "${LOAD_MODE}" == "index" ]] && ! index_ready; then
   exit 1
 fi
 
-# National dense Full CH is the preferred cross-province path; provincial
-# sidecars are optional fallback when china.mmlp.full.ch is absent.
-if [[ "${LOAD_MODE}" == "index" ]] && [[ ! -f "${BASE}.full.ch" ]] && ! regional_ready; then
-  echo "Provincial graphs/full.ch missing; building all regions (first install may take hours)..."
-  # shellcheck source=/dev/null
-  source "${ROOT}/tools/china_regions_util.sh"
-  ensure_all_china_regions "${GRAPH}"
+# National dense Full CH is required for the same interactive experience as local.
+# If missing, build it here (no manual copy). Provincial sidecars are optional fallback only.
+if [[ "${LOAD_MODE}" == "index" ]] && [[ ! -f "${BASE}.full.ch" ]]; then
+  echo "National Full CH missing; building china.mmlp.full.ch (often ~10–20 min)..."
+  bash "${ROOT}/tools/build_national_full_ch.sh" "${GRAPH}"
 fi
 
 if [[ "${LOAD_MODE}" == "index" ]] && [[ ! -f "${BASE}.full.ch" ]] && ! regional_ready; then
-  echo "ERROR: not all provincial full.ch sidecars are ready (and no national full.ch)." >&2
+  echo "ERROR: national Full CH build failed and provincial sidecars are incomplete." >&2
   # shellcheck source=/dev/null
   source "${ROOT}/tools/china_regions_util.sh"
   china_regions_print_missing "${GRAPH}" >&2
-  echo "Run: bash tools/bootstrap_service.sh  OR  bash tools/build_national_full_ch.sh" >&2
+  echo "Re-run: bash tools/bootstrap_service.sh" >&2
   exit 1
 fi
 if [[ -f "${BASE}.full.ch" ]]; then
