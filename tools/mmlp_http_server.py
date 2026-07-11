@@ -33,7 +33,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from tools.map_roads import GraphMmap, bbox_from_points, export_roads_geojson
-from tools.map_tiles import MBTilesStore, resolve_mbtiles_path
+from tools.map_tiles import MultiMBTilesStore, open_mbtiles_store
 from tools.map_tile_render import GraphTileRenderer
 
 
@@ -308,7 +308,7 @@ class MmlpCore:
         self.map_state = MapState()
         self.road_basemap: Optional[RoadBasemap] = None
         self.tile_renderer: Optional[GraphTileRenderer] = None
-        self.mbtiles: Optional[MBTilesStore] = None
+        self.mbtiles: Optional[MultiMBTilesStore] = None
 
         hint = "~5 min for full" if load_mode == "full" else "usually under 1 min for index"
         sys.stderr.write(
@@ -334,13 +334,16 @@ class MmlpCore:
         # Defer mmap basemap until after mmlp_service ready (full graph needs all RAM).
         self.road_basemap = RoadBasemap(graph)
         self.tile_renderer = GraphTileRenderer(graph)
-        mbtiles_path = resolve_mbtiles_path()
-        if mbtiles_path:
-            try:
-                self.mbtiles = MBTilesStore(mbtiles_path)
-                sys.stderr.write(f"[http] offline map tiles: {mbtiles_path}\n")
-            except Exception as e:
-                sys.stderr.write(f"[http] mbtiles load failed: {e}\n")
+        try:
+            self.mbtiles = open_mbtiles_store()
+            if self.mbtiles is not None:
+                layers = self.mbtiles.meta.get("layers") or [self.mbtiles.path]
+                sys.stderr.write(
+                    f"[http] offline map tiles ({len(layers)}): {', '.join(layers)}\n"
+                )
+        except Exception as e:
+            sys.stderr.write(f"[http] mbtiles load failed: {e}\n")
+            self.mbtiles = None
 
     def _wait_service_ready(self) -> None:
         assert self._proc.stdout is not None
@@ -495,8 +498,23 @@ def make_handler(core: MmlpCore, web_root: str):
                     self._json(200, core.tile_renderer.meta())
                 return
             tile_parts = path.split("/")
-            if len(tile_parts) == 7 and tile_parts[1:4] == ["api", "map", "tiles"]:
-                fn = tile_parts[6]
+            # /api/map/tiles/{z}/{x}/{y}.pbf
+            # /api/map/tiles/{layer}/{z}/{x}/{y}.pbf  (per-country Shortbread)
+            is_tile = (
+                len(tile_parts) in (7, 8)
+                and tile_parts[1:4] == ["api", "map", "tiles"]
+            )
+            if is_tile:
+                layer_id = None
+                if len(tile_parts) == 7:
+                    z_s, x_s, fn = tile_parts[4], tile_parts[5], tile_parts[6]
+                else:
+                    layer_id, z_s, x_s, fn = (
+                        tile_parts[4],
+                        tile_parts[5],
+                        tile_parts[6],
+                        tile_parts[7],
+                    )
                 ext = None
                 if fn.endswith(".png"):
                     ext = "png"
@@ -504,8 +522,8 @@ def make_handler(core: MmlpCore, web_root: str):
                     ext = "pbf"
                 if ext is not None:
                     try:
-                        z = int(tile_parts[4])
-                        x = int(tile_parts[5])
+                        z = int(z_s)
+                        x = int(x_s)
                         y = int(fn[: -len("." + ext)])
                     except ValueError:
                         self._json(400, {"error": "bad tile path"})
@@ -517,9 +535,9 @@ def make_handler(core: MmlpCore, web_root: str):
                         and bool(core.mbtiles.meta.get("vector"))
                     )
                     if core.mbtiles is not None and (ext == "pbf" or not mbtiles_vector):
-                        data = core.mbtiles.get_tile(z, x, y)
+                        data = core.mbtiles.get_tile(z, x, y, layer_id=layer_id)
 
-                    if data is None and ext == "png":
+                    if data is None and ext == "png" and layer_id is None:
                         data = core.tile_renderer.render_tile(z, x, y)
 
                     if data is None:

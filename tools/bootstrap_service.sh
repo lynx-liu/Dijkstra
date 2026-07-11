@@ -41,7 +41,7 @@ fi
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
-    echo "[3/7] Graph file missing, deploying nationwide graph..."
+    echo "[3/7] Graph file missing, deploying China + Central Asia graph..."
     bash tools/deploy_graph_nationwide.sh
   else
     echo "ERROR: graph not found: ${GRAPH}" >&2
@@ -49,7 +49,13 @@ if [[ ! -f "${GRAPH}" ]]; then
     exit 1
   fi
 else
-  echo "[3/7] Graph file exists, skip deploy."
+  echo "[3/7] Ensure graph coverage (China + Central Asia if enabled)..."
+  # deploy_graph no-ops when coverage stamp already matches; rebuilds when CA missing.
+  if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
+    bash tools/deploy_graph_nationwide.sh
+  else
+    echo "[3/7] Graph file exists, skip deploy (AUTO_DEPLOY_GRAPH=0)."
+  fi
 fi
 
 echo "[4/7] Ensure nationwide index sidecars..."

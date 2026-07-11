@@ -4,8 +4,8 @@
 
 | 项目 | 说明 |
 |------|------|
-| 数据源 | BBBike 全国 Shortbread 矢量包 |
-| 安装位置 | `data/map/china.mbtiles`（约 2 GB，**不进 git**） |
+| 数据源 | BBBike 中国 Shortbread + 中亚五国 Shortbread 叠加 |
+| 安装位置 | `data/map/china.mbtiles` + `data/map/central_asia/*.mbtiles`（**不进 git**） |
 | 渲染 | MapLibre GL 3.6.2 + 本地字形（`web/vendor/map/glyphs/`） |
 | 瓦片 API | `/api/map/tiles/{z}/{x}/{y}.pbf` |
 | 未安装时 | 回退为路网实时渲染 PNG（慢，无地名） |
@@ -15,7 +15,7 @@
 ```bash
 git pull
 bash tools/bootstrap_service.sh          # 依赖、编译、Leaflet + MapLibre + 字形
-bash tools/download_mbtiles.sh           # 约 2 GB，需有网，只需一次
+bash tools/download_mbtiles.sh           # 中国 ~2 GB + 中亚五国叠加，需有网
 RESTART=1 bash tools/start_http_server.sh
 ```
 
@@ -31,11 +31,11 @@ bash tools/start_http_server.sh
 ### 验证
 
 ```bash
-ls -lh data/map/china.mbtiles
+ls -lh data/map/china.mbtiles data/map/central_asia/*.mbtiles
 curl -s http://127.0.0.1:8080/api/map/tiles/meta | python3 -m json.tool
 ```
 
-已装好时应看到：
+已装好时应看到 `name` 含 Central Asia，`bounds` 西界约到 46°E（哈萨克斯坦），以及：
 
 ```json
 "source": "mbtiles",

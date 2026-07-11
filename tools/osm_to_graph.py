@@ -87,8 +87,8 @@ def in_bbox(lat: float, lon: float, bbox: Optional[Tuple[float, float, float, fl
     return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
 
 
-def open_db(db_path: str) -> sqlite3.Connection:
-    if os.path.exists(db_path):
+def open_db(db_path: str, fresh: bool = True) -> sqlite3.Connection:
+    if fresh and os.path.exists(db_path):
         os.remove(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -96,21 +96,21 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.executescript(
         """
-        CREATE TABLE needed_node (id INTEGER PRIMARY KEY);
-        CREATE TABLE way_row (
+        CREATE TABLE IF NOT EXISTS needed_node (id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS way_row (
             way_id INTEGER PRIMARY KEY,
             edge_type INTEGER NOT NULL,
             speed REAL NOT NULL,
             refs TEXT NOT NULL
         );
-        CREATE TABLE node_row (
+        CREATE TABLE IF NOT EXISTS node_row (
             id INTEGER PRIMARY KEY,
             lat REAL NOT NULL,
             lon REAL NOT NULL,
             is_station INTEGER NOT NULL DEFAULT 0,
             kind INTEGER NOT NULL DEFAULT 0
         );
-        CREATE TABLE edge_row (
+        CREATE TABLE IF NOT EXISTS edge_row (
             id INTEGER PRIMARY KEY,
             node_from INTEGER NOT NULL,
             node_to INTEGER NOT NULL,
@@ -118,7 +118,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
             length REAL NOT NULL,
             speed REAL NOT NULL
         );
-        CREATE INDEX idx_edge_from ON edge_row(node_from);
+        CREATE INDEX IF NOT EXISTS idx_edge_from ON edge_row(node_from);
         """
     )
     return conn
@@ -152,7 +152,7 @@ class WayPass(osmium.SimpleHandler):
         speed = parse_maxspeed_kmh(tags.get("maxspeed"))
         refs_txt = ",".join(str(r) for r in refs)
         self.conn.execute(
-            "INSERT INTO way_row VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO way_row VALUES (?,?,?,?)",
             (w.id, edge_type, speed, refs_txt),
         )
         self.conn.executemany(
@@ -291,48 +291,65 @@ def export_binary(conn: sqlite3.Connection, path: str) -> None:
     )
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "wb") as out:
-        out.write(MAGIC)
-        out.write(struct.pack("<I", VERSION))
-        out.write(struct.pack("<Q", node_count))
-        out.write(struct.pack("<Q", edge_count))
+    # Write to a sibling temp file then atomically replace so a live mmap of
+    # the previous graph keeps its inode until process restart.
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as out:
+            out.write(MAGIC)
+            out.write(struct.pack("<I", VERSION))
+            out.write(struct.pack("<Q", node_count))
+            out.write(struct.pack("<Q", edge_count))
 
-        cur = conn.execute("SELECT id, lat, lon, kind FROM node_row ORDER BY id")
-        for nid, lat, lon, kind in cur:
-            out.write(struct.pack("<q", nid))
-            out.write(struct.pack("<d", lat))
-            out.write(struct.pack("<d", lon))
-            out.write(struct.pack("<i", kind))
+            cur = conn.execute("SELECT id, lat, lon, kind FROM node_row ORDER BY id")
+            for nid, lat, lon, kind in cur:
+                out.write(struct.pack("<q", nid))
+                out.write(struct.pack("<d", lat))
+                out.write(struct.pack("<d", lon))
+                out.write(struct.pack("<i", kind))
 
-        cur = conn.execute(
-            "SELECT id, node_from, node_to, etype, length, speed FROM edge_row ORDER BY id"
-        )
-        for eid, fr, to, etype, length, speed in cur:
-            out.write(struct.pack("<q", eid))
-            out.write(struct.pack("<q", fr))
-            out.write(struct.pack("<q", to))
-            out.write(struct.pack("<i", etype))
-            out.write(struct.pack("<d", length))
-            out.write(struct.pack("<d", speed))
+            cur = conn.execute(
+                "SELECT id, node_from, node_to, etype, length, speed FROM edge_row ORDER BY id"
+            )
+            for eid, fr, to, etype, length, speed in cur:
+                out.write(struct.pack("<q", eid))
+                out.write(struct.pack("<q", fr))
+                out.write(struct.pack("<q", to))
+                out.write(struct.pack("<i", etype))
+                out.write(struct.pack("<d", length))
+                out.write(struct.pack("<d", speed))
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
     size_mb = os.path.getsize(path) / (1024 * 1024)
     print(f"[osm_to_graph] wrote {path} ({size_mb:.2f} MiB)", flush=True)
 
 
-def build_graph(pbf_path: str, bbox: Optional[Tuple[float, float, float, float]], db_path: str):
-    conn = open_db(db_path)
-    try:
-        print(f"[osm_to_graph] pass 1/4: scan ways in {pbf_path}", flush=True)
-        wpass = WayPass(conn, bbox)
-        wpass.apply_file(pbf_path)
-        conn.commit()
-        print(f"[osm_to_graph] pass1 done ways={wpass.way_count:,}", flush=True)
+def ingest_pbf(conn: sqlite3.Connection, pbf_path: str,
+               bbox: Optional[Tuple[float, float, float, float]]) -> None:
+    print(f"[osm_to_graph] pass 1/4: scan ways in {pbf_path}", flush=True)
+    wpass = WayPass(conn, bbox)
+    wpass.apply_file(pbf_path)
+    conn.commit()
+    print(f"[osm_to_graph] pass1 done ways={wpass.way_count:,}", flush=True)
 
-        print("[osm_to_graph] pass 2/4: scan nodes", flush=True)
-        npass = NodePass(conn, bbox)
-        npass.apply_file(pbf_path, locations=True)
-        conn.commit()
-        print(f"[osm_to_graph] pass2 done nodes={npass.node_count:,}", flush=True)
+    print(f"[osm_to_graph] pass 2/4: scan nodes in {pbf_path}", flush=True)
+    npass = NodePass(conn, bbox)
+    npass.apply_file(pbf_path, locations=True)
+    conn.commit()
+    print(f"[osm_to_graph] pass2 done nodes={npass.node_count:,}", flush=True)
+
+
+def build_graph(pbf_paths, bbox: Optional[Tuple[float, float, float, float]], db_path: str):
+    if isinstance(pbf_paths, str):
+        pbf_paths = [pbf_paths]
+    conn = open_db(db_path, fresh=True)
+    try:
+        for pbf_path in pbf_paths:
+            ingest_pbf(conn, pbf_path, bbox)
 
         print("[osm_to_graph] pass 3/4: build edge segments", flush=True)
         materialize_edges(conn)
@@ -346,7 +363,13 @@ def build_graph(pbf_path: str, bbox: Optional[Tuple[float, float, float, float]]
 
 def main():
     parser = argparse.ArgumentParser(description="Convert OSM PBF to mmlp binary graph")
-    parser.add_argument("--input", "-i", required=True)
+    parser.add_argument(
+        "--input",
+        "-i",
+        action="append",
+        required=True,
+        help="OSM PBF path (repeat for China + Central Asia merges)",
+    )
     parser.add_argument("--output", "-o", required=True)
     parser.add_argument("--bbox", help="minLon,minLat,maxLon,maxLat")
     parser.add_argument(
@@ -363,6 +386,15 @@ def main():
     bbox = parse_bbox(args.bbox) if args.bbox else None
     db_path = args.db or (args.output + ".staging.sqlite")
     t0 = time.time()
+
+    for path in args.input:
+        if not os.path.isfile(path):
+            print(f"ERROR: input not found: {path}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"[osm_to_graph] inputs ({len(args.input)}):", flush=True)
+    for path in args.input:
+        print(f"  - {path}", flush=True)
 
     conn = build_graph(args.input, bbox, db_path)
     export_binary(conn, args.output)

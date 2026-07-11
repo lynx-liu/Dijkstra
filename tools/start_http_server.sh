@@ -68,9 +68,14 @@ fi
 
 echo "=== MMLP HTTP service ==="
 echo "Graph: ${GRAPH}"
-MBTILES="${MMLP_MBTILES:-${ROOT}/data/map/china.mbtiles}"
-if [[ -f "${MBTILES}" ]]; then
-  echo "Map: ${MBTILES} (offline mbtiles)"
+# shellcheck source=/dev/null
+source "${ROOT}/config/map.defaults.env" 2>/dev/null || true
+if [[ -f "${ROOT}/data/map/china_central_asia.mbtiles" ]]; then
+  echo "Map: data/map/china_central_asia.mbtiles (China + Central Asia)"
+elif [[ -d "${ROOT}/data/map/central_asia" ]] && compgen -G "${ROOT}/data/map/central_asia/*.mbtiles" >/dev/null; then
+  echo "Map: china.mbtiles + central_asia/*.mbtiles overlays"
+elif [[ -f "${ROOT}/data/map/china.mbtiles" ]]; then
+  echo "Map: data/map/china.mbtiles (China only — run: bash tools/download_mbtiles.sh for 中亚)"
 else
   echo "Map: graph render — install: bash tools/download_mbtiles.sh"
 fi

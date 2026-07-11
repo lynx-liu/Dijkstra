@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download Geofabrik China OSM extract.
+# Download Geofabrik China OSM extract (+ Central Asia five when enabled).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,24 +7,42 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "${ROOT}/config/osm.defaults.env"
 
 mkdir -p "${OSM_DIR}"
+cd "${ROOT}"
 
-if [[ -f "${PBF_PATH}" ]]; then
-  echo "[download_osm] already exists: ${PBF_PATH}"
-  ls -lh "${PBF_PATH}"
-  exit 0
-fi
+download_one() {
+  local url="$1"
+  local path="$2"
+  local label="$3"
+  if [[ -f "${path}" ]]; then
+    echo "[download_osm] already exists: ${path}"
+    ls -lh "${path}"
+    return 0
+  fi
+  echo "[download_osm] downloading ${label}"
+  echo "[download_osm]   url=${url}"
+  echo "[download_osm]   -> ${path}"
+  if command -v wget >/dev/null 2>&1; then
+    wget -c -O "${path}" "${url}"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -L -C - -o "${path}" "${url}"
+  else
+    echo "ERROR: need wget or curl" >&2
+    exit 1
+  fi
+  ls -lh "${path}"
+}
 
-echo "[download_osm] downloading ${GEOFABRIK_URL}"
-echo "[download_osm] target ${PBF_PATH} (~1.4 GiB, may take a while)"
+download_one "${GEOFABRIK_URL}" "${PBF_PATH}" "China"
 
-if command -v wget >/dev/null 2>&1; then
-  wget -c -O "${PBF_PATH}" "${GEOFABRIK_URL}"
-elif command -v curl >/dev/null 2>&1; then
-  curl -L -C - -o "${PBF_PATH}" "${GEOFABRIK_URL}"
+if [[ "${INCLUDE_CENTRAL_ASIA}" == "1" ]]; then
+  echo "[download_osm] INCLUDE_CENTRAL_ASIA=1 — fetching 中亚五国"
+  download_one "${CA_KZ_URL}" "${CA_KZ_PBF}" "Kazakhstan 哈萨克斯坦"
+  download_one "${CA_KG_URL}" "${CA_KG_PBF}" "Kyrgyzstan 吉尔吉斯斯坦"
+  download_one "${CA_TJ_URL}" "${CA_TJ_PBF}" "Tajikistan 塔吉克斯坦"
+  download_one "${CA_TM_URL}" "${CA_TM_PBF}" "Turkmenistan 土库曼斯坦"
+  download_one "${CA_UZ_URL}" "${CA_UZ_PBF}" "Uzbekistan 乌兹别克斯坦"
 else
-  echo "ERROR: need wget or curl" >&2
-  exit 1
+  echo "[download_osm] INCLUDE_CENTRAL_ASIA=0 — China only"
 fi
 
 echo "[download_osm] complete"
-ls -lh "${PBF_PATH}"

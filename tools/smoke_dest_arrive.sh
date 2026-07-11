@@ -16,8 +16,11 @@ echo "destination  : 43.92, 87.50 (乌鲁木齐)" >&2
 echo >&2
 
 START=$(date +%s.%N)
+# Disable Expect: 100-continue — curl otherwise waits ~1s for a 100 reply
+# that BaseHTTPServer never sends, which falsely looks like routing regression.
 python3 - "${VEHICLE_TIME}" "${ARRIVE_BY}" <<'PY' | curl -s -X POST "${BASE}/api/destinations/arrive" \
   -H 'Content-Type: application/json' \
+  -H 'Expect:' \
   -d @- | python3 -m json.tool
 import json, sys
 vt, ab = sys.argv[1], sys.argv[2]

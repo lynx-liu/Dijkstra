@@ -156,7 +156,16 @@
     if (style.glyphs && style.glyphs.indexOf('http') !== 0) {
       style.glyphs = origin + style.glyphs;
     }
-    if (style.sources && style.sources.shortbread) {
+
+    // Multiple country Shortbread extracts overlap in z/x/y. Serving one blob
+    // per tile drops the other country (looks like "only a small patch"). MapLibre
+    // must composite one vector source per mbtiles file.
+    const layerIds =
+      meta && Array.isArray(meta.layer_ids) && meta.layer_ids.length > 0
+        ? meta.layer_ids.map((L) => L.id)
+        : ['shortbread'];
+
+    if (layerIds.length === 1 && style.sources && style.sources.shortbread) {
       const tiles = style.sources.shortbread.tiles || [];
       style.sources.shortbread.tiles = tiles.map((u) => {
         if (u.indexOf('http') === 0) return u;
@@ -164,7 +173,36 @@
       });
       style.sources.shortbread.minzoom = minZoom;
       style.sources.shortbread.maxzoom = maxZoom;
+      return style;
     }
+
+    const templateLayers = (style.layers || []).slice();
+    style.sources = {};
+    layerIds.forEach((id) => {
+      const srcId = id === 'shortbread' ? 'shortbread' : 'sb_' + id;
+      style.sources[srcId] = {
+        type: 'vector',
+        tiles: [origin + '/api/map/tiles/' + encodeURIComponent(id) + '/{z}/{x}/{y}.pbf'],
+        minzoom: minZoom,
+        maxzoom: maxZoom,
+      };
+    });
+
+    const outLayers = [];
+    templateLayers.forEach((layer) => {
+      if (!layer.source) {
+        outLayers.push(layer);
+        return;
+      }
+      layerIds.forEach((id) => {
+        const srcId = id === 'shortbread' ? 'shortbread' : 'sb_' + id;
+        const copy = JSON.parse(JSON.stringify(layer));
+        copy.id = layer.id + '__' + id;
+        copy.source = srcId;
+        outLayers.push(copy);
+      });
+    });
+    style.layers = outLayers;
     return style;
   }
 
