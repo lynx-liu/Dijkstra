@@ -3702,12 +3702,19 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
         deadlineHorizon >= 1.0 && travel <= deadlineHorizon + 1e-6 &&
         eta <= static_cast<double>(dest.arriveByUnix) + 1e-6;
 
-    // Polyline: sample by road distance. Adaptive step keeps maxSeg drawable
-    // on multi-thousand-km hauls (fixed 8km + 400-pt cap used to jump to end
-    // and leave 200–700km visual chords).
-    constexpr std::size_t kMaxPolyPts = 800;
+    // Polyline: sample by road distance along unpacked original edges.
+    // Floor used to be 8km — fine for national overview, but Leaflet straight
+    // segments between samples look like off-road chords when zoomed in.
+    // ~400–500m floor keeps city/zoom views on-road; long hauls still adapt up.
+    constexpr std::size_t kMaxPolyPts = 2000;
+    constexpr double kMinSampleM = 400.0;
+    // Short trips: emit every arc endpoint (OSM ways already sparse enough).
+    const bool denseLocal = distM <= 80000.0 || path.arcs.size() <= 400;
     const double sampleEveryM =
-        std::max(8000.0, distM / static_cast<double>(std::max<std::size_t>(kMaxPolyPts / 2, 40)));
+        denseLocal
+            ? 0.0
+            : std::max(kMinSampleM,
+                       distM / static_cast<double>(std::max<std::size_t>(kMaxPolyPts / 2, 40)));
     RoutePolyline route;
     route.points.reserve(std::min(path.arcs.size(), kMaxPolyPts) + 6);
     appendRoutePt(route, {vehicle.lat, vehicle.lon});
@@ -3722,14 +3729,14 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     for (std::size_t k = 0; k < path.arcs.size(); ++k) {
       sinceSampleM += static_cast<double>(path.arcs[k].lengthM);
       const bool last = (k + 1 == path.arcs.size());
-      if (sinceSampleM >= stepM || last) {
+      if (denseLocal || sinceSampleM >= stepM || last) {
         if (store.nodeLatLon(path.arcs[k].toNodeId, plat, plon)) {
           appendRoutePt(route, {plat, plon});
         }
         sinceSampleM = 0.0;
         // If we are filling the budget, sparsify remaining samples instead of
         // jumping to the destination (that creates geodesic-looking chords).
-        if (route.points.size() >= (kMaxPolyPts * 3) / 4 && !last) {
+        if (!denseLocal && route.points.size() >= (kMaxPolyPts * 3) / 4 && !last) {
           const double remainM = distM - polylineLengthMeters(route);
           const std::size_t room = (kMaxPolyPts > route.points.size() + 4)
                                        ? (kMaxPolyPts - route.points.size() - 4)
