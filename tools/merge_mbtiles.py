@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Merge Shortbread MBTiles overlays into a base file (China + Central Asia)."""
 
-from __future__ import annotations
+# Compatible with CentOS 7 system Python 3.6 (no future annotations).
 
 import argparse
 import os

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serve vector/raster tiles from one or more local MBTiles files (offline street map)."""
 
-from __future__ import annotations
+# Compatible with CentOS 7 system Python 3.6 (no future annotations).
 
 import os
 import sqlite3
