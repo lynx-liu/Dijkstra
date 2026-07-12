@@ -22,7 +22,10 @@ if [[ -f "${BASE}.sidx" && -f "${BASE}.nidx" && -f "${BASE}.eidx" ]]; then
     fi
     "${ROOT}/build/mmlp_build_aux" "${GRAPH}" --egeo-only
   fi
-  rm -f "${BASE}.rtidx" "${BASE}.csr"
+  # Do NOT delete .csr here: bootstrap runs build_national_full_ch next, and
+  # wiping CSR forces a multi-minute mmlp_build_aux --csr-only every time.
+  # Legacy partition cache is still safe to drop.
+  rm -f "${BASE}.rtidx"
   echo "Index files OK:"
   ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx" "${BASE}.egeo" 2>/dev/null \
     || ls -lh "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx"
