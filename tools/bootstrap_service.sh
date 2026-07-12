@@ -92,15 +92,14 @@ bash tools/fetch_web_vendor.sh
 bash tools/fetch_map_vendor.sh
 bash tools/fetch_map_glyphs.sh
 
-echo "[7/7] Offline map tiles (optional, ~2 GB)..."
-if [[ "${AUTO_DOWNLOAD_MBTILES:-0}" == "1" ]]; then
-  bash tools/download_mbtiles.sh
+echo "[7/7] Offline map tiles (China + 中亚五国 Shortbread)..."
+# Always ensure via download_mbtiles.sh (idempotent: skips files that exist).
+# Operators only use bootstrap + start_http_server — do not require a third script.
+# Air-gapped: SKIP_MBTILES=1
+if [[ "${SKIP_MBTILES:-0}" == "1" ]]; then
+  echo "[7/7] SKIP_MBTILES=1 — leaving data/map as-is."
 else
-  if [[ -f "${ROOT}/data/map/china.mbtiles" ]]; then
-    echo "[7/7] china.mbtiles present."
-  else
-    echo "[7/7] Skip mbtiles (set AUTO_DOWNLOAD_MBTILES=1 or run: bash tools/download_mbtiles.sh)"
-  fi
+  bash tools/download_mbtiles.sh
 fi
 
 if [[ ! -f "${GRAPH}" ]]; then

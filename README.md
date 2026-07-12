@@ -36,7 +36,7 @@ python3 tools/bench_dest_arrive.py --label verify --runs 3
 
 启动后在浏览器打开 **http://127.0.0.1:8080/map**，可实时查看 POST 上报的车辆位置、会合点及两车路径（点击标记查看详情，页面每 2 秒自动刷新）。
 
-> **地图底图（推荐）**：运行 `bash tools/download_mbtiles.sh` 安装离线 Shortbread 矢量 mbtiles（约 2 GB，含道路与地名，无外网 CDN）；未安装时回退为路网实时渲染。详见 [tools/prepare_offline_map.md](tools/prepare_offline_map.md)。
+> **地图底图**：由 `bootstrap_service.sh` / `start_http_server.sh` 自动确保（中国 Shortbread + 中亚五国叠加）。无需再单独跑其它脚本；无网环境可设 `SKIP_MBTILES=1`。详见 [tools/prepare_offline_map.md](tools/prepare_offline_map.md)。
 
 > `bootstrap_service.sh` 已包含初始化所需步骤，通常不需要再手动分步执行。
 

@@ -14,19 +14,21 @@
 
 ```bash
 git pull
-bash tools/bootstrap_service.sh          # 依赖、编译、Leaflet + MapLibre + 字形
-bash tools/download_mbtiles.sh           # 中国 ~2 GB + 中亚五国叠加，需有网
-RESTART=1 bash tools/start_http_server.sh
+bash tools/bootstrap_service.sh          # 依赖、编译、图、Full CH、中国+中亚底图
+MMLP_PRELOAD_REGIONS=off bash tools/start_http_server.sh
 ```
 
-或 bootstrap 时自动下载 mbtiles：
+只需以上两个脚本。`download_mbtiles.sh` 由它们在缺底图时自动调用（已有文件会跳过）。
+
+或 bootstrap 结束后直接起服务：
 
 ```bash
-AUTO_DOWNLOAD_MBTILES=1 bash tools/bootstrap_service.sh
-bash tools/start_http_server.sh
+START_AFTER_BOOTSTRAP=1 bash tools/bootstrap_service.sh
 ```
 
 浏览器打开 `http://<主机>:8080/map`，**Ctrl+F5** 强刷。
+
+无网环境：`SKIP_MBTILES=1 bash tools/bootstrap_service.sh`
 
 ### 验证
 
