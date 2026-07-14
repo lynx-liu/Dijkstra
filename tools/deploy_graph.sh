@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download OSM (if needed) and build mmlp binary graph.
-# With INCLUDE_CENTRAL_ASIA=1 (default), merges China + 中亚五国 into one graph.
+# Default: China + 中亚五国 + Russia into one graph; bootstrap rebuilds national Full CH.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,11 +16,14 @@ echo "=== deploy_graph started $(date -Is) ==="
 bash "${ROOT}/tools/download_osm.sh"
 
 coverage_required() {
+  local parts=("china")
   if [[ "${INCLUDE_CENTRAL_ASIA}" == "1" ]]; then
-    echo "${GRAPH_COVERAGE_REQUIRED_CA}"
-  else
-    echo "${GRAPH_COVERAGE_REQUIRED_CHINA}"
+    parts+=("kz" "kg" "tj" "tm" "uz")
   fi
+  if [[ "${INCLUDE_RUSSIA}" == "1" ]]; then
+    parts+=("ru")
+  fi
+  echo "${parts[*]}"
 }
 
 coverage_file() {
@@ -39,6 +42,9 @@ list_input_pbfs() {
   local inputs=("${PBF_PATH}")
   if [[ "${INCLUDE_CENTRAL_ASIA}" == "1" ]]; then
     inputs+=("${CA_KZ_PBF}" "${CA_KG_PBF}" "${CA_TJ_PBF}" "${CA_TM_PBF}" "${CA_UZ_PBF}")
+  fi
+  if [[ "${INCLUDE_RUSSIA}" == "1" ]]; then
+    inputs+=("${RU_PBF}")
   fi
   local p
   for p in "${inputs[@]}"; do
@@ -73,11 +79,7 @@ if [[ -n "${BBOX:-}" ]]; then
     echo "[deploy_graph] Python bbox filter ${BBOX}"
   fi
 else
-  if [[ "${INCLUDE_CENTRAL_ASIA}" == "1" ]]; then
-    echo "[deploy_graph] building China + Central Asia (kz/kg/tj/tm/uz) graph"
-  else
-    echo "[deploy_graph] building China-only graph"
-  fi
+  echo "[deploy_graph] building graph coverage: $(coverage_required)"
 fi
 
 FORCE_REBUILD="${FORCE_REBUILD_GRAPH:-0}"
@@ -97,12 +99,11 @@ if [[ -f "${GRAPH_PATH}" ]] && coverage_ok && [[ "${FORCE_REBUILD}" != "1" ]]; t
 fi
 
 if [[ -f "${GRAPH_PATH}" ]] && ! coverage_ok; then
-  echo "[deploy_graph] coverage mismatch — rebuilding graph to include Central Asia"
+  echo "[deploy_graph] coverage mismatch — rebuilding graph"
   echo "  have: $(cat "$(coverage_file)" 2>/dev/null || echo '(none)')"
   echo "  want: $(coverage_required)"
 fi
 
-# Optional: single merged PBF via osmium (faster one-file apply).
 BUILD_INPUTS=("${MULTI_INPUTS[@]}")
 if [[ "${#MULTI_INPUTS[@]}" -gt 1 ]] && command -v osmium >/dev/null 2>&1 && [[ -z "${BBOX:-}" ]]; then
   echo "[deploy_graph] osmium cat -> ${MERGED_PBF_PATH}"
@@ -124,7 +125,6 @@ fi
 printf '%s\n' "$(coverage_required)" >"$(coverage_file)"
 echo "[deploy_graph] wrote coverage: $(cat "$(coverage_file)")"
 
-# Graph changed → invalidate national Full CH / indexes so bootstrap rebuilds them.
 BASE="${GRAPH_PATH%.bin}"
 rm -f "${BASE}.full.ch" "${BASE}.csr" "${BASE}.sidx" "${BASE}.nidx" "${BASE}.eidx" "${BASE}.egeo" \
   "${BASE}.hwy.ch" "${BASE}.hwy.csr" "${BASE}.rtidx"

@@ -4,8 +4,8 @@
 
 | 项目 | 说明 |
 |------|------|
-| 数据源 | BBBike 中国 Shortbread + 中亚五国 Shortbread 叠加 |
-| 安装位置 | `data/map/china.mbtiles` + `data/map/central_asia/*.mbtiles`（**不进 git**） |
+| 数据源 | BBBike 中国/中亚 Shortbread + Geofabrik 俄罗斯联邦区 Shortbread |
+| 安装位置 | `data/map/china.mbtiles` + `central_asia/*.mbtiles` + `russia/*.mbtiles`（**不进 git**） |
 | 渲染 | MapLibre GL 3.6.2 + 本地字形（`web/vendor/map/glyphs/`） |
 | 瓦片 API | `/api/map/tiles/{z}/{x}/{y}.pbf` |
 | 未安装时 | 回退为路网实时渲染 PNG（慢，无地名） |
@@ -14,7 +14,7 @@
 
 ```bash
 git pull
-bash tools/bootstrap_service.sh          # 依赖、编译、图、Full CH、中国+中亚底图
+bash tools/bootstrap_service.sh          # 依赖、编译、图、Full CH、中国+中亚+俄罗斯底图
 MMLP_PRELOAD_REGIONS=off bash tools/start_http_server.sh
 ```
 
@@ -33,7 +33,7 @@ START_AFTER_BOOTSTRAP=1 bash tools/bootstrap_service.sh
 ### 验证
 
 ```bash
-ls -lh data/map/china.mbtiles data/map/central_asia/*.mbtiles
+ls -lh data/map/china.mbtiles data/map/central_asia/*.mbtiles data/map/russia/*.mbtiles
 curl -s http://127.0.0.1:8080/api/map/tiles/meta | python3 -m json.tool
 ```
 

@@ -138,7 +138,7 @@ class MultiMBTilesStore:
         if max_z is not None:
             base["maxzoom"] = max_z
         if len(self.stores) > 1:
-            base["name"] = "China + Central Asia Shortbread"
+            base["name"] = "China + Central Asia + Russia Shortbread"
         return base
 
     def get_tile(self, z: int, x: int, y: int, layer_id: Optional[str] = None) -> Optional[bytes]:
@@ -163,7 +163,7 @@ class MultiMBTilesStore:
 
 
 def resolve_mbtiles_paths() -> List[str]:
-    """Ordered mbtiles paths: optional merged file, else China + CA overlays."""
+    """Ordered mbtiles paths: optional merged file, else China + CA + Russia overlays."""
     env = os.environ.get("MMLP_MBTILES", "").strip()
     if env:
         parts = [p.strip() for p in env.split(":") if p.strip()]
@@ -190,6 +190,12 @@ def resolve_mbtiles_paths() -> List[str]:
         path = os.path.join(ca_dir, name)
         if os.path.isfile(path):
             paths.append(path)
+
+    ru_dir = os.path.join(root, "data/map/russia")
+    if os.path.isdir(ru_dir):
+        for name in sorted(os.listdir(ru_dir)):
+            if name.endswith(".mbtiles"):
+                paths.append(os.path.join(ru_dir, name))
 
     if paths:
         return paths

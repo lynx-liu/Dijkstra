@@ -41,7 +41,7 @@ fi
 
 if [[ ! -f "${GRAPH}" ]]; then
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
-    echo "[3/7] Graph file missing, deploying China + Central Asia graph..."
+    echo "[3/7] Graph file missing, deploying China + Central Asia + Russia graph..."
     bash tools/deploy_graph_nationwide.sh
   else
     echo "ERROR: graph not found: ${GRAPH}" >&2
@@ -49,7 +49,7 @@ if [[ ! -f "${GRAPH}" ]]; then
     exit 1
   fi
 else
-  echo "[3/7] Ensure graph coverage (China + Central Asia if enabled)..."
+  echo "[3/7] Ensure graph coverage (China + Central Asia + Russia if enabled)..."
   # deploy_graph no-ops when coverage stamp already matches; rebuilds when CA missing.
   if [[ "${AUTO_DEPLOY_GRAPH}" == "1" ]]; then
     bash tools/deploy_graph_nationwide.sh
@@ -92,7 +92,7 @@ bash tools/fetch_web_vendor.sh
 bash tools/fetch_map_vendor.sh
 bash tools/fetch_map_glyphs.sh
 
-echo "[7/7] Offline map tiles (China + 中亚五国 Shortbread)..."
+echo "[7/7] Offline map tiles (China + 中亚五国 + 俄罗斯 Shortbread)..."
 # Always ensure via download_mbtiles.sh (idempotent: skips files that exist).
 # Operators only use bootstrap + start_http_server — do not require a third script.
 # Air-gapped: SKIP_MBTILES=1

@@ -2,9 +2,10 @@
 
 ## 服务范围
 
-- **生产范围**：中国全境 + **中亚五国**（哈萨克斯坦、吉尔吉斯斯坦、塔吉克斯坦、土库曼斯坦、乌兹别克斯坦）公铁多模态路网
-- **重点验证区域**：新疆及西部干线、中国—中亚跨境走廊；东部/中部同样适用同一套图与算法
-- **数据主源**：Geofabrik 中国 extract + 中亚五国 extract，合并为同一份 `china.mmlp.bin`（文件名沿用；覆盖范围见旁路 `.coverage` 戳）
+- **生产范围**：中国全境 + **中亚五国** + **俄罗斯联邦** 公铁多模态路网
+- **重点验证区域**：新疆及西部干线、中国—中亚/中俄跨境走廊；东部/中部同样适用同一套图与算法
+- **数据主源**：Geofabrik 中国 + 中亚五国 + `russia-latest.osm.pbf`，合并为同一份 `china.mmlp.bin`（文件名沿用；覆盖范围见旁路 `.coverage` 戳）
+- **路由加速**：全国稠密 Full CH（`china.mmlp.full.ch`），由 `bootstrap_service.sh` 在覆盖变更后自动重建
 
 ## 结论：是否合适？
 
@@ -13,14 +14,14 @@
 - **公路**：`highway=*`（motorway、trunk、primary、secondary 等）
 - **铁路**：`railway=rail`（干线）、以及 `light_rail`、`subway` 等（可按需过滤）
 
-中国全境数据在 Geofabrik 持续更新（约 **1.4 GB** PBF，日更）。中亚五国各自有国家级包，默认与中国包一并下载并导入。省级 Geofabrik 子包不完整，区域试验可用 **bbox 裁剪** 或 **Overpass** 从全国包派生。
+中国全境数据在 Geofabrik 持续更新（约 **1.4 GB** PBF，日更）。中亚五国与俄罗斯各自有国家级包，默认与中国包一并下载并导入。省级 Geofabrik 子包不完整，区域试验可用 **bbox 裁剪** 或 **Overpass** 从全国包派生。
 
 ### 优势
 
 - 免费、ODbL 许可，可离线处理
 - 公路网在东部/干线较完整；铁路主干 `railway=rail` 普遍有线位
 - 与方案中的 `Edge`/`Node` 结构自然对应
-- 中亚与中国共用同一套过滤规则与全国 Full CH，跨境轨迹无需省级拼接
+- 中亚/俄罗斯与中国共用同一套过滤规则与全国 Full CH，跨境轨迹无需省级拼接
 
 ### 局限（需知）
 
@@ -30,14 +31,15 @@
 | 中亚 OSM 密度 | 部分路段稀疏、属性不全 | 与中国相同默认限速/休息模型；重点口岸加强测试 |
 | 铁路属性 | `maxspeed`、单双线、货运线属性不完整 | 用默认铁路限速 + 业务历史速度 |
 | 枢纽 | 公铁换乘关系 OSM 不统一 | `HUB` 节点规则 + 可选人工表 |
-| PBF 体积 | 中国 1.4GB+，中亚合计约数百 MB～1GB | 离线预处理一次；运行时 index + 全国 Full CH |
+| PBF 体积 | 中国 ~1.4GB + 中亚数百 MB + 俄罗斯 ~4GB | 离线预处理一次；运行时 index + 全国 Full CH |
+| 俄罗斯底图 | 无单一全国 Shortbread；用联邦区包叠加，远东包过大则跳过 | Geofabrik `*-shortbread-1.0.mbtiles`；缺区可用路网回退 |
 | 区域质量差异 | 东部较密，西部/中亚稀疏/偏移 | 全国统一规则；重点区加强测试 |
 
 **不建议**把 Geofabrik 的 `china-latest-free.shp.zip` 作为唯一数据源；应使用 **`.osm.pbf` + 自研/工具链过滤**。
 
 ## 推荐数据源
 
-### 1. Geofabrik — 中国 + 中亚五国（生产）
+### 1. Geofabrik — 中国 + 中亚五国 + 俄罗斯（生产）
 
 | 区域 | URL / 文件 |
 |------|------------|
@@ -47,16 +49,16 @@
 | 塔吉克斯坦 | `asia/tajikistan-latest.osm.pbf` |
 | 土库曼斯坦 | `asia/turkmenistan-latest.osm.pbf` |
 | 乌兹别克斯坦 | `asia/uzbekistan-latest.osm.pbf` |
+| 俄罗斯 | [russia.html](https://download.geofabrik.de/russia.html) → `russia-latest.osm.pbf`（~4 GB） |
 
-默认 `INCLUDE_CENTRAL_ASIA=1`（`config/osm.defaults.env`）。仅中国：`INCLUDE_CENTRAL_ASIA=0`。
+默认 `INCLUDE_CENTRAL_ASIA=1`、`INCLUDE_RUSSIA=1`（`config/osm.defaults.env`）。关闭：`INCLUDE_RUSSIA=0`。
 
 ```bash
-bash tools/download_osm.sh
-bash tools/deploy_graph_nationwide.sh   # 覆盖不全时自动重建图并作废旧 Full CH
-bash tools/bootstrap_service.sh         # 重建索引 + 全国 Full CH
+bash tools/bootstrap_service.sh         # 覆盖不全时自动重建图 + 全国 Full CH + 底图
+MMLP_PRELOAD_REGIONS=off bash tools/start_http_server.sh
 ```
 
-覆盖戳：`data/graph/china.mmlp.bin.coverage`（例如 `china kz kg tj tm uz`）。
+覆盖戳：`data/graph/china.mmlp.bin.coverage`（例如 `china kz kg tj tm uz ru`）。
 
 ### 2. 区域裁剪 — 开发 / 重点区回归（可选）
 

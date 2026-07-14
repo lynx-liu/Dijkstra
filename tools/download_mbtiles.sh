@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Download China (+ optional Central Asia) Shortbread vector mbtiles for offline map.
+# Download China (+ Central Asia / Russia) Shortbread vector mbtiles for offline map.
+# Called by bootstrap_service.sh / start_http_server.sh (idempotent).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null
 source "${ROOT}/config/map.defaults.env"
-# Align with graph coverage flag when set in osm.defaults.env
 if [[ -f "${ROOT}/config/osm.defaults.env" ]]; then
   # shellcheck source=/dev/null
   source "${ROOT}/config/osm.defaults.env"
 fi
 INCLUDE_CENTRAL_ASIA_MAP="${INCLUDE_CENTRAL_ASIA_MAP:-${INCLUDE_CENTRAL_ASIA:-1}}"
+INCLUDE_RUSSIA_MAP="${INCLUDE_RUSSIA_MAP:-${INCLUDE_RUSSIA:-1}}"
+MAX_RU_MBTILES_BYTES="${MAX_RU_MBTILES_BYTES:-8589934592}"
 
 DEST="${ROOT}/${MBTILES_PATH}"
 ZIP="${ROOT}/${MAP_DIR}/${MBTILES_ZIP_NAME}"
 KEEP_ZIP="${KEEP_MBTILES_ZIP:-0}"
 CA_DIR="${ROOT}/${MBTILES_CA_DIR}"
+RU_DIR="${ROOT}/${MBTILES_RU_DIR}"
 
 download_zip_extract() {
   local url="$1"
@@ -66,6 +69,37 @@ download_zip_extract() {
   ls -lh "${dest}"
 }
 
+# Direct .mbtiles URL (Geofabrik Russia federal districts).
+download_mbtiles_file() {
+  local url="$1"
+  local dest="$2"
+  local label="$3"
+  local max_bytes="${4:-0}"
+
+  if [[ -f "${dest}" ]]; then
+    echo "[mbtiles] already exists: ${dest}"
+    ls -lh "${dest}"
+    return 0
+  fi
+
+  if [[ "${max_bytes}" -gt 0 ]]; then
+    local cl
+    cl="$(curl -sI -L --connect-timeout 20 "${url}" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r' | tail -1)"
+    if [[ -n "${cl}" ]] && [[ "${cl}" =~ ^[0-9]+$ ]] && [[ "${cl}" -gt "${max_bytes}" ]]; then
+      echo "[mbtiles] SKIP ${label}: remote size ${cl} > MAX_RU_MBTILES_BYTES=${max_bytes}"
+      echo "  URL: ${url}"
+      return 0
+    fi
+  fi
+
+  mkdir -p "$(dirname "${dest}")"
+  echo "[mbtiles] downloading ${label}..."
+  echo "  URL: ${url}"
+  curl -fL --connect-timeout 30 --retry 3 --retry-delay 5 -C - -o "${dest}.partial" "${url}"
+  mv -f "${dest}.partial" "${dest}"
+  ls -lh "${dest}"
+}
+
 # --- China base ---
 if [[ -f "${DEST}" ]]; then
   echo "[mbtiles] China base present: ${DEST}"
@@ -88,11 +122,27 @@ if [[ "${INCLUDE_CENTRAL_ASIA_MAP}" == "1" ]]; then
     "${ROOT}/${CA_TM_MBTILES}" "Turkmenistan"
   download_zip_extract "${CA_UZ_MBTILES_URL}" "${CA_DIR}/uzbekistan.mbtiles-shortbread.zip" \
     "${ROOT}/${CA_UZ_MBTILES}" "Uzbekistan"
-  echo "[mbtiles] Central Asia overlays ready under ${CA_DIR}"
+  echo "[mbtiles] Central Asia overlays under ${CA_DIR}"
   ls -lh "${CA_DIR}"/*.mbtiles 2>/dev/null || true
 else
-  echo "[mbtiles] INCLUDE_CENTRAL_ASIA_MAP=0 — China base only"
+  echo "[mbtiles] INCLUDE_CENTRAL_ASIA_MAP=0 — skip Central Asia"
+fi
+
+# --- Russia federal-district Shortbread (Geofabrik) ---
+if [[ "${INCLUDE_RUSSIA_MAP}" == "1" ]]; then
+  echo "[mbtiles] INCLUDE_RUSSIA_MAP=1 — fetching Russia federal Shortbread"
+  echo "  (skip packages larger than MAX_RU_MBTILES_BYTES=${MAX_RU_MBTILES_BYTES})"
+  mkdir -p "${RU_DIR}"
+  # shellcheck disable=SC2086
+  for dist in ${RU_FED_DISTRICTS}; do
+    url="https://download.geofabrik.de/russia/${dist}-shortbread-1.0.mbtiles"
+    dest="${RU_DIR}/${dist}.mbtiles"
+    download_mbtiles_file "${url}" "${dest}" "Russia ${dist}" "${MAX_RU_MBTILES_BYTES}"
+  done
+  echo "[mbtiles] Russia overlays under ${RU_DIR}"
+  ls -lh "${RU_DIR}"/*.mbtiles 2>/dev/null || true
+else
+  echo "[mbtiles] INCLUDE_RUSSIA_MAP=0 — skip Russia"
 fi
 
 echo "[mbtiles] done"
-echo "Restart HTTP service to pick up overlays: bash tools/start_http_server.sh"

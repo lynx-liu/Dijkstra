@@ -69,7 +69,7 @@ fi
 echo "=== MMLP HTTP service ==="
 echo "Graph: ${GRAPH}"
 
-# Ensure offline basemap (China + Central Asia). Same contract as bootstrap:
+# Ensure offline basemap (China + Central Asia + Russia). Same contract as bootstrap:
 # operators only run start_http_server — do not require download_mbtiles.sh by hand.
 # Air-gapped: SKIP_MBTILES=1
 if [[ "${SKIP_MBTILES:-0}" != "1" ]]; then
@@ -80,28 +80,30 @@ if [[ "${SKIP_MBTILES:-0}" != "1" ]]; then
     source "${ROOT}/config/osm.defaults.env"
   fi
   INCLUDE_CENTRAL_ASIA_MAP="${INCLUDE_CENTRAL_ASIA_MAP:-${INCLUDE_CENTRAL_ASIA:-1}}"
+  INCLUDE_RUSSIA_MAP="${INCLUDE_RUSSIA_MAP:-${INCLUDE_RUSSIA:-1}}"
   map_incomplete=0
   if [[ ! -f "${ROOT}/data/map/china.mbtiles" ]] && [[ ! -f "${ROOT}/data/map/china_central_asia.mbtiles" ]]; then
     map_incomplete=1
-  elif [[ "${INCLUDE_CENTRAL_ASIA_MAP}" == "1" ]]; then
+  fi
+  if [[ "${map_incomplete}" != "1" && "${INCLUDE_CENTRAL_ASIA_MAP}" == "1" ]]; then
     for f in \
       "${ROOT}/${CA_KZ_MBTILES:-data/map/central_asia/kazakhstan.mbtiles}" \
       "${ROOT}/${CA_KG_MBTILES:-data/map/central_asia/kyrgyzstan.mbtiles}" \
       "${ROOT}/${CA_TJ_MBTILES:-data/map/central_asia/tajikistan.mbtiles}" \
       "${ROOT}/${CA_TM_MBTILES:-data/map/central_asia/turkmenistan.mbtiles}" \
       "${ROOT}/${CA_UZ_MBTILES:-data/map/central_asia/uzbekistan.mbtiles}"; do
-      # Paths from map.defaults.env are relative to ROOT when not absolute.
-      if [[ "${f}" != /* ]]; then
-        f="${ROOT}/${f}"
-      fi
-      if [[ ! -f "${f}" ]]; then
-        map_incomplete=1
-        break
-      fi
+      if [[ "${f}" != /* ]]; then f="${ROOT}/${f}"; fi
+      if [[ ! -f "${f}" ]]; then map_incomplete=1; break; fi
     done
   fi
+  # Russia: require at least one federal overlay when enabled (large Far East may be skipped).
+  if [[ "${map_incomplete}" != "1" && "${INCLUDE_RUSSIA_MAP}" == "1" ]]; then
+    if ! compgen -G "${ROOT}/data/map/russia/*.mbtiles" >/dev/null; then
+      map_incomplete=1
+    fi
+  fi
   if [[ "${map_incomplete}" == "1" ]]; then
-    echo "Map tiles incomplete (need China + 中亚五国) — fetching via download_mbtiles.sh ..."
+    echo "Map tiles incomplete (China + 中亚 + 俄罗斯) — fetching via download_mbtiles.sh ..."
     bash "${ROOT}/tools/download_mbtiles.sh"
   fi
 fi
@@ -109,7 +111,9 @@ fi
 # shellcheck source=/dev/null
 source "${ROOT}/config/map.defaults.env" 2>/dev/null || true
 if [[ -f "${ROOT}/data/map/china_central_asia.mbtiles" ]]; then
-  echo "Map: data/map/china_central_asia.mbtiles (China + Central Asia)"
+  echo "Map: data/map/china_central_asia.mbtiles (merged)"
+elif [[ -d "${ROOT}/data/map/russia" ]] && compgen -G "${ROOT}/data/map/russia/*.mbtiles" >/dev/null; then
+  echo "Map: china + central_asia + russia/*.mbtiles overlays"
 elif [[ -d "${ROOT}/data/map/central_asia" ]] && compgen -G "${ROOT}/data/map/central_asia/*.mbtiles" >/dev/null; then
   echo "Map: china.mbtiles + central_asia/*.mbtiles overlays"
 elif [[ -f "${ROOT}/data/map/china.mbtiles" ]]; then

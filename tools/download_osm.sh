@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download Geofabrik China OSM extract (+ Central Asia five when enabled).
+# Download Geofabrik China OSM extract (+ Central Asia / Russia when enabled).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,7 +42,14 @@ if [[ "${INCLUDE_CENTRAL_ASIA}" == "1" ]]; then
   download_one "${CA_TM_URL}" "${CA_TM_PBF}" "Turkmenistan 土库曼斯坦"
   download_one "${CA_UZ_URL}" "${CA_UZ_PBF}" "Uzbekistan 乌兹别克斯坦"
 else
-  echo "[download_osm] INCLUDE_CENTRAL_ASIA=0 — China only"
+  echo "[download_osm] INCLUDE_CENTRAL_ASIA=0 — skip Central Asia"
+fi
+
+if [[ "${INCLUDE_RUSSIA}" == "1" ]]; then
+  echo "[download_osm] INCLUDE_RUSSIA=1 — fetching Russian Federation (~4 GB)"
+  download_one "${RU_URL}" "${RU_PBF}" "Russia 俄罗斯"
+else
+  echo "[download_osm] INCLUDE_RUSSIA=0 — skip Russia"
 fi
 
 echo "[download_osm] complete"
