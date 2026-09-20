@@ -448,7 +448,8 @@ def reserve_listen_socket(host: str, port: int) -> socket.socket:
 def make_handler(core: MmlpCore, web_root: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sys.stderr.write("%s %s - %s\n" % (ts, self.address_string(), fmt % args))
 
         def _json(self, code: int, body: dict):
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
