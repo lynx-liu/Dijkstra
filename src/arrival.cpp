@@ -3466,6 +3466,7 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     const SpatialIndex& matchIndex, const std::vector<VehicleInfo>& vehicles,
     const std::vector<VehicleHistory>& histories, const DestinationQuery& dest,
     const PredictParam& param, bool nearestSeeds = false) {
+  (void)nearestSeeds;  // callers still pass a retry flag; seeding is unified below
   const FullChGraph& ch = store.fullCh();
   const double profileMs = speedMsFromKmh(ch.profileKmh());
 
@@ -3495,7 +3496,46 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     }
     return info;
   };
-  const bool hwySeeding = nearestSeeds && store.hasCh() && store.hasHwyCsr();
+  // Nearest-road / hwy / Full-CH spatial seeds when edge snap is empty or sits on a
+  // disconnected fragment. Same ladder for destination and vehicle so A→B and B→A
+  // seeding stay symmetric (mountain / border clicks).
+  const auto nearestFullChSeedsAt = [&](double lat, double lon, VehicleType type) -> FullChSeedInfo {
+    std::vector<int64_t> nodes;
+    if (store.hasCh() && store.hasHwyCsr()) {
+      nodes = snapHwyPortalSeeds(store, store, store.hwyCsr(), matchIndex, lat, lon, type, 8);
+      if (nodes.empty()) {
+        nodes = findNearestHwyOverlayNodes(store, store, store.hwyCsr(), store.ch(), matchIndex, lat,
+                                           lon, 50000.0, 8);
+      }
+    }
+    if (nodes.empty()) {
+      for (const double radiusM : {25000.0, 50000.0, 100000.0}) {
+        nodes = findNearestFullChRoadNodes(store, ch, matchIndex, lat, lon, type, radiusM, 8);
+        if (!nodes.empty()) {
+          break;
+        }
+      }
+    }
+    return seedsFromNodes(nodes, lat, lon);
+  };
+  const auto seedSetsDiffer = [](const FullChSeedInfo& a, const FullChSeedInfo& b) {
+    if (a.seeds.size() != b.seeds.size()) {
+      return true;
+    }
+    for (const FullChGraph::Seed& s : a.seeds) {
+      bool found = false;
+      for (const FullChGraph::Seed& t : b.seeds) {
+        if (t.nodeId == s.nodeId) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   const GraphPosition goalPos = matchVehicleToGraphIndexed(store, matchIndex, destProbe);
   LatLon goalLl{dest.lat, dest.lon};
@@ -3522,25 +3562,8 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
   // Full-CH nearest-node search so we still draw a real road polyline.
   if (goalSeeds.seeds.empty()) {
     goalLl = {dest.lat, dest.lon};
-    std::vector<int64_t> goalNodes;
-    if (store.hasCh() && store.hasHwyCsr()) {
-      goalNodes = snapHwyPortalSeeds(store, store, store.hwyCsr(), matchIndex, dest.lat, dest.lon,
-                                     dest.type, 8);
-      if (goalNodes.empty()) {
-        goalNodes = findNearestHwyOverlayNodes(store, store, store.hwyCsr(), store.ch(), matchIndex,
-                                               dest.lat, dest.lon, 50000.0, 8);
-      }
-    }
-    if (goalNodes.empty()) {
-      for (const double radiusM : {25000.0, 50000.0, 100000.0}) {
-        goalNodes = findNearestFullChRoadNodes(store, ch, matchIndex, dest.lat, dest.lon, dest.type,
-                                               radiusM, 8);
-        if (!goalNodes.empty()) {
-          break;
-        }
-      }
-    }
-    if (goalNodes.empty() && goalPos.valid) {
+    goalSeeds = nearestFullChSeedsAt(dest.lat, dest.lon, dest.type);
+    if (goalSeeds.seeds.empty() && goalPos.valid) {
       // Last resort: use whatever node/edge endpoints the spatial snap found,
       // even if the gap was large (better than returning zero routes).
       goalSeeds = fullChSeedsForPosition(store, ch, goalPos, profileMs);
@@ -3552,17 +3575,14 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
       if (!goalSeeds.seeds.empty()) {
         goalLl = positionLatLonStore(store, goalPos);
       }
-    } else if (!goalNodes.empty()) {
-      goalSeeds = seedsFromNodes(goalNodes, dest.lat, dest.lon);
-      if (!goalSeeds.seeds.empty()) {
-        double nlat = 0.0;
-        double nlon = 0.0;
-        if (store.nodeLatLon(goalSeeds.seeds.front().nodeId, nlat, nlon)) {
-          goalLl = {nlat, nlon};
-        }
-        if (locationId.empty()) {
-          locationId = "node:" + std::to_string(goalSeeds.seeds.front().nodeId);
-        }
+    } else if (!goalSeeds.seeds.empty()) {
+      double nlat = 0.0;
+      double nlon = 0.0;
+      if (store.nodeLatLon(goalSeeds.seeds.front().nodeId, nlat, nlon)) {
+        goalLl = {nlat, nlon};
+      }
+      if (locationId.empty()) {
+        locationId = "node:" + std::to_string(goalSeeds.seeds.front().nodeId);
       }
     }
   }
@@ -3618,24 +3638,39 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     FullChSeedInfo fromSeeds;
     if (pos.valid) {
       snapLl = positionLatLonStore(store, pos);
-      if (haversineMeters(snapLl, {vehicle.lat, vehicle.lon}) <= 20000.0) {
+      const double fromGapM = haversineMeters(snapLl, {vehicle.lat, vehicle.lon});
+      // Match destination snap tolerance (100km): remote mountain GPS often sits
+      // farther than 20km from the nearest truck-routable edge.
+      if (fromGapM <= 100000.0) {
         fromSeeds = fullChSeedsForPosition(store, ch, pos, profileMs);
+        if (fromGapM > 30000.0) {
+          for (FullChGraph::Seed& s : fromSeeds.seeds) {
+            s.costSec += fromGapM / profileMs;
+            fromSeeds.offsetMeters[s.nodeId] += fromGapM;
+          }
+        }
       }
     }
-    if (fromSeeds.seeds.empty() && hwySeeding) {
-      snapLl = {vehicle.lat, vehicle.lon};
-      std::vector<int64_t> fromNodes;
-      if (!tryReuseVehiclePortals(vehicle, fromNodes)) {
-        fromNodes = snapHwyPortalSeeds(store, store, store.hwyCsr(), matchIndex, vehicle.lat,
-                                       vehicle.lon, vehicle.type, 4);
-        if (fromNodes.empty()) {
-          // Geometric nearest highway nodes (spatial-index bbox, ~tens of ms).
-          fromNodes = findNearestHwyOverlayNodes(store, store, store.hwyCsr(), store.ch(),
-                                                 matchIndex, vehicle.lat, vehicle.lon, 20000.0, 4);
+    if (fromSeeds.seeds.empty()) {
+      // Same wide ladder as destination seeds (not only when nearestSeeds/hwy).
+      fromSeeds = nearestFullChSeedsAt(vehicle.lat, vehicle.lon, vehicle.type);
+      if (fromSeeds.seeds.empty() && pos.valid) {
+        fromSeeds = fullChSeedsForPosition(store, ch, pos, profileMs);
+        const double gapM = haversineMeters(positionLatLonStore(store, pos), {vehicle.lat, vehicle.lon});
+        for (FullChGraph::Seed& s : fromSeeds.seeds) {
+          s.costSec += gapM / profileMs;
+          fromSeeds.offsetMeters[s.nodeId] += gapM;
         }
-        storeVehiclePortals(vehicle, fromNodes);
       }
-      fromSeeds = seedsFromNodes(fromNodes, vehicle.lat, vehicle.lon);
+      if (!fromSeeds.seeds.empty()) {
+        double nlat = 0.0;
+        double nlon = 0.0;
+        if (store.nodeLatLon(fromSeeds.seeds.front().nodeId, nlat, nlon)) {
+          snapLl = {nlat, nlon};
+        } else {
+          snapLl = {vehicle.lat, vehicle.lon};
+        }
+      }
     }
     if (fromSeeds.seeds.empty()) {
       slots[i].needFallback = true;
@@ -3648,8 +3683,8 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
     const double maxProfileSec = searchHorizon * 1.6 + 1800.0;
     const std::size_t settleCap =
         param.maxVisitedNodes > 0 ? param.maxVisitedNodes : static_cast<std::size_t>(400000);
-    const FullChGraph::PathResult path = ch.route(fromSeeds.seeds, goalSeeds.seeds, maxProfileSec,
-                                                  settleCap, param.maxRouteWallMs);
+    FullChGraph::PathResult path = ch.route(fromSeeds.seeds, goalSeeds.seeds, maxProfileSec,
+                                            settleCap, param.maxRouteWallMs);
     if (path.capped) {
       if (param.maxRouteWallMs > 0.0) {
         // Interactive corridor hop: hard miss, no slow fallback / geodesic chord.
@@ -3660,17 +3695,33 @@ std::vector<VehicleInfo> appendDestinationFullChBatch(
       return;
     }
     if (!path.found) {
-      if (nearestSeeds && param.maxRouteWallMs <= 0.0) {
-        // Nearest-node seeding is approximate (seed may sit in a disconnected
-        // fragment): "no path" is not authoritative, let the fallback decide.
+      if (param.maxRouteWallMs > 0.0) {
+        return;
+      }
+      // Edge-snap seeds can sit on a one-way / disconnected fragment while a nearby
+      // Full-CH node is connected (seen on KG mountain borders: B→A works, A→B empty).
+      // One wide-seed retry only on miss — happy path still pays a single CH query.
+      const FullChSeedInfo wideSeeds = nearestFullChSeedsAt(vehicle.lat, vehicle.lon, vehicle.type);
+      if (!wideSeeds.seeds.empty() && seedSetsDiffer(wideSeeds, fromSeeds)) {
+        const FullChGraph::PathResult retry =
+            ch.route(wideSeeds.seeds, goalSeeds.seeds, maxProfileSec, settleCap,
+                     param.maxRouteWallMs);
+        if (!retry.capped && retry.found) {
+          path = retry;
+          fromSeeds = wideSeeds;
+          double nlat = 0.0;
+          double nlon = 0.0;
+          if (store.nodeLatLon(fromSeeds.seeds.front().nodeId, nlat, nlon)) {
+            snapLl = {nlat, nlon};
+          }
+        }
+      }
+      if (!path.found) {
+        // Keep leftover for outer nearestSeeds / hwy fallback; never silent-drop.
         slots[i].needFallback = true;
         slots[i].reason = 'n';
         return;
       }
-      // Full-graph CH covers every road node: no path within the padded cap
-      // means the destination is not reachable inside the horizon.
-      // Corridor hops (maxRouteWallMs>0) also hard-miss here.
-      return;
     }
 
     double driveSec = 0.0;
